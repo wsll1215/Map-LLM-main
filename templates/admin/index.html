@@ -1,0 +1,27 @@
+{% extends "admin/index.html" %}
+{% load static %}
+
+{% block extrahead %}
+{{ block.super }}
+<script>
+// Fix admin links to prevent hash prefix
+document.addEventListener('DOMContentLoaded', function() {
+    // Find all links in the admin index page
+    const links = document.querySelectorAll('a[href]');
+    
+    links.forEach(function(link) {
+        const href = link.getAttribute('href');
+        
+        // If the link starts with #/admin, fix it
+        if (href && href.startsWith('#/admin')) {
+            const fixedHref = href.substring(1); // Remove the # prefix
+            link.setAttribute('href', fixedHref);
+            console.log('Fixed link:', href, '->', fixedHref);
+        }
+    });
+    
+    console.log('Admin index links fixed');
+});
+</script>
+{% endblock %}
+

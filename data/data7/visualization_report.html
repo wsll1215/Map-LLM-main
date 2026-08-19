@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shapefile 可视化结果</title>
+    <style>
+        body {
+            font-family: "Microsoft YaHei", Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .stats {
+            background-color: #e3f2fd;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        .stats h2 {
+            margin-top: 0;
+            color: #1976d2;
+        }
+        .stat-item {
+            margin: 10px 0;
+            font-size: 16px;
+        }
+        .stat-label {
+            font-weight: bold;
+            color: #555;
+        }
+        .image-section {
+            margin: 30px 0;
+        }
+        .image-section h2 {
+            color: #1976d2;
+            border-bottom: 2px solid #1976d2;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        .image-container {
+            text-align: center;
+            margin: 20px 0;
+        }
+        .image-container img {
+            max-width: 100%;
+            height: auto;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .description {
+            color: #666;
+            margin-top: 10px;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🗺️ Shapefile 可视化结果</h1>
+        <p class="subtitle">综合前后对比分析</p>
+        
+        <div class="stats">
+            <h2>📊 数据统计</h2>
+            <div class="stat-item">
+                <span class="stat-label">综合前要素数量:</span> 113,877 个
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">综合后要素数量:</span> 11,103 个
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">综合比率:</span> 约 9.75% （减少了 90.25%）
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">说明:</span> 数据经过空间综合处理，要素数量大幅减少，提高了数据效率
+            </div>
+        </div>
+        
+        <div class="image-section">
+            <h2>并排对比图</h2>
+            <div class="image-container">
+                <img src="shapefile_comparison.png" alt="综合前后对比">
+                <p class="description">左侧为综合前（蓝色），右侧为综合后（红色）</p>
+            </div>
+        </div>
+        
+        <div class="image-section">
+            <h2>叠加对比图</h2>
+            <div class="image-container">
+                <img src="shapefile_overlay.png" alt="叠加对比">
+                <p class="description">蓝色为综合前，红色为综合后，叠加显示可清晰看出变化</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

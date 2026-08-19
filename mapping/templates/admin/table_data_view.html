@@ -1,0 +1,610 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block title %}{{ title }} - {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block extrastyle %}
+<style>
+    .table-data-container {
+        padding: 20px;
+        max-width: 100%;
+        margin: 0 auto;
+    }
+
+    .data-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 12px;
+        margin-bottom: 25px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .data-header h1 {
+        margin: 0;
+        font-size: 24px;
+        font-weight: 600;
+    }
+
+    .header-actions {
+        display: flex;
+        gap: 10px;
+    }
+
+    .header-btn {
+        padding: 10px 20px;
+        background: rgba(255,255,255,0.2);
+        color: white;
+        border: 2px solid white;
+        border-radius: 8px;
+        text-decoration: none;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        cursor: pointer;
+    }
+
+    .header-btn:hover {
+        background: white;
+        color: #667eea;
+    }
+
+    .data-info {
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        margin-bottom: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .info-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .info-label {
+        font-weight: 600;
+        color: #666;
+    }
+
+    .info-value {
+        color: #333;
+        font-size: 18px;
+        font-weight: 600;
+    }
+
+    .table-wrapper {
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        overflow: hidden;
+    }
+
+    .data-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+    }
+
+    .data-table thead {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+    }
+
+    .data-table th {
+        padding: 15px 12px;
+        text-align: left;
+        font-weight: 600;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+    }
+
+    .data-table tbody tr {
+        border-bottom: 1px solid #f0f0f0;
+        transition: background 0.2s ease;
+    }
+
+    .data-table tbody tr:hover {
+        background: #f8f9fa;
+    }
+
+    .data-table td {
+        padding: 12px;
+        color: #333;
+        max-width: 300px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .data-table td:hover {
+        white-space: normal;
+        word-wrap: break-word;
+    }
+
+    .action-column {
+        width: 100px;
+        text-align: center;
+    }
+
+    .delete-btn {
+        padding: 6px 12px;
+        background: #dc3545;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    }
+
+    .delete-btn:hover {
+        background: #c82333;
+        transform: scale(1.05);
+    }
+
+    .delete-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+    }
+
+    .checkbox-column {
+        width: 50px;
+        text-align: center;
+    }
+
+    .select-checkbox {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+    }
+
+    .batch-actions {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+        padding: 15px 20px;
+        background: white;
+        border-radius: 8px;
+        margin-bottom: 15px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+
+    .batch-actions-label {
+        font-weight: 600;
+        color: #333;
+    }
+
+    .batch-delete-btn {
+        padding: 8px 16px;
+        background: #dc3545;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    }
+
+    .batch-delete-btn:hover:not(:disabled) {
+        background: #c82333;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(220, 53, 69, 0.3);
+    }
+
+    .batch-delete-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+    }
+
+    .selected-count {
+        color: #667eea;
+        font-weight: 600;
+        font-size: 16px;
+    }
+
+    .pagination {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+        padding: 20px;
+        background: white;
+        border-radius: 0 0 12px 12px;
+    }
+
+    .page-btn {
+        padding: 8px 16px;
+        background: #667eea;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        text-decoration: none;
+        font-weight: 600;
+        transition: all 0.2s ease;
+    }
+
+    .page-btn:hover:not(:disabled) {
+        background: #5568d3;
+        transform: scale(1.05);
+    }
+
+    .page-btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+    }
+
+    .page-info {
+        color: #666;
+        font-weight: 600;
+    }
+
+    .error-message {
+        background: #fff3cd;
+        border: 2px solid #ffc107;
+        color: #856404;
+        padding: 20px;
+        border-radius: 12px;
+        margin: 20px 0;
+        text-align: center;
+        font-size: 16px;
+    }
+
+    .no-data {
+        text-align: center;
+        padding: 60px;
+        color: #999;
+        font-size: 18px;
+    }
+
+    .limit-selector {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .limit-selector select {
+        padding: 8px 12px;
+        border: 2px solid #667eea;
+        border-radius: 6px;
+        font-size: 14px;
+        cursor: pointer;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="table-data-container">
+    <div class="data-header">
+        <h1>📊 {{ table_name }} - 数据查看</h1>
+        <div class="header-actions">
+            <a href="/admin/mapping/{{ opts.model_name }}/export/{{ table_name_en }}/" class="header-btn">
+                📥 导出CSV
+            </a>
+            <a href="javascript:history.back()" class="header-btn">
+                ← 返回
+            </a>
+        </div>
+    </div>
+
+    {% if error %}
+        <div class="error-message">
+            ⚠️ {{ error }}
+        </div>
+    {% else %}
+        {% if rows %}
+            <div class="data-info">
+                <div class="info-item">
+                    <span class="info-label">📋 总记录数:</span>
+                    <span class="info-value">{{ total }}</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">📄 当前页:</span>
+                    <span class="info-value">{{ page }} / {{ total_pages }}</span>
+                </div>
+                <div class="limit-selector">
+                    <span class="info-label">每页显示:</span>
+                    <select onchange="changeLimit(this.value)">
+                        <option value="20" {% if limit == 20 %}selected{% endif %}>20</option>
+                        <option value="50" {% if limit == 50 %}selected{% endif %}>50</option>
+                        <option value="100" {% if limit == 100 %}selected{% endif %}>100</option>
+                        <option value="200" {% if limit == 200 %}selected{% endif %}>200</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- 批量操作工具栏 -->
+            <div class="batch-actions">
+                <span class="batch-actions-label">批量操作:</span>
+                <button class="batch-delete-btn" id="batchDeleteBtn" onclick="batchDelete()" disabled>
+                    🗑️ 删除选中 (<span id="selectedCount">0</span>)
+                </button>
+                <span style="color: #666; font-size: 14px;">提示: 勾选记录后可批量删除</span>
+            </div>
+
+            <div class="table-wrapper">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th class="checkbox-column">
+                                <input type="checkbox" class="select-checkbox" id="selectAll" onchange="toggleSelectAll(this)">
+                            </th>
+                            {% for column in columns %}
+                                <th>{{ column }}</th>
+                            {% endfor %}
+                            <th class="action-column">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in rows %}
+                            <tr data-row-id="{{ forloop.counter0 }}" data-pk-value="{{ row.pk }}">
+                                <td class="checkbox-column">
+                                    <input type="checkbox" class="select-checkbox row-checkbox"
+                                           data-pk="{{ row.pk }}"
+                                           data-row-index="{{ forloop.counter0 }}"
+                                           onchange="updateSelectedCount()">
+                                </td>
+                                {% for cell in row.data %}
+                                    <td title="{{ cell }}" data-col-index="{{ forloop.counter0 }}">{{ cell|default:"NULL" }}</td>
+                                {% endfor %}
+                                <td class="action-column">
+                                    <button class="delete-btn" onclick="deleteRecord('{{ row.pk }}', {{ forloop.counter0 }})">
+                                        🗑️ 删除
+                                    </button>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+
+                <div class="pagination">
+                    {% if page > 1 %}
+                        <a href="?page=1&limit={{ limit }}" class="page-btn">首页</a>
+                        <a href="?page={{ page|add:-1 }}&limit={{ limit }}" class="page-btn">上一页</a>
+                    {% else %}
+                        <button class="page-btn" disabled>首页</button>
+                        <button class="page-btn" disabled>上一页</button>
+                    {% endif %}
+
+                    <span class="page-info">第 {{ page }} 页 / 共 {{ total_pages }} 页</span>
+
+                    {% if page < total_pages %}
+                        <a href="?page={{ page|add:1 }}&limit={{ limit }}" class="page-btn">下一页</a>
+                        <a href="?page={{ total_pages }}&limit={{ limit }}" class="page-btn">末页</a>
+                    {% else %}
+                        <button class="page-btn" disabled>下一页</button>
+                        <button class="page-btn" disabled>末页</button>
+                    {% endif %}
+                </div>
+            </div>
+        {% else %}
+            <div class="no-data">
+                📭 该表暂无数据
+            </div>
+        {% endif %}
+    {% endif %}
+</div>
+
+<script>
+function changeLimit(limit) {
+    const url = new URL(window.location.href);
+    url.searchParams.set('limit', limit);
+    url.searchParams.set('page', '1');
+    window.location.href = url.toString();
+}
+
+function deleteRecord(pkValue, rowIndex) {
+    // 确认删除
+    if (!confirm('确定要删除这条记录吗？\n\n主键值: ' + pkValue + '\n\n此操作不可恢复！')) {
+        return;
+    }
+
+    // 获取按钮并禁用
+    const btn = event.target;
+    const originalText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '⏳ 删除中...';
+
+    // 构建删除URL
+    const deleteUrl = '/admin/mapping/{{ opts.model_name }}/delete/{{ table_name_en }}/' + encodeURIComponent(pkValue) + '/';
+
+    // 发送删除请求
+    fetch(deleteUrl, {
+        method: 'POST',
+        headers: {
+            'X-CSRFToken': getCookie('csrftoken'),
+            'Content-Type': 'application/json',
+        },
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            // 删除成功，移除表格行
+            const row = document.querySelector(`tr[data-row-id="${rowIndex}"]`);
+            if (row) {
+                row.style.backgroundColor = '#d4edda';
+                setTimeout(() => {
+                    row.remove();
+                    // 如果表格为空，刷新页面
+                    const tbody = document.querySelector('.data-table tbody');
+                    if (tbody && tbody.children.length === 0) {
+                        window.location.reload();
+                    }
+                }, 500);
+            }
+            alert('✅ 删除成功！\n\n' + data.message);
+        } else {
+            // 删除失败
+            btn.disabled = false;
+            btn.innerHTML = originalText;
+            alert('❌ 删除失败！\n\n错误信息: ' + data.error);
+        }
+    })
+    .catch(error => {
+        // 网络错误
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+        alert('❌ 删除失败！\n\n网络错误: ' + error.message);
+    });
+}
+
+// 获取CSRF Token
+function getCookie(name) {
+    let cookieValue = null;
+    if (document.cookie && document.cookie !== '') {
+        const cookies = document.cookie.split(';');
+        for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i].trim();
+            if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                break;
+            }
+        }
+    }
+    return cookieValue;
+}
+
+// 全选/取消全选
+function toggleSelectAll(checkbox) {
+    const rowCheckboxes = document.querySelectorAll('.row-checkbox');
+    rowCheckboxes.forEach(cb => {
+        cb.checked = checkbox.checked;
+    });
+    updateSelectedCount();
+}
+
+// 更新选中数量
+function updateSelectedCount() {
+    const selectedCheckboxes = document.querySelectorAll('.row-checkbox:checked');
+    const count = selectedCheckboxes.length;
+
+    // 更新显示
+    document.getElementById('selectedCount').textContent = count;
+
+    // 更新批量删除按钮状态
+    const batchDeleteBtn = document.getElementById('batchDeleteBtn');
+    batchDeleteBtn.disabled = count === 0;
+
+    // 更新全选复选框状态
+    const selectAllCheckbox = document.getElementById('selectAll');
+    const allCheckboxes = document.querySelectorAll('.row-checkbox');
+    selectAllCheckbox.checked = count > 0 && count === allCheckboxes.length;
+    selectAllCheckbox.indeterminate = count > 0 && count < allCheckboxes.length;
+}
+
+// 批量删除
+function batchDelete() {
+    const selectedCheckboxes = document.querySelectorAll('.row-checkbox:checked');
+
+    if (selectedCheckboxes.length === 0) {
+        alert('请先选择要删除的记录！');
+        return;
+    }
+
+    // 收集选中的主键值
+    const pkValues = [];
+    const rowIndices = [];
+    selectedCheckboxes.forEach(cb => {
+        pkValues.push(cb.dataset.pk);
+        rowIndices.push(cb.dataset.rowIndex);
+    });
+
+    // 确认删除
+    const confirmMsg = `确定要删除选中的 ${pkValues.length} 条记录吗？\n\n主键值: ${pkValues.join(', ')}\n\n此操作不可恢复！`;
+    if (!confirm(confirmMsg)) {
+        return;
+    }
+
+    // 禁用批量删除按钮
+    const batchDeleteBtn = document.getElementById('batchDeleteBtn');
+    const originalText = batchDeleteBtn.innerHTML;
+    batchDeleteBtn.disabled = true;
+    batchDeleteBtn.innerHTML = '⏳ 删除中...';
+
+    // 禁用所有复选框
+    document.querySelectorAll('.select-checkbox').forEach(cb => cb.disabled = true);
+
+    // 依次删除每条记录
+    let successCount = 0;
+    let failCount = 0;
+    const errors = [];
+
+    // 使用Promise.all并行删除
+    const deletePromises = pkValues.map((pkValue, index) => {
+        const deleteUrl = '/admin/mapping/{{ opts.model_name }}/delete/{{ table_name_en }}/' + encodeURIComponent(pkValue) + '/';
+
+        return fetch(deleteUrl, {
+            method: 'POST',
+            headers: {
+                'X-CSRFToken': getCookie('csrftoken'),
+                'Content-Type': 'application/json',
+            },
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                successCount++;
+                // 标记行为成功删除
+                const rowIndex = rowIndices[index];
+                const row = document.querySelector(`tr[data-row-id="${rowIndex}"]`);
+                if (row) {
+                    row.style.backgroundColor = '#d4edda';
+                    row.dataset.deleted = 'true';
+                }
+            } else {
+                failCount++;
+                errors.push(`主键 ${pkValue}: ${data.error}`);
+            }
+            return data;
+        })
+        .catch(error => {
+            failCount++;
+            errors.push(`主键 ${pkValue}: ${error.message}`);
+        });
+    });
+
+    // 等待所有删除完成
+    Promise.all(deletePromises).then(() => {
+        // 移除成功删除的行
+        setTimeout(() => {
+            document.querySelectorAll('tr[data-deleted="true"]').forEach(row => row.remove());
+
+            // 显示结果
+            let resultMsg = `批量删除完成！\n\n`;
+            resultMsg += `✅ 成功: ${successCount} 条\n`;
+            if (failCount > 0) {
+                resultMsg += `❌ 失败: ${failCount} 条\n\n`;
+                resultMsg += `失败详情:\n${errors.join('\n')}`;
+            }
+            alert(resultMsg);
+
+            // 检查表格是否为空
+            const tbody = document.querySelector('.data-table tbody');
+            if (tbody && tbody.children.length === 0) {
+                window.location.reload();
+            } else {
+                // 恢复按钮和复选框
+                batchDeleteBtn.innerHTML = originalText;
+                document.querySelectorAll('.select-checkbox').forEach(cb => cb.disabled = false);
+
+                // 取消全选
+                document.getElementById('selectAll').checked = false;
+                updateSelectedCount();
+            }
+        }, 500);
+    });
+}
+</script>
+{% endblock %}
+

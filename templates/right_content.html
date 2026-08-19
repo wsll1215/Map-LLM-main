@@ -1,0 +1,266 @@
+{# right_content.html - 问答助手区域 #}
+
+<main class="lyear-layout-content">
+    <div class="container-fluid h-100 p-0">
+        <div class="card shadow-sm h-100 d-flex flex-column">
+            <div class="card-header text-white qa-header"
+                style="background: linear-gradient(135deg, #8fa4f3 0%, #9d7bb8 100%); padding: 8px 12px;">
+                <h6 class="mb-0"><i class="fas fa-robot me-2"></i>问答助手</h6>
+            </div>
+            <div class="card-body qa-card-body flex-grow-1 d-flex flex-column p-3">
+                <div class="chat-container flex-grow-1 overflow-auto d-flex flex-column-reverse">
+                    {% for wen in all_wendas %}
+                    <div class="chat-message">
+                        <div class="question-bubble p-3 mb-3">
+                            <div class="d-flex align-items-center mb-2">
+                                <img src="static/images/Q.png" alt="Question" class="me-0"
+                                    style="width: 30px; height: 30px;">
+                            </div>
+                            <div class="border-success">
+                                {{ wen.question }}
+                            </div>
+                        </div>
+
+                        <div class="answer-bubble pt-1 p-3 mb-2">
+                            <div class="d-flex align-items-center mb-0">
+                                <img src="static/images/A.png" alt="Answer" class="me-0"
+                                    style="width: 30px; height: 30px;">
+                            </div>
+                            <div class="border-success qa-history-answer">{{ wen.anster|safe }}</div>
+                        </div>
+                    </div>
+                    {% empty %}
+                    <div class="chat-empty-state">
+                        <i class="fas fa-comments"></i>
+                        <p>暂无对话记录，开始提问吧！</p>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                <form id="qa-form" class="qa-composer">
+                    {% csrf_token %}
+                    <label class="qa-composer-label" for="questionInput">输入问题</label>
+                    <textarea class="form-control qa-input" name="key" id="questionInput" placeholder="请输入相关问题"
+                        onkeydown="if(event.keyCode === 13 && !event.shiftKey) { $('#qa-form').submit(); return false; }"></textarea>
+                    <div class="qa-action-row button-group">
+                        <button class="btn qa-action-btn qa-primary-btn" type="submit"
+                            style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 16px; padding: 6px 14px; font-size: 12px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2); transition: all 0.3s ease;">
+                            <i class="fas fa-search me-1"></i> 获取解答
+                        </button>
+                        <button id="satisfaction-btn" class="btn qa-action-btn" type="button"
+                            style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 16px; padding: 6px 14px; font-size: 12px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2); transition: all 0.3s ease; opacity: 0.8;">
+                            <i class="fas fa-star me-1"></i> 满意度
+                        </button>
+                        <button id="clean-history-btn" class="btn qa-action-btn" type="button"
+                            style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 16px; padding: 6px 14px; font-size: 12px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2); transition: all 0.3s ease; opacity: 0.6;">
+                            <i class="fas fa-trash-alt me-1"></i> 清除
+                        </button>
+                    </div>
+                </form>
+
+                {% if daan %}
+                <div class="result-card mt-4 p-4 bg-light rounded">
+                    <h5 class="text-success mb-3">
+                        <i class="fas fa-lightbulb me-2"></i> 解答结果
+                    </h5>
+                    <div class="answer-content ps-3 border-start border-3 border-success">
+                        {{ daan|safe }}
+                    </div>
+                    {% if sql %}
+                    <div class="mt-3 text-muted small">
+                        <i class="fas fa-code me-2"></i> 查询语句：<code>{{ sql }}</code>
+                    </div>
+                    {% endif %}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</main>
+
+<style>
+    .qa-card-body {
+        gap: 12px;
+        min-height: 0;
+    }
+
+    .chat-container {
+        background: #f8f9fa;
+        border-radius: 10px;
+        overflow-y: auto;
+        flex-grow: 1;
+        min-height: 0;
+        padding: 10px;
+        margin-bottom: 0;
+    }
+
+    .chat-empty-state {
+        min-height: 120px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: #6b7280;
+        gap: 8px;
+        font-size: 14px;
+    }
+
+    .chat-empty-state i {
+        font-size: 22px;
+        color: #7c93dd;
+    }
+
+    .chat-empty-state p {
+        margin: 0;
+    }
+
+    .chat-message {
+        margin-bottom: 1rem;
+    }
+
+    .chat-message:last-child {
+        margin-bottom: 0.5rem;
+    }
+
+    .question-bubble {
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        transition: box-shadow 0.3s ease;
+        padding: 8px 12px;
+    }
+
+    .question-bubble:hover {
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+    }
+
+    .answer-bubble {
+        background: #e3f2fd;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        transition: box-shadow 0.3s ease;
+        padding: 8px 12px;
+    }
+
+    .answer-bubble:hover {
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+    }
+
+    .border-success {
+        border-color: #28a745 !important;
+        padding-left: 1.5rem;
+    }
+
+    .qa-history-answer {
+        white-space: pre-line;
+        word-break: break-word;
+    }
+
+    .qa-composer {
+        display: flex;
+        flex-direction: column;
+        flex: 0 0 auto;
+        gap: 10px;
+        padding: 12px;
+        margin-top: auto;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+        overflow: visible;
+        border-radius: 12px;
+        background: #ffffff;
+        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+    }
+
+    .qa-composer-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: #475569;
+        margin: 0;
+    }
+
+    .qa-input {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        height: 92px;
+        min-height: 92px;
+        max-height: 92px;
+        resize: none;
+        box-sizing: border-box;
+        font-size: 13px;
+        line-height: 1.5;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        padding: 12px 14px;
+        box-shadow: none;
+    }
+
+    .qa-input:focus {
+        border-color: #80bdff;
+        box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.18);
+    }
+
+    .qa-action-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: flex-start;
+        align-items: center;
+        width: 100%;
+        margin-top: 0;
+        padding-top: 2px;
+    }
+
+    .qa-action-btn {
+        font-weight: 500;
+        min-width: 88px;
+        white-space: nowrap;
+    }
+
+    .button-group .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        opacity: 1 !important;
+        background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%) !important;
+    }
+
+    .lyear-layout-content .card-body {
+        display: flex;
+        flex-direction: column;
+    }
+
+    @media (max-width: 768px) {
+        .qa-composer {
+            padding: 10px;
+        }
+
+        .qa-input {
+            height: 84px;
+            min-height: 84px;
+            max-height: 84px;
+        }
+
+        .qa-action-row {
+            justify-content: flex-start;
+        }
+
+        .qa-action-btn {
+            flex: 1 1 100px;
+        }
+    }
+</style>
+
+<script>
+    $(document).ready(function () {
+        $('#questionInput').focus();
+
+        const chatContainer = document.querySelector('.chat-container');
+        if (chatContainer) {
+            chatContainer.scrollTop = 0;
+        }
+    });
+</script>

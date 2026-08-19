@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{# 引入左侧内容区域 - 图谱查询与可视化 #}
+{% block left_content %}
+{% include 'left_content.html' %}
+{% endblock %}
+
+{# 引入右侧内容区域 - 问答小助手 #}
+{% block right_content %}
+{% include 'right_content.html' %}
+{% endblock %}

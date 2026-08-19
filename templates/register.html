@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+    <title>注册</title>
+    <link rel="icon" href="favicon.ico" type="/static/image/ico">
+    <meta name="keywords" content="注册">
+    <meta name="description" content="注册">
+    <meta name="author" content="yinqi">
+    <link href="/static/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/static/css/materialdesignicons.min.css" rel="stylesheet">
+    <link href="/static/css/style.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f5f5f5; /* 浅灰色背景作为备用 */
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .lyear-login-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 420px; /* 固定宽度，可根据需要调整 */
+            max-width: 90%; /* 响应式最大宽度 */
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            border-radius: 12px;
+            overflow: hidden;
+            transition: transform 0.3s ease;
+            background: rgba(255, 255, 255, 0.95); /* 半透明白色背景 */
+        }
+
+        .lyear-login-box:hover {
+            transform: translate(-50%, -52%); /* 调整hover效果以适应居中 */
+        }
+
+        /* 添加背景图容器 */
+        .login-background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: url('../static/images/back.jpg') no-repeat center center;
+            background-size: cover;
+            z-index: -1;
+        }
+
+        .lyear-login-right {
+            margin-left: 0;
+            padding: 40px 50px;
+            position: relative;
+            z-index: 999;
+            width: 100%;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #4CAF50, #45a049);
+            border: none;
+            letter-spacing: 1px;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+
+        .form-control:focus {
+            border-color: #4CAF50;
+            box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.1);
+        }
+
+        .text-center a {
+            color: #666;
+            transition: color 0.3s ease;
+            text-decoration: none;
+            font-size: 0.9em;
+        }
+
+        .text-center a:hover {
+            color: #4CAF50;
+            text-decoration: underline;
+        }
+
+        /* 响应式调整 */
+        @media screen and (max-width: 480px) {
+            .lyear-login-box {
+                width: 90%;
+            }
+            .lyear-login-right {
+                padding: 30px;
+            }
+        }
+
+        @media screen and (max-width: 320px) {
+            .lyear-login-right {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="login-background"></div>
+
+<div class="lyear-login-box">
+    <div class="lyear-login-right">
+        <form action="/accounts/register" method="post">
+            {% csrf_token %}
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input name="username" type="text" class="form-control" id="username" placeholder="请输入您的用户名">
+            </div>
+
+            <div class="form-group">
+                <label for="password">密码</label>
+                <input name="password" type="password" class="form-control" id="password" placeholder="请输入您的密码">
+            </div>
+
+            <div class="form-group">
+                <label for="password2">确认密码</label>
+                <input name="password2" type="password" class="form-control" id="password2" placeholder="请再次输入您的密码">
+            </div>
+
+            <div class="form-group mt-4">
+                <button class="btn btn-block btn-primary py-2" type="submit" style="font-size: 1.1em; border-radius: 8px;">
+                    📝 立即注册
+                </button>
+            </div>
+
+            <footer class="text-center mt-4">
+                <p class="m-b-0"><a href="/accounts/login">已有账号，去登录</a></p>
+            </footer>
+        </form>
+    </div>
+</div>
+
+<script type="text/javascript" src="/static/js/jquery.min.js"></script>
+<script type="text/javascript" src="/static/js/bootstrap.min.js"></script>
+<script type="text/javascript">;</script>
+{% if msg %}
+    <script>
+        alert("{{ msg }}")
+    </script>
+{% endif %}
+</body>
+</html>

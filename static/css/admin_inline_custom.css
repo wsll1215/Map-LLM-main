@@ -1,0 +1,179 @@
+/* =========================
+   Django Admin Inline 自定义样式（终版）
+   ========================= */
+
+/* === 通用部分：隐藏标题、优化删除按钮 === */
+.inline-related h3 {
+  display: none !important;
+}
+
+/* 优化只读字段显示 */
+.inline-related .readonly {
+  padding: 0 !important;
+}
+
+/* 删除按钮样式 */
+.inline-related .delete {
+  display: block !important;
+  margin-top: 10px !important;
+  padding: 8px 12px !important;
+  background: #fff3cd !important;
+  border: 1px solid #dc3545 !important;
+  border-radius: 4px !important;
+}
+.inline-related .delete label {
+  color: #dc3545 !important;
+  font-weight: bold !important;
+}
+.inline-related .delete:hover {
+  background: #ffe69c !important;
+}
+
+/* =========================
+   针对 “生成的地图” Inline 去除左侧空白
+   Django 默认容器 id: #generatedmap_set-group
+   ========================= */
+
+/* 通用：去掉外层缩进 */
+#generatedmap_set-group.inline-group,
+#generatedmap_set-group .inline-related,
+#generatedmap_set-group fieldset.module,
+#generatedmap_set-group .inline-related .module {
+  margin-left: 0 !important;
+  padding-left: 0 !important;
+}
+
+/* 新版 Django (grid 布局) */
+#generatedmap_set-group .form-row {
+  --label-width: 0 !important;              /* 关键：清空标签列宽度 */
+  display: grid !important;                 /* 强制单列布局 */
+  grid-template-columns: 1fr !important;    /* 只留一列 */
+  margin-left: 0 !important;
+  padding-left: 0 !important;
+}
+
+/* 让卡片占满整行 */
+#generatedmap_set-group .form-row .fieldBox {
+  grid-column: 1 / -1 !important;
+}
+
+/* 老版 Django (float 布局) 的兼容 */
+.aligned #generatedmap_set-group .form-row .readonly,
+.aligned #generatedmap_set-group .form-row input,
+.aligned #generatedmap_set-group .form-row select,
+.aligned #generatedmap_set-group .form-row textarea,
+.aligned #generatedmap_set-group .form-row > div {
+  margin-left: 0 !important;
+}
+
+/* 彻底隐藏 label 及其占位（冒号来自 label:after） */
+#generatedmap_set-group .form-row label,
+#generatedmap_set-group .form-row label::after {
+  display: none !important;
+  width: 0 !important;
+  content: "" !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+}
+
+/* 修复冒号残影问题（部分版本在 label:after 生成 “:”） */
+#generatedmap_set-group .form-row label:after {
+  content: none !important;
+}
+
+/* 防止 fieldset.module 在 grid 内额外缩进 */
+#generatedmap_set-group .module {
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+
+/* 彻底清掉“标签列”可能产生的冒号（多重保险） */
+#generatedmap_set-group .form-row label,
+#generatedmap_set-group .form-row label::before,
+#generatedmap_set-group .form-row label::after,
+#generatedmap_set-group .form-row::before,
+#generatedmap_set-group .form-row::after,
+#generatedmap_set-group .form-row > *::before,
+#generatedmap_set-group .form-row > *::after,
+#generatedmap_set-group .inline-label,
+#generatedmap_set-group .inline-label::before,
+#generatedmap_set-group .inline-label::after {
+  content: "" !important;
+  display: none !important;
+  width: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  font-size: 0 !important; /* 避免某些主题用字体渲染冒号 */
+  line-height: 0 !important;
+}
+
+/* ============================
+   去掉 “生成的地图” + “对话消息” 左侧 label 与冒号列
+   ============================ */
+
+/* 通用布局修正（Django 3/4 grid 布局 + 老版本 float 布局） */
+#generated_maps-group .form-row,
+#generatedmap_set-group .form-row,
+#chat_messages-group .form-row,
+#chatmessage_set-group .form-row {
+  --label-width: 0 !important;      /* grid 标签列宽清零 */
+  display: grid !important;
+  grid-template-columns: 1fr !important;
+  margin-left: 0 !important;
+  padding-left: 0 !important;
+}
+
+/* 完全隐藏 label（包括真正的冒号文字） */
+#generated_maps-group .form-row label,
+#generatedmap_set-group .form-row label,
+#chat_messages-group .form-row label,
+#chatmessage_set-group .form-row label {
+  display: none !important;
+  visibility: hidden !important;
+  width: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+}
+
+/* 清除伪元素冒号 */
+#generated_maps-group .form-row label::before,
+#generated_maps-group .form-row label::after,
+#generatedmap_set-group .form-row label::before,
+#generatedmap_set-group .form-row label::after,
+#chat_messages-group .form-row label::before,
+#chat_messages-group .form-row label::after,
+#chatmessage_set-group .form-row label::before,
+#chatmessage_set-group .form-row label::after {
+  content: none !important;
+  display: none !important;
+}
+
+/* 让只读内容（卡片）占满整行，左贴齐 */
+#generated_maps-group .form-row .readonly,
+#generatedmap_set-group .form-row .readonly,
+#chat_messages-group .form-row .readonly,
+#chatmessage_set-group .form-row .readonly {
+  grid-column: 1 / -1 !important;
+  margin-left: 0 !important;
+}
+
+/* 外层容器额外缩进清零（双保险） */
+#generated_maps-group.inline-group,
+#generatedmap_set-group.inline-group,
+#chat_messages-group.inline-group,
+#chatmessage_set-group.inline-group,
+#generated_maps-group .inline-related,
+#generatedmap_set-group .inline-related,
+#chat_messages-group .inline-related,
+#chatmessage_set-group .inline-related,
+#generated_maps-group fieldset.module,
+#generatedmap_set-group fieldset.module,
+#chat_messages-group fieldset.module,
+#chatmessage_set-group fieldset.module {
+  margin-left: 0 !important;
+  padding-left: 0 !important;
+}

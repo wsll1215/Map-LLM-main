@@ -1,0 +1,29 @@
+/* 改变列表页表头样式 */
+#changelist table thead th {
+    background-color: #f5f5f5;
+    color: #333;
+    font-weight: bold;
+}
+
+/* 美化表单样式 */
+.form-row {
+    padding: 8px;
+    border-bottom: 1px solid #eee;
+}
+
+/* 美化按钮样式 */
+.button, input[type=submit], input[type=button], .submit-row input {
+    background: #417690;
+    border-radius: 4px;
+}
+
+/* 改变悬停效果 */
+.button:hover, input[type=submit]:hover, input[type=button]:hover {
+    background: #205067;
+}
+
+/* 美化标题样式 */
+h1 {
+    color: #417690;
+    font-weight: bold;
+}

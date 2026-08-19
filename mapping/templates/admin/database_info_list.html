@@ -1,0 +1,301 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block title %}{{ title }} - {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block extrastyle %}
+<style>
+    .database-info-container {
+        padding: 20px;
+        max-width: 1400px;
+        margin: 0 auto;
+    }
+
+    .db-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 30px;
+        border-radius: 12px;
+        margin-bottom: 30px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+
+    .db-header h1 {
+        margin: 0 0 10px 0;
+        font-size: 28px;
+        font-weight: 600;
+    }
+
+    .db-meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 15px;
+        margin-top: 20px;
+    }
+
+    .db-meta-item {
+        background: rgba(255,255,255,0.1);
+        padding: 15px;
+        border-radius: 8px;
+        backdrop-filter: blur(10px);
+    }
+
+    .db-meta-label {
+        font-size: 12px;
+        opacity: 0.8;
+        margin-bottom: 5px;
+    }
+
+    .db-meta-value {
+        font-size: 16px;
+        font-weight: 600;
+    }
+
+    .tables-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+        gap: 20px;
+        margin-top: 20px;
+    }
+
+    .table-card {
+        background: white;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        transition: all 0.3s ease;
+        border: 2px solid transparent;
+    }
+
+    .table-card:hover {
+        box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+        border-color: #667eea;
+        transform: translateY(-2px);
+    }
+
+    .table-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+        padding-bottom: 15px;
+        border-bottom: 2px solid #f0f0f0;
+    }
+
+    .table-name {
+        font-size: 18px;
+        font-weight: 600;
+        color: #333;
+    }
+
+    .table-chinese-name {
+        font-size: 14px;
+        color: #667eea;
+        font-weight: 500;
+        margin-top: 5px;
+    }
+
+    .table-count {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 8px 16px;
+        border-radius: 20px;
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    .table-columns {
+        margin: 15px 0;
+        max-height: 150px;
+        overflow-y: auto;
+    }
+
+    .column-item {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 12px;
+        background: #f8f9fa;
+        margin-bottom: 5px;
+        border-radius: 6px;
+        font-size: 13px;
+    }
+
+    .column-name {
+        color: #333;
+        font-weight: 500;
+    }
+
+    .column-type {
+        color: #666;
+        font-size: 12px;
+    }
+
+    .table-actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 15px;
+    }
+
+    .action-btn {
+        flex: 1;
+        padding: 10px;
+        border: none;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        text-decoration: none;
+        text-align: center;
+        display: inline-block;
+    }
+
+    .btn-view {
+        background: #4CAF50;
+        color: white;
+    }
+
+    .btn-view:hover {
+        background: #45a049;
+        transform: scale(1.05);
+    }
+
+    .btn-export {
+        background: #2196F3;
+        color: white;
+    }
+
+    .btn-export:hover {
+        background: #0b7dda;
+        transform: scale(1.05);
+    }
+
+    .btn-clear {
+        background: #f44336;
+        color: white;
+    }
+
+    .btn-clear:hover {
+        background: #da190b;
+        transform: scale(1.05);
+    }
+
+    .error-message {
+        background: #fff3cd;
+        border: 1px solid #ffc107;
+        color: #856404;
+        padding: 20px;
+        border-radius: 8px;
+        margin: 20px 0;
+    }
+
+    .no-data {
+        text-align: center;
+        padding: 40px;
+        color: #999;
+        font-size: 16px;
+    }
+
+    /* 滚动条样式 */
+    .table-columns::-webkit-scrollbar {
+        width: 6px;
+    }
+
+    .table-columns::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 3px;
+    }
+
+    .table-columns::-webkit-scrollbar-thumb {
+        background: #888;
+        border-radius: 3px;
+    }
+
+    .table-columns::-webkit-scrollbar-thumb:hover {
+        background: #555;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="database-info-container">
+    {% if db_stats %}
+        <div class="db-header">
+            <h1>📊 {{ title }}</h1>
+            <div class="db-meta">
+                <div class="db-meta-item">
+                    <div class="db-meta-label">📁 数据库路径</div>
+                    <div class="db-meta-value" style="font-size: 12px; word-break: break-all;">{{ db_stats.path }}</div>
+                </div>
+                <div class="db-meta-item">
+                    <div class="db-meta-label">💾 文件大小</div>
+                    <div class="db-meta-value">{{ db_stats.size|filesizeformat }}</div>
+                </div>
+                <div class="db-meta-item">
+                    <div class="db-meta-label">📅 创建时间</div>
+                    <div class="db-meta-value">{{ db_stats.created_at|date:"Y-m-d H:i" }}</div>
+                </div>
+                <div class="db-meta-item">
+                    <div class="db-meta-label">🔄 最后修改</div>
+                    <div class="db-meta-value">{{ db_stats.modified_at|date:"Y-m-d H:i" }}</div>
+                </div>
+                <div class="db-meta-item">
+                    <div class="db-meta-label">📋 表数量</div>
+                    <div class="db-meta-value">{{ db_stats.tables|length }} 个表</div>
+                </div>
+            </div>
+        </div>
+
+        {% if db_stats.error %}
+            <div class="error-message">
+                ⚠️ 读取数据库时出错: {{ db_stats.error }}
+            </div>
+        {% else %}
+            {% if db_stats.tables %}
+                <div class="tables-grid">
+                    {% for table in db_stats.tables %}
+                        <div class="table-card">
+                            <div class="table-header">
+                                <div>
+                                    <div class="table-name">{{ table.chinese_name }}</div>
+                                    <div class="table-chinese-name">{{ table.name }}</div>
+                                </div>
+                                <div class="table-count">{{ table.count }} 条</div>
+                            </div>
+
+                            <div class="table-columns">
+                                {% for column in table.columns %}
+                                    <div class="column-item">
+                                        <span class="column-name">{{ column.name }}</span>
+                                        <span class="column-type">{{ column.type }}</span>
+                                    </div>
+                                {% endfor %}
+                            </div>
+
+                            <div class="table-actions">
+                                <a href="/admin/mapping/{{ opts.model_name }}/view/{{ table.name }}/"
+                                   class="action-btn btn-view">
+                                    👁️ 查看数据
+                                </a>
+                                <a href="/admin/mapping/{{ opts.model_name }}/export/{{ table.name }}/"
+                                   class="action-btn btn-export">
+                                    📥 导出CSV
+                                </a>
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <div class="no-data">
+                    📭 数据库中没有表
+                </div>
+            {% endif %}
+        {% endif %}
+    {% else %}
+        <div class="error-message">
+            ⚠️ 数据库文件不存在或无法访问
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
+

@@ -1,0 +1,3697 @@
+﻿<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>智能地图制作 - Map-LLM</title>
+
+    <!-- 基础资源 -->
+    <link rel="icon" href="favicon.ico" type="image/ico">
+    <link href="/static/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/static/css/materialdesignicons.min.css" rel="stylesheet">
+    <link href="/static/css/style.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+    <script src="/static/jquery-1.10.2.min.js"></script>
+
+    <!-- 页面样式 -->
+    <style>
+        /* 基础布局 */
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: 'Microsoft YaHei', Arial, sans-serif;
+        }
+
+        .mapping-layout {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* 顶部导航栏 */
+        .mapping-header {
+            height: 60px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            position: relative;
+            z-index: 1000;
+        }
+
+        .mapping-title {
+            font-size: 24px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .user-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            color: rgba(255, 255, 255, 0.9);
+        }
+
+        .user-info a {
+            transition: all 0.3s ease;
+            padding: 8px 12px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .user-info a:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            text-decoration: none;
+        }
+
+        /* 主内容容器 */
+        .mapping-container {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* 左侧聊天区域 */
+        .chat-panel {
+            width: 38%;
+            background: #f8f9fa;
+            border-right: 1px solid #e9ecef;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chat-header {
+            padding: 8px 12px;
+            background: white;
+            border-bottom: 1px solid #e9ecef;
+            font-weight: bold;
+            color: #495057;
+            font-size: 14px;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .message {
+            max-width: 80%;
+            padding: 8px 12px;
+            border-radius: 12px;
+            word-wrap: break-word;
+            line-height: 1.3;
+            font-size: 13px;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 3px;
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background: white;
+            border: 1px solid #e9ecef;
+            color: #495057;
+            border-bottom-left-radius: 3px;
+        }
+
+        /* 日志消息样式 */
+        .message.log {
+            align-self: flex-start;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            color: #495057;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-width: 90%;
+        }
+
+        .message.log.info {
+            border-left: 4px solid #17a2b8;
+        }
+
+        .message.log.warning {
+            border-left: 4px solid #ffc107;
+            background: #fff3cd;
+        }
+
+        .message.log.error {
+            border-left: 4px solid #dc3545;
+            background: #f8d7da;
+        }
+
+        .message.log.debug {
+            border-left: 4px solid #6c757d;
+            background: #e2e3e5;
+        }
+
+        .log-header {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 4px;
+            font-weight: bold;
+        }
+
+        .log-level {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+
+        .log-level {
+            background: #17a2b8;
+            color: white;
+        }
+
+        .message.log.warning .log-level {
+            background: #ffc107;
+            color: #212529;
+        }
+
+        .message.log.error .log-level {
+            background: #dc3545;
+            color: white;
+        }
+
+        .message.log.debug .log-level {
+            background: #6c757d;
+            color: white;
+        }
+
+        .log-step {
+            padding: 2px 6px;
+            background: #e9ecef;
+            border-radius: 4px;
+            font-size: 10px;
+            color: #495057;
+        }
+
+        .log-progress {
+            padding: 2px 6px;
+            background: #28a745;
+            color: white;
+            border-radius: 4px;
+            font-size: 10px;
+        }
+
+        .log-content {
+            line-height: 1.4;
+            white-space: pre-wrap;
+        }
+
+        /* 日志容器样式 */
+        .message.log-container {
+            align-self: flex-start;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-left: 4px solid #17a2b8;
+            color: #495057;
+            max-width: 95%;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+
+        .log-title {
+            font-weight: bold;
+            color: #17a2b8;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .log-status {
+            font-size: 10px;
+            color: #6c757d;
+            font-style: italic;
+        }
+
+        .log-status.updating {
+            color: #28a745;
+        }
+
+        .log-status.completed {
+            color: #6c757d;
+        }
+
+        .log-content-container {
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 8px;
+            background: white;
+            border-radius: 4px;
+            padding: 8px;
+        }
+
+        .log-entry {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin-bottom: 4px;
+            padding: 2px 0;
+            border-bottom: 1px solid #f1f3f4;
+            font-size: 11px;
+            line-height: 1.3;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+        }
+
+        .log-timestamp {
+            color: #6c757d;
+            font-size: 10px;
+            min-width: 60px;
+            flex-shrink: 0;
+        }
+
+        .log-step-badge {
+            background: #e9ecef;
+            color: #495057;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 9px;
+            flex-shrink: 0;
+        }
+
+        .log-progress-badge {
+            background: #28a745;
+            color: white;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 9px;
+            flex-shrink: 0;
+        }
+
+        .log-message {
+            flex: 1;
+            word-break: break-word;
+        }
+
+        .log-entry.warning .log-message {
+            color: #856404;
+        }
+
+        .log-entry.error .log-message {
+            color: #721c24;
+        }
+
+        .log-entry.debug .log-message {
+            color: #6c757d;
+        }
+
+        /* 日志容器滚动条样式 */
+        .log-content-container::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .log-content-container::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 3px;
+        }
+
+        .log-content-container::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 3px;
+        }
+
+        .log-content-container::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+
+        /* 流式输出样式 */
+        .message.streaming-log {
+            max-width: 95%;
+            background: white;
+            border: 1px solid #e9ecef;
+            border-left: 4px solid #17a2b8;
+        }
+
+        .streaming-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            font-weight: bold;
+            color: #495057;
+        }
+
+        .streaming-header i {
+            color: #17a2b8;
+        }
+
+        .streaming-title {
+            flex: 1;
+            font-size: 14px;
+        }
+
+        .streaming-status {
+            font-size: 12px;
+            color: #6c757d;
+            font-weight: normal;
+            font-style: italic;
+        }
+
+        .streaming-status.executing {
+            color: #28a745;
+        }
+
+        .streaming-status.completed {
+            color: #6c757d;
+        }
+
+        .streaming-content {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #f8f9fa;
+        }
+
+        .log-stream {
+            margin: 0;
+            padding: 12px;
+            font-family: 'Courier New', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            color: #495057;
+            background: transparent;
+            border: none;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+
+        /* 流式输出滚动条样式 */
+        .streaming-content::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .streaming-content::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
+        }
+
+        .streaming-content::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 4px;
+        }
+
+        .streaming-content::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+
+        /* 添加打字机效果的动画 */
+        .streaming-status.executing::after {
+            content: '';
+            display: inline-block;
+            width: 3px;
+            height: 12px;
+            background: #28a745;
+            margin-left: 4px;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+
+            0%,
+            50% {
+                opacity: 1;
+            }
+
+            51%,
+            100% {
+                opacity: 0;
+            }
+        }
+
+        .message.system {
+            align-self: center;
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+            font-style: italic;
+            text-align: center;
+            max-width: 60%;
+        }
+
+        .chat-input-area {
+            padding: 12px;
+            background: white;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        .chat-input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #e9ecef;
+            border-radius: 20px;
+            outline: none;
+            font-size: 13px;
+            transition: border-color 0.3s;
+            resize: none;
+            min-height: 36px;
+            max-height: 120px;
+            overflow-y: auto;
+            line-height: 1.4;
+            font-family: inherit;
+        }
+
+        .chat-input:focus {
+            border-color: #667eea;
+        }
+
+        /* 自定义滚动条样式 */
+        .chat-input::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .chat-input::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 3px;
+        }
+
+        .chat-input::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 3px;
+        }
+
+        .chat-input::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+
+        .send-btn {
+            padding: 8px 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 20px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 13px;
+            transition: transform 0.2s;
+        }
+
+        .send-btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* 右侧地图展示区域 */
+        .map-panel {
+            width: 62%;
+            background: white;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .map-header {
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            font-weight: bold;
+            color: #495057;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .map-header-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* 下载按钮组容器 */
+        .download-btn-group {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .download-btn {
+            padding: 6px 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 16px 0 0 16px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .download-btn:hover {
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .download-btn:active {
+            transform: translateY(0);
+        }
+
+        .download-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* 格式选择按钮 */
+        .download-format-toggle {
+            padding: 6px 8px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-left: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 0 16px 16px 0;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+        }
+
+        .download-format-toggle:hover {
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+        }
+
+        .download-format-toggle.active {
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+        }
+
+        /* 格式选择下拉菜单 */
+        .download-format-menu {
+            position: absolute;
+            top: calc(100% + 5px);
+            right: 0;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+            min-width: 180px;
+            z-index: 1000;
+            display: none;
+            overflow: hidden;
+        }
+
+        .download-format-menu.show {
+            display: block;
+            animation: slideDown 0.2s ease;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* 格式选项 */
+        .format-option {
+            padding: 10px 15px;
+            cursor: pointer;
+            transition: background 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .format-option:last-child {
+            border-bottom: none;
+        }
+
+        .format-option:hover {
+            background: #f8f9fa;
+        }
+
+        .format-option i {
+            color: #667eea;
+            font-size: 16px;
+            width: 20px;
+            text-align: center;
+        }
+
+        .format-option .format-desc {
+            margin-left: auto;
+            font-size: 11px;
+            color: #999;
+        }
+
+        .format-option.selected {
+            background: #f0f4ff;
+        }
+
+        .format-option.selected i {
+            color: #764ba2;
+        }
+
+        .map-content {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+            background: white;
+        }
+
+        .map-placeholder {
+            text-align: center;
+            color: #6c757d;
+            padding: 30px;
+        }
+
+        .map-placeholder i {
+            font-size: 48px;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+
+        .map-placeholder h4 {
+            font-size: 16px;
+            margin-bottom: 8px;
+        }
+
+        .map-placeholder p {
+            font-size: 13px;
+            margin-bottom: 0;
+        }
+
+        .map-image {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border: none;
+            box-shadow: none;
+        }
+
+        .loading-spinner {
+            display: none;
+            text-align: center;
+            padding: 30px;
+        }
+
+        .loading-spinner p {
+            font-size: 13px;
+            margin-top: 10px;
+        }
+
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        /* 状态指示器 */
+        .status-indicator {
+            padding: 6px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .status-pending {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .status-processing {
+            background: #cce5ff;
+            color: #004085;
+        }
+
+        .status-completed {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-failed {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        /* 响应式设计 */
+        @media (max-width: 768px) {
+            .mapping-container {
+                flex-direction: column;
+            }
+
+            .chat-panel,
+            .map-panel {
+                width: 100%;
+                height: 50%;
+            }
+        }
+
+        /* 滚动条样式 */
+        .chat-messages::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .chat-messages::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 3px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 3px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+        /* 默认比例：左 38% / 右 62%（可拖拽更改） */
+        .mapping-container {
+            display: flex;
+            overflow: hidden;
+        }
+
+        .chat-panel {
+            flex: 0 0 38%;
+            width: 38%;            /* 兼容旧写法 */
+            min-width: 260px;      /* 设个下限，避免拖太窄 */
+        }
+
+        .map-panel {
+            flex: 1 1 62%;
+            width: 62%;
+            min-width: 360px;
+        }
+
+        /* 中间可拖拽分割线 */
+        .resize-handle {
+            flex: 0 0 6px;
+            width: 6px;
+            cursor: col-resize;
+            background: linear-gradient(180deg, #e9ecef, #dfe3e8);
+            border-left: 1px solid #e3e6ea;
+            border-right: 1px solid #e3e6ea;
+            transition: background 0.15s ease;
+        }
+        .resize-handle:hover {
+            background: #d7dbe0;
+        }
+
+        /* 拖拽时禁用选中，给点反馈 */
+        body.resizing,
+        body.resizing * {
+            cursor: col-resize !important;
+            user-select: none !important;
+        }
+
+        /* 移动端：上下布局，隐藏分割线，宽度恢复 100% */
+        @media (max-width: 768px) {
+            .mapping-container {
+                flex-direction: column;
+            }
+            .chat-panel,
+            .map-panel {
+                width: 100%;
+                height: 50%;
+                flex: 0 0 auto;
+                min-width: 0;
+            }
+            .resize-handle {
+                display: none;
+            }
+        }
+
+        /* 作为图片视口（裁切边界） */
+        .map-viewport {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;      /* 裁掉超出的部分，用于拖拽查看 */
+            background: #fff;
+        }
+
+        /* 实际承载图片的层，可被缩放/平移 */
+        .map-image-layer {
+            position: absolute;
+            inset: 0;              /* top:0 right:0 bottom:0 left:0 */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            /* transform-origin: center center; 围绕中心缩放 */
+            transform-origin: 0 0; 
+            will-change: transform;
+            cursor: grab;          /* 拖拽手型 */
+        }
+        .map-image-layer.dragging { cursor: grabbing; }
+
+        /* 复用你现有的 .map-image 外观，但不要限制缩放 */
+        .map-image {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            user-select: none;     /* 防止拖拽时选中文本/图片 */
+            pointer-events: none;  /* 事件交给容器处理（更顺滑） */
+        }
+
+        /* 右下角小工具栏 */
+        .zoom-toolbar {
+            position: absolute;
+            right: 12px;
+            bottom: 12px;
+            display: flex;
+            gap: 8px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid #e9ecef;
+            border-radius: 10px;
+            padding: 6px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+        }
+        .zoom-toolbar button {
+            border: 1px solid #e5e7eb;
+            background: #fff;
+            padding: 6px 10px;
+            border-radius: 8px;
+            font-size: 13px;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .zoom-toolbar button:hover { background: #f8fafc; }
+        .zoom-toolbar .zoom-readout {
+            min-width: 54px;
+            text-align: center;
+            padding: 6px 8px;
+            border-radius: 8px;
+            background: #f3f4f6;
+            border: 1px solid #e5e7eb;
+            font-variant-numeric: tabular-nums;
+        }
+        .resize-handle {
+        align-self: stretch;
+        z-index: 2;
+        }
+        .map-viewport { touch-action: none; }
+
+        /* 实时制图工作区：保留同一页面预览能力，只优化右侧地图面板表现 */
+        .map-panel {
+            background: #ffffff;
+            position: relative;
+        }
+
+        .map-header {
+            min-height: 58px;
+            padding: 10px 16px;
+            background: #ffffff;
+            border-bottom: 1px solid #dbe3ef;
+            box-shadow: 0 1px 0 rgba(15, 23, 42, 0.03);
+        }
+
+        .map-header-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #172033;
+        }
+
+        .map-header-title i {
+            width: 30px;
+            height: 30px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: #2563eb;
+            background: #eaf1ff;
+            border-radius: 8px;
+        }
+
+        .map-title-text {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            line-height: 1.15;
+        }
+
+        .map-title-main {
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        .map-title-sub {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            font-size: 11px;
+            font-weight: 400;
+            color: #6b7280;
+        }
+
+        .map-header-actions {
+            gap: 8px;
+        }
+
+        .history-toggle-btn,
+        .history-refresh-btn,
+        .history-close-btn {
+            height: 30px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 0 10px;
+            border: 1px solid #d7dee8;
+            border-radius: 8px;
+            background: #ffffff;
+            color: #334155;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+        }
+
+        .history-toggle-btn:hover,
+        .history-refresh-btn:hover,
+        .history-close-btn:hover,
+        .history-toggle-btn.active {
+            background: #eff6ff;
+            border-color: #93c5fd;
+            color: #1d4ed8;
+        }
+
+        .history-refresh-btn,
+        .history-close-btn {
+            width: 30px;
+            padding: 0;
+        }
+
+        .map-history-panel {
+            position: absolute;
+            top: 58px;
+            right: 0;
+            bottom: 0;
+            width: min(360px, 46%);
+            z-index: 15;
+            display: flex;
+            flex-direction: column;
+            background: rgba(255, 255, 255, 0.98);
+            border-left: 1px solid #dbe3ef;
+            box-shadow: -12px 0 24px rgba(15, 23, 42, 0.08);
+            transform: translateX(100%);
+            transition: transform 0.18s ease-out;
+        }
+
+        .map-history-panel.open {
+            transform: translateX(0);
+        }
+
+        .history-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 12px;
+            border-bottom: 1px solid #e5eaf1;
+        }
+
+        .history-panel-title {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+
+        .history-panel-title strong {
+            color: #172033;
+            font-size: 14px;
+        }
+
+        .history-panel-title span {
+            color: #64748b;
+            font-size: 11px;
+            font-weight: 400;
+        }
+
+        .history-panel-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .history-map-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+
+        .history-session {
+            margin-bottom: 12px;
+        }
+
+        .history-session-title {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+            color: #334155;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .history-session-title span {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .history-session-title small {
+            flex: 0 0 auto;
+            color: #94a3b8;
+            font-size: 10px;
+            font-weight: 500;
+        }
+
+        .history-map-item {
+            width: 100%;
+            display: grid;
+            grid-template-columns: 76px minmax(0, 1fr);
+            gap: 10px;
+            margin-bottom: 8px;
+            padding: 8px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background: #ffffff;
+            color: #1f2937;
+            text-align: left;
+            cursor: pointer;
+        }
+
+        .history-map-item:hover,
+        .history-map-item.active {
+            border-color: #60a5fa;
+            background: #eff6ff;
+        }
+
+        .history-map-item.missing {
+            opacity: 0.58;
+            cursor: not-allowed;
+        }
+
+        .history-map-thumb {
+            width: 76px;
+            height: 54px;
+            object-fit: cover;
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+        }
+
+        .history-map-meta {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .history-map-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 12px;
+            font-weight: 700;
+            color: #111827;
+        }
+
+        .history-map-detail {
+            color: #64748b;
+            font-size: 11px;
+            line-height: 1.3;
+        }
+
+        .history-empty,
+        .history-loading,
+        .history-error {
+            padding: 28px 12px;
+            color: #64748b;
+            text-align: center;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .history-error {
+            color: #b91c1c;
+        }
+
+        .map-content {
+            align-items: stretch;
+            justify-content: stretch;
+            padding: 0;
+            background: #ffffff;
+        }
+
+        .map-placeholder,
+        .loading-spinner {
+            width: 100%;
+            min-height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: none;
+            border-radius: 0;
+            background: #ffffff;
+        }
+
+        .loading-spinner {
+            display: none;
+        }
+
+        .map-placeholder i {
+            color: #2563eb;
+            opacity: 0.72;
+        }
+
+        .map-viewport {
+            border: none;
+            border-radius: 0;
+            background: #ffffff;
+            box-shadow: none;
+        }
+
+        .vector-map-svg {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        .map-image-layer {
+            z-index: 1;
+            padding: 0;
+        }
+
+        .map-image {
+            border-radius: 0;
+            filter: none;
+            opacity: 0;
+            transition: opacity 0.12s ease-out;
+        }
+
+        .map-image.is-visible {
+            opacity: 1;
+        }
+
+        .vector-map-empty {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 4;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            padding: 0;
+            color: #64748b;
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
+            backdrop-filter: none;
+            text-align: center;
+            pointer-events: none;
+        }
+
+        .vector-map-empty i {
+            color: #2563eb;
+            font-size: 28px;
+            opacity: 0.9;
+        }
+
+        .vector-map-empty .vector-empty-text {
+            max-width: 20em;
+            font-size: 14px;
+            line-height: 1.5;
+            color: #64748b;
+        }
+        }
+
+        .realtime-step {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #334155;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            flex: 0 0 auto;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.14);
+        }
+
+        .vector-step-badge {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .zoom-toolbar {
+            right: 20px;
+            bottom: 20px;
+            z-index: 8;
+            border-radius: 8px;
+            background: rgba(255,255,255,0.94);
+            border-color: rgba(203, 213, 225, 0.95);
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+            backdrop-filter: blur(8px);
+        }
+
+        .zoom-toolbar button {
+            border-radius: 6px;
+            color: #334155;
+        }
+
+        .status-indicator {
+            border-radius: 999px;
+            text-transform: none;
+            letter-spacing: 0;
+        }
+
+        @media (max-width: 980px) {
+            .map-history-panel {
+                width: 100%;
+            }
+
+            .zoom-toolbar {
+                bottom: 20px;
+            }
+        }
+
+    </style>
+</head>
+
+<body>
+    <div class="mapping-layout">
+        <!-- 顶部导航 -->
+        <header class="mapping-header">
+            <div class="mapping-title">
+                <i class="fas fa-map-marked-alt"></i>
+                智能地图制作系统
+            </div>
+            <div class="user-info">
+                <a href="/" style="color: rgba(255,255,255,0.9); text-decoration: none; margin-right: 20px;">
+                    <i class="fas fa-project-diagram"></i> 知识图谱
+                </a>
+                <span>{{ request.user.username }}</span>
+                <a href="/accounts/logout" style="color: rgba(255,255,255,0.9); text-decoration: none;">
+                    <i class="fas fa-sign-out-alt"></i> 退出
+                </a>
+            </div>
+        </header>
+
+        <!-- 主内容区域 -->
+        <div class="mapping-container">
+            <!-- 左侧聊天面板 -->
+            <div class="chat-panel">
+                <div class="chat-header" style="display: flex; justify-content: space-between; align-items: center;">
+                    <span><i class="fas fa-comments"></i> 制图助手</span>
+                    <button id="newSessionBtn" class="btn btn-sm" style="background: rgba(255,255,255,0.2); color: #495057; border: none; border-radius: 12px; padding: 4px 12px; font-size: 12px;" title="开始新会话">
+                        <i class="fas fa-plus"></i> 新会话
+                    </button>
+                </div>
+
+                <div class="chat-messages" id="chatMessages">
+                    <div class="message assistant">
+                        您好！我是智能地图制作助手。请按以下格式描述您的制图需求：
+                        <br><br>
+                        <strong>📌 传统地图制作</strong><br>
+                        <!-- 需包含以下内容：<br> -->
+                        <strong>1. 数据文件说明</strong><br>
+                        &nbsp;&nbsp;&nbsp;• 指定数据目录（如data1）<br>
+                        &nbsp;&nbsp;&nbsp;• 列出需要的.shp文件<br>
+                        <strong>2. 地图设置要求</strong><br>
+                        &nbsp;&nbsp;&nbsp;• 地图标题<br>
+                        &nbsp;&nbsp;&nbsp;• 背景色、图片大小、分辨率<br>
+                        &nbsp;&nbsp;&nbsp;• 是否显示图例、比例尺、指北针<br>
+                        <strong>3. 图层样式要求</strong><br>
+                        &nbsp;&nbsp;&nbsp;• 每个图层的颜色、线宽、线型等<br>
+                        &nbsp;&nbsp;&nbsp;• 标记样式、标签设置<br>
+                        &nbsp;&nbsp;&nbsp;• （可选）添加文字注记<br>
+                        <br>
+                        <strong>📌 路网综合可视化</strong><br>
+                        <!-- 需包含以下内容：<br> -->
+                        <strong>1. 数据文件说明</strong><br>
+                        &nbsp;&nbsp;&nbsp;• 指定数据目录（如data6）<br>
+                        &nbsp;&nbsp;&nbsp;• 指定路网.shp文件<br>
+                        <strong>2. 算法要求</strong><br>
+                        &nbsp;&nbsp;&nbsp;• 使用gcnn算法或层次算法<br>
+                        <strong>3. 保留比例</strong><br>
+                        &nbsp;&nbsp;&nbsp;• 如：保留比例为0.8<br>
+                        &nbsp;&nbsp;&nbsp;• 尺度要求：如1:500到1:2000<br>
+                        <br>
+                        <strong>💡 提示：</strong>地图生成后，您可以继续对话进行修改，如"删除Highway图层"、"修改背景色为蓝色"、"添加比例尺"等。
+                    </div>
+                </div>
+
+
+                <div class="chat-input-area">
+                    <div class="input-group">
+                        <textarea class="chat-input" id="chatInput" placeholder="请描述您的制图需求..." maxlength="1000"
+                            rows="1"></textarea>
+                        <button type="button" class="send-btn" id="sendBtn">
+                            <i class="fas fa-paper-plane"></i> 发送
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 分割线（新增） -->
+            <div class="resize-handle" id="resizeHandle" title="拖动调整左右宽度"></div>
+
+            <!-- 右侧地图展示面板 -->
+            <div class="map-panel">
+                <div class="map-header">
+                    <div class="map-header-title">
+                        <i class="fas fa-map"></i>
+                        <div class="map-title-text">
+                            <span class="map-title-main">地图工作区</span>
+                            <span class="map-title-sub realtime-step">
+                                <span class="live-dot"></span>
+                                <span id="vectorStepBadge" class="vector-step-badge">实时预览准备中...</span>
+                            </span>
+                        </div>
+                    </div>
+                    <div class="map-header-actions">
+                        <button type="button" id="historyToggleBtn" class="history-toggle-btn" title="查看历史地图">
+                            <i class="fas fa-history"></i> 历史
+                        </button>
+                        <div class="download-btn-group" id="downloadBtnGroup" style="display: none;">
+                            <button id="downloadBtn" class="download-btn" title="下载地图">
+                                <i class="fas fa-download"></i> 下载
+                            </button>
+                            <button id="downloadFormatToggle" class="download-format-toggle" title="选择格式">
+                                <i class="fas fa-caret-down"></i>
+                            </button>
+                            <div class="download-format-menu" id="downloadFormatMenu">
+                                <div class="format-option" data-format="png">
+                                    <i class="fas fa-image"></i> PNG格式
+                                    <span class="format-desc">推荐,高质量</span>
+                                </div>
+                                <div class="format-option" data-format="jpg">
+                                    <i class="fas fa-file-image"></i> JPG格式
+                                    <span class="format-desc">文件较小</span>
+                                </div>
+                                <div class="format-option" data-format="pdf">
+                                    <i class="fas fa-file-pdf"></i> PDF格式
+                                    <span class="format-desc">适合打印</span>
+                                </div>
+                                <div class="format-option" data-format="svg">
+                                    <i class="fas fa-vector-square"></i> SVG格式
+                                    <span class="format-desc">矢量图形</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="mapStatus"></div>
+                    </div>
+                </div>
+
+                <div class="map-content" id="mapContent">
+                    <div class="map-placeholder">
+                        <i class="fas fa-map-marked-alt"></i>
+                        <h4>等待地图生成</h4>
+                        <p>请在左侧输入您的制图需求，系统将为您生成专业的地图</p>
+                    </div>
+
+                    <div class="loading-spinner" id="loadingSpinner">
+                        <div class="spinner"></div>
+                        <p>正在生成地图，请稍候...</p>
+                    </div>
+                </div>
+
+                <aside class="map-history-panel" id="mapHistoryPanel" aria-hidden="true">
+                    <div class="history-panel-header">
+                        <div class="history-panel-title">
+                            <strong>历史地图</strong>
+                            <span>选择历史成果后可继续修改该会话</span>
+                        </div>
+                        <div class="history-panel-actions">
+                            <button type="button" id="historyRefreshBtn" class="history-refresh-btn" title="刷新历史地图">
+                                <i class="fas fa-rotate"></i>
+                            </button>
+                            <button type="button" id="historyCloseBtn" class="history-close-btn" title="关闭历史地图">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="history-map-list" id="historyMapList">
+                        <div class="history-empty">尚未加载历史地图</div>
+                    </div>
+                </aside>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript -->
+    <script src="/static/js/bootstrap.min.js"></script>
+    <script>
+        // 全局变量
+        let currentRequestId = null;
+        let logPollingInterval = null;
+        let lastLogTime = null;
+        let logContainer = null; // 日志容器元素
+        let seenLogMessages = new Set(); // 前端去重（按消息文本）
+        let seenLogIds = new Set(); // 前端去重（按日志ID）
+        let isFetchingLogs = false; // 防止并发轮询导致重复
+        let lastPollAt = 0; // 最近一次轮询完成时间戳
+        let pollingStartTime = 0; // 本轮轮询的启动时间，用于判断是否应该停止
+        let isProcessing = false;
+        let pendingAssistantReply = false;
+        let lastSyncedAssistantMessageId = null;
+        let mapBuildSocket = null;
+        let realtimePreviewPollingInterval = null;
+        let lastRealtimePreviewFilename = null;
+        let realtimePreviewLoadSeq = 0;
+        let activeRealtimePreviewUrl = null;
+        let historyMapsLoaded = false;
+        let selectedHistoryMapId = null;
+        let historyMapIndex = new Map();
+        let vectorPreviewState = {
+            extent: null,
+            title: '',
+            map: {},
+            layers: new Map(),
+            legendItems: [],
+            legends: [],
+            annotations: [],
+            elements: {},
+            outputPath: null,
+            previewImageUrl: null,
+            lastStep: null
+        };
+
+        // 页面加载完成后初始化
+        $(document).ready(function () {
+            initializeChat();
+        });
+
+        // ========== 可拖拽分割线：左右面板伸缩 ==========
+        (function () {
+            const container = document.querySelector('.mapping-container');
+            const left = document.querySelector('.chat-panel');
+            const right = document.querySelector('.map-panel');
+            const handle = document.getElementById('resizeHandle');
+            const STORAGE_KEY = 'mapllm_splitter_chat_pct';
+
+            if (!container || !left || !right || !handle) return;
+
+            // 恢复上次比例（桌面端才恢复）
+            function applySavedPct(pct) {
+                pct = Math.max(20, Math.min(80, pct || 38)); // 限制 20%~80%
+                left.style.flexBasis = pct + '%';
+                left.style.width = pct + '%';
+                right.style.flexBasis = (100 - pct) + '%';
+                right.style.width = (100 - pct) + '%';
+            }
+
+            function isMobile() {
+                return window.matchMedia('(max-width: 768px)').matches;
+            }
+
+            // 初始化：移动端不恢复比例
+            if (!isMobile()) {
+                const saved = Number(localStorage.getItem(STORAGE_KEY));
+                applySavedPct(isNaN(saved) ? 38 : saved);
+            }
+
+            let startX = 0;
+            let startLeftWidth = 0;
+            let dragging = false;
+
+            function onMouseDown(e) {
+                if (isMobile()) return; // 移动端禁用拖拽
+                dragging = true;
+                document.body.classList.add('resizing');
+
+                // 记录起始点与左侧像素宽度
+                startX = e.clientX;
+                startLeftWidth = left.getBoundingClientRect().width;
+
+                // 绑定事件
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            }
+
+            function onMouseMove(e) {
+                if (!dragging) return;
+
+                const containerRect = container.getBoundingClientRect();
+                const total = containerRect.width; // 总宽（不含滚动条）
+                const delta = e.clientX - startX;
+                let newLeftPx = startLeftWidth + delta;
+
+                // 转换成百分比并做边界限制
+                let pct = (newLeftPx / total) * 100;
+                pct = Math.max(20, Math.min(80, pct));
+
+                // 应用
+                left.style.flexBasis = pct + '%';
+                left.style.width = pct + '%';
+                right.style.flexBasis = (100 - pct) + '%';
+                right.style.width = (100 - pct) + '%';
+            }
+
+            function onMouseUp() {
+                if (!dragging) return;
+                dragging = false;
+                document.body.classList.remove('resizing');
+
+                // 保存比例
+                const pct = parseFloat(left.style.flexBasis || left.style.width || '38');
+                if (!isNaN(pct)) {
+                    localStorage.setItem(STORAGE_KEY, String(pct));
+                }
+
+                // 解绑事件
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            }
+
+            handle.addEventListener('mousedown', onMouseDown);
+
+            // 视口变化：切到移动端则重置为上下布局；切回桌面端应用保存值
+            window.addEventListener('resize', () => {
+                if (isMobile()) return; // 移动端 CSS 已经覆盖
+
+                const saved = Number(localStorage.getItem(STORAGE_KEY));
+                applySavedPct(isNaN(saved) ? 38 : saved);
+            });
+        })();
+
+
+        function initializeChat() {
+            // 绑定发送按钮事件
+            $('#sendBtn').off('click.mapChat').on('click.mapChat', function (e) {
+                e.preventDefault();
+                sendMessage();
+            });
+
+            // 绑定回车键事件
+            $('#chatInput').keypress(function (e) {
+                if (e.which === 13 && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                }
+            });
+
+            // 绑定输入框自动调整高度
+            $('#chatInput').on('input', function () {
+                autoResizeTextarea(this);
+            });
+
+            // 绑定下载按钮事件
+            $('#downloadBtn').click(function() {
+                downloadMap(window.selectedFormat || 'png');
+            });
+
+            $('#historyToggleBtn').off('click.mapHistory').on('click.mapHistory', function() {
+                toggleHistoryPanel();
+            });
+
+            $('#historyRefreshBtn').off('click.mapHistory').on('click.mapHistory', function() {
+                loadHistoryMaps(true);
+            });
+
+            $('#historyCloseBtn').off('click.mapHistory').on('click.mapHistory', function() {
+                closeHistoryPanel();
+            });
+
+            $('#historyMapList').off('click.mapHistory').on('click.mapHistory', '.history-map-item', function() {
+                const mapId = Number($(this).data('map-id'));
+                openHistoryMap(mapId);
+            });
+
+            // 绑定格式选择按钮事件
+            $('#downloadFormatToggle').click(function(e) {
+                e.stopPropagation();
+                $('#downloadFormatMenu').toggleClass('show');
+                $(this).toggleClass('active');
+            });
+
+            // 绑定格式选项点击事件
+            $('.format-option').click(function() {
+                const format = $(this).data('format');
+                window.selectedFormat = format;
+
+                // 更新选中状态
+                $('.format-option').removeClass('selected');
+                $(this).addClass('selected');
+
+                // 关闭菜单
+                $('#downloadFormatMenu').removeClass('show');
+                $('#downloadFormatToggle').removeClass('active');
+
+                // 立即下载
+                downloadMap(format);
+            });
+
+            // 点击其他地方关闭下拉菜单
+            $(document).click(function(e) {
+                if (!$(e.target).closest('.download-btn-group').length) {
+                    $('#downloadFormatMenu').removeClass('show');
+                    $('#downloadFormatToggle').removeClass('active');
+                }
+            });
+
+            // 绑定新会话按钮事件
+            $('#newSessionBtn').click(startNewSession);
+
+            // 初始化时调整一次高度
+            autoResizeTextarea(document.getElementById('chatInput'));
+
+            // 初始化默认格式
+            window.selectedFormat = 'png';
+        }
+
+        // 自动调整textarea高度的函数
+        function autoResizeTextarea(textarea) {
+            // 重置高度以获取正确的scrollHeight
+            textarea.style.height = 'auto';
+
+            // 计算新高度
+            const minHeight = 36; // 最小高度
+            const maxHeight = 120; // 最大高度
+            let newHeight = Math.max(minHeight, textarea.scrollHeight);
+            newHeight = Math.min(maxHeight, newHeight);
+
+            // 设置新高度
+            textarea.style.height = newHeight + 'px';
+        }
+
+        // 开始新会话
+        function startNewSession() {
+            if (isProcessing) {
+                alert('当前正在处理请求，请稍候');
+                return;
+            }
+
+            if (currentRequestId && !confirm('确定要开始新会话吗？当前会话将被保存。')) {
+                return;
+            }
+
+            // ✅ 重置所有会话相关的变量
+            currentRequestId = null;
+            selectedHistoryMapId = null;
+            lastLogTime = null;
+            logContainer = null;
+            seenLogMessages.clear();  // ✅ 清空日志去重集合
+
+            // 清空聊天记录
+            $('#chatMessages').html(`
+                <div class="message assistant">
+                    您好！我是智能地图制作助手。请按以下格式描述您的制图需求：
+                    <br><br>
+                    <strong>📌 传统地图制作（行政区划图、交通图等）</strong><br>
+                    需包含以下内容：<br>
+                    <strong>1. 数据文件说明</strong><br>
+                    &nbsp;&nbsp;&nbsp;• 指定数据目录（如data1）<br>
+                    &nbsp;&nbsp;&nbsp;• 列出需要的.shp文件<br>
+                    <strong>2. 地图设置要求</strong><br>
+                    &nbsp;&nbsp;&nbsp;• 地图标题<br>
+                    &nbsp;&nbsp;&nbsp;• 背景色、图片大小、分辨率<br>
+                    &nbsp;&nbsp;&nbsp;• 是否显示图例、比例尺、指北针<br>
+                    <strong>3. 图层样式要求</strong><br>
+                    &nbsp;&nbsp;&nbsp;• 每个图层的颜色、线宽、线型等<br>
+                    &nbsp;&nbsp;&nbsp;• 标记样式、标签设置<br>
+                    &nbsp;&nbsp;&nbsp;• （可选）添加文字注记<br>
+                    <br>
+                    <strong>📌 路网综合可视化</strong><br>
+                    需包含以下内容：<br>
+                    <strong>1. 数据文件说明</strong><br>
+                    &nbsp;&nbsp;&nbsp;• 指定数据目录（如data6）<br>
+                    &nbsp;&nbsp;&nbsp;• 指定路网.shp文件<br>
+                    <strong>2. 算法要求</strong><br>
+                    &nbsp;&nbsp;&nbsp;• 使用gcnn算法或层次算法<br>
+                    <strong>3. 保留比例</strong><br>
+                    &nbsp;&nbsp;&nbsp;• 如：保留比例为0.8<br>
+                    &nbsp;&nbsp;&nbsp;• （可选）尺度要求：如1:500到1:2000<br>
+                    <br>
+                    <strong>💡 提示：</strong>地图生成后，您可以继续对话进行修改，如"删除Highway图层"、"修改背景色为蓝色"、"添加比例尺"等。
+                </div>
+            `);
+
+            // 清空地图显示
+            $('#mapContent').html(`
+                <div class="map-placeholder">
+                    <i class="fas fa-map-marked-alt"></i>
+                    <h4>等待地图生成</h4>
+                    <p>请在左侧输入您的制图需求，系统将为您生成专业的地图</p>
+                </div>
+                <div class="loading-spinner" id="loadingSpinner">
+                    <div class="spinner"></div>
+                    <p>正在生成地图，请稍候...</p>
+                </div>
+            `);
+
+            // 隐藏下载按钮组
+            $('#downloadBtnGroup').hide();
+
+            // 清空当前地图数据
+            window.currentMapData = null;
+            highlightHistorySelection();
+
+            addMessage('system', '已开始新会话，您可以开始新的制图任务了！');
+        }
+
+        // 下载地图函数
+        function downloadMap(format) {
+            if (!window.currentMapData) {
+                alert('没有可下载的地图');
+                return;
+            }
+
+            format = format || 'png';
+
+            // 如果是PNG格式且原文件就是PNG，直接下载
+            const originalFormat = window.currentMapData.filename.split('.').pop().toLowerCase();
+            if (format === 'png' && originalFormat === 'png') {
+                directDownload(format);
+                return;
+            }
+
+            // 需要格式转换，调用后端API
+            $.ajax({
+                url: '/mapping/api/convert-map-format/',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    file_path: window.currentMapData.url,
+                    target_format: format,
+                    map_id: window.currentMapData.map_id
+                }),
+                success: function(response) {
+                    if (response.success) {
+                        // 下载转换后的文件
+                        const link = document.createElement('a');
+                        link.href = response.file_url;
+
+                        const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+                        link.download = `map_${timestamp}.${format}`;
+                        link.style.display = 'none';
+
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                    } else {
+                        alert('格式转换失败：' + response.message);
+                    }
+                },
+                error: function(xhr, status, error) {
+                    console.error('格式转换失败:', error);
+                    alert('格式转换失败，请稍后重试');
+                }
+            });
+        }
+
+        // 直接下载（不需要转换）
+        function directDownload(format) {
+            try {
+                const link = document.createElement('a');
+                link.href = window.currentMapData.url;
+
+                const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+                link.download = `map_${timestamp}.${format}`;
+                link.style.display = 'none';
+
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            } catch (error) {
+                console.error('下载失败:', error);
+                alert('下载失败，请稍后重试');
+            }
+        }
+
+        function toggleHistoryPanel() {
+            const panel = $('#mapHistoryPanel');
+            if (panel.hasClass('open')) {
+                closeHistoryPanel();
+                return;
+            }
+            openHistoryPanel();
+        }
+
+        function openHistoryPanel() {
+            $('#mapHistoryPanel').addClass('open').attr('aria-hidden', 'false');
+            $('#historyToggleBtn').addClass('active');
+            if (!historyMapsLoaded) {
+                loadHistoryMaps(true);
+            } else {
+                highlightHistorySelection();
+            }
+        }
+
+        function closeHistoryPanel() {
+            $('#mapHistoryPanel').removeClass('open').attr('aria-hidden', 'true');
+            $('#historyToggleBtn').removeClass('active');
+        }
+
+        function refreshHistoryMaps(silent = true) {
+            if (historyMapsLoaded || $('#mapHistoryPanel').hasClass('open')) {
+                loadHistoryMaps(!silent);
+            }
+        }
+
+        function loadHistoryMaps(showLoading = true) {
+            const list = $('#historyMapList');
+            if (showLoading) {
+                list.html('<div class="history-loading"><i class="fas fa-spinner fa-spin"></i><br>正在加载历史地图...</div>');
+            }
+
+            $.ajax({
+                url: '/mapping/api/history-maps/',
+                method: 'GET',
+                success: function(response) {
+                    if (!response.success) {
+                        list.html(`<div class="history-error">${escapeHtml(response.message || '历史地图加载失败')}</div>`);
+                        return;
+                    }
+                    historyMapsLoaded = true;
+                    renderHistoryMaps(response.sessions || []);
+                },
+                error: function() {
+                    list.html('<div class="history-error">历史地图加载失败，请稍后重试。</div>');
+                }
+            });
+        }
+
+        function renderHistoryMaps(sessions) {
+            const list = $('#historyMapList');
+            historyMapIndex = new Map();
+
+            if (!sessions.length) {
+                list.html('<div class="history-empty">暂无历史地图。生成地图后会出现在这里。</div>');
+                return;
+            }
+
+            const html = sessions.map(session => {
+                const maps = session.maps || [];
+                maps.forEach(map => {
+                    historyMapIndex.set(Number(map.id), {
+                        ...map,
+                        session_title: session.title,
+                        request_text: session.request_text,
+                        session_status: session.status
+                    });
+                });
+
+                const mapsHtml = maps.map(map => {
+                    const thumb = map.file_exists
+                        ? `<img class="history-map-thumb" src="${map.file_path}" alt="${escapeHtml(map.filename)}">`
+                        : `<div class="history-map-thumb"></div>`;
+                    const activeClass = Number(map.id) === Number(selectedHistoryMapId) ? ' active' : '';
+                    const missingClass = map.file_exists ? '' : ' missing';
+                    return `
+                        <button type="button" class="history-map-item${activeClass}${missingClass}" data-map-id="${map.id}" ${map.file_exists ? '' : 'disabled'}>
+                            ${thumb}
+                            <span class="history-map-meta">
+                                <span class="history-map-name">${escapeHtml(map.filename)}</span>
+                                <span class="history-map-detail">v${escapeHtml(map.version || '-')} · ${escapeHtml(formatHistoryTime(map.created_at))}</span>
+                                <span class="history-map-detail">点击查看并设为当前修改对象</span>
+                            </span>
+                        </button>
+                    `;
+                }).join('');
+
+                return `
+                    <section class="history-session">
+                        <div class="history-session-title">
+                            <span title="${escapeHtml(session.request_text || session.title || '')}">${escapeHtml(session.title || '未命名地图')}</span>
+                            <small>#${session.request_id}</small>
+                        </div>
+                        ${mapsHtml}
+                    </section>
+                `;
+            }).join('');
+
+            list.html(html);
+            highlightHistorySelection();
+        }
+
+        function openHistoryMap(mapId) {
+            if (isProcessing) {
+                alert('当前正在处理请求，请稍候再切换历史地图');
+                return;
+            }
+
+            const mapData = historyMapIndex.get(Number(mapId));
+            if (!mapData || !mapData.file_exists) {
+                alert('该历史地图文件不存在，无法查看');
+                return;
+            }
+
+            stopLogPolling();
+            stopRealtimePreviewPolling();
+            if (mapBuildSocket) {
+                mapBuildSocket.close();
+                mapBuildSocket = null;
+            }
+
+            selectedHistoryMapId = Number(mapData.id);
+            currentRequestId = mapData.request_id;
+            pendingAssistantReply = false;
+            lastSyncedAssistantMessageId = null;
+            lastRealtimePreviewFilename = null;
+            activeRealtimePreviewUrl = null;
+
+            showMap({
+                id: mapData.id,
+                request_id: mapData.request_id,
+                filename: mapData.filename,
+                file_path: mapData.file_path,
+                file_exists: mapData.file_exists,
+                version: mapData.version
+            });
+            $('#vectorStepBadge').text(`正在查看历史地图 v${mapData.version || '-'}`);
+            updateMapStatus('completed', '历史地图');
+            highlightHistorySelection();
+            loadChatMessagesForRequest(mapData.request_id, function() {
+                addMessage('system', `已切换到历史地图 v${mapData.version || '-'}，后续修改将作用于当前查看的地图会话。`);
+                activateHistoryMapState(mapData);
+            });
+        }
+
+        function activateHistoryMapState(mapData) {
+            $.ajax({
+                url: '/mapping/api/activate-history-map/',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ map_id: mapData.id }),
+                success: function(response) {
+                    if (!response.success) {
+                        addMessage('system', '历史地图状态激活失败：' + (response.message || '未知错误'));
+                        return;
+                    }
+                    if (!response.active_state && response.message) {
+                        addMessage('system', response.message);
+                    } else if (response.cloned && response.message) {
+                        addMessage('system', response.message);
+                    }
+                },
+                error: function() {
+                    addMessage('system', '历史地图状态激活失败，继续修改时可能使用该会话最新状态。');
+                }
+            });
+        }
+
+        function loadChatMessagesForRequest(requestId, afterLoad) {
+            $.ajax({
+                url: `/mapping/api/chat-messages/${requestId}/`,
+                method: 'GET',
+                success: function(response) {
+                    if (!response.success || !response.messages) {
+                        if (typeof afterLoad === 'function') afterLoad();
+                        return;
+                    }
+
+                    $('#chatMessages').empty();
+                    response.messages.forEach(function(message) {
+                        addMessage(message.type || 'assistant', message.content || '');
+                    });
+                    if (typeof afterLoad === 'function') afterLoad();
+                },
+                error: function() {
+                    if (typeof afterLoad === 'function') afterLoad();
+                }
+            });
+        }
+
+        function highlightHistorySelection() {
+            $('.history-map-item').removeClass('active');
+            if (selectedHistoryMapId) {
+                $(`.history-map-item[data-map-id="${selectedHistoryMapId}"]`).addClass('active');
+            }
+        }
+
+        function formatHistoryTime(value) {
+            if (!value) return '';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return '';
+            return date.toLocaleString('zh-CN', {
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+
+        function sendMessage() {
+            const input = $('#chatInput');
+            const message = input.val().trim();
+
+            if (!message) {
+                console.debug('[MapLLM] 发送被忽略：输入为空');
+                return;
+            }
+
+            if (isProcessing) {
+                console.debug('[MapLLM] 发送被忽略：当前仍在处理中');
+                return;
+            }
+
+            // 显示用户消息
+            addMessage('user', message);
+
+            // 清空输入框
+            input.val('');
+
+            // 重置输入框高度
+            autoResizeTextarea(input[0]);
+
+            // 设置处理状态
+            setProcessing(true);
+
+            // 根据是否已有当前请求，决定新建或继续对话
+            try {
+                if (currentRequestId) {
+                    console.debug('[MapLLM] 发送继续对话请求', currentRequestId);
+                    continueConversation(message);
+                } else {
+                    console.debug('[MapLLM] 发送新建地图请求');
+                    createMapRequest(message);
+                }
+            } catch (error) {
+                console.error('[MapLLM] 发送请求前端异常', error);
+                addMessage('assistant', '前端发送请求时发生异常，请查看浏览器控制台。');
+                setProcessing(false);
+            }
+        }
+
+        function addMessage(type, content, timestamp = null) {
+            const messagesContainer = $('#chatMessages');
+            const messageDiv = $(`
+        <div class="message ${type}">
+            ${content}
+        </div>
+        `);
+
+            messagesContainer.append(messageDiv);
+            messagesContainer.scrollTop(messagesContainer[0].scrollHeight);
+        }
+
+        function createMapRequest(requestText) {
+            $.ajax({
+                url: '/mapping/api/create-request/',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    request_text: requestText
+                }),
+                success: function (response) {
+                    if (response.success) {
+                        currentRequestId = response.request_id;
+                        pendingAssistantReply = false;
+                        lastSyncedAssistantMessageId = null;
+                        addMessage('system', '正在分析您的需求...');
+
+                        // 开始处理请求
+                        processMapRequest(currentRequestId);
+                    } else {
+                        addMessage('assistant', '抱歉，创建请求失败：' + response.message);
+                        setProcessing(false);
+                    }
+                },
+                error: function () {
+                    addMessage('assistant', '抱歉，网络连接出现问题，请稍后重试。');
+                    setProcessing(false);
+                }
+            });
+        }
+
+        function startMapBuildSocket(requestId, resetPreview = true) {
+            if (!requestId) return;
+
+            if (mapBuildSocket) {
+                mapBuildSocket.close();
+                mapBuildSocket = null;
+            }
+
+            showVectorMapWorkspace(resetPreview);
+
+            const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            const wsUrl = `${protocol}://${window.location.host}/ws/mapping/build/${requestId}/`;
+            mapBuildSocket = new WebSocket(wsUrl);
+
+            mapBuildSocket.onopen = function () {
+                updateVectorStep({ tool_name: 'websocket', observation: '实时矢量预览已连接' });
+            };
+
+            mapBuildSocket.onmessage = function (event) {
+                try {
+                    const payload = JSON.parse(event.data);
+                    handleMapBuildEvent(payload);
+                } catch (error) {
+                    console.warn('地图实时事件解析失败', error);
+                }
+            };
+
+            mapBuildSocket.onerror = function () {
+                updateVectorStep({ tool_name: 'websocket', observation: '实时预览连接异常，最终地图仍会正常生成' });
+            };
+
+            mapBuildSocket.onclose = function () {
+                mapBuildSocket = null;
+            };
+        }
+
+        function startRealtimeMapWorkspace(requestId, resetPreview = true) {
+            if (!requestId) return;
+            try {
+                startMapBuildSocket(requestId, resetPreview);
+                startRealtimePreviewPolling(requestId);
+            } catch (error) {
+                console.warn('实时预览启动失败，不影响后端制图请求', error);
+                updateMapStatus('processing', '后台制图中');
+            }
+        }
+
+        function startRealtimePreviewPolling(requestId) {
+            if (!requestId) return;
+            stopRealtimePreviewPolling();
+
+            fetchLatestRealtimePreview(requestId);
+            realtimePreviewPollingInterval = setInterval(() => {
+                fetchLatestRealtimePreview(requestId);
+            }, 800);
+        }
+
+        function stopRealtimePreviewPolling() {
+            if (realtimePreviewPollingInterval) {
+                clearInterval(realtimePreviewPollingInterval);
+                realtimePreviewPollingInterval = null;
+            }
+        }
+
+        function fetchLatestRealtimePreview(requestId) {
+            $.ajax({
+                url: `/mapping/api/realtime-preview/${requestId}/`,
+                method: 'GET',
+                success: function (response) {
+                    if (!response.success || !response.preview || !response.preview.image_url) return;
+                    if (response.preview.filename && response.preview.filename === lastRealtimePreviewFilename) return;
+                    lastRealtimePreviewFilename = response.preview.filename || response.preview.image_url;
+                    updateRealtimePreviewImage(response.preview);
+                    updateVectorStep({
+                        tool_name: 'matplotlib_preview',
+                        observation: '已同步最新后端中间图',
+                        preview: response.preview
+                    });
+                }
+            });
+        }
+
+        function mapViewportHtml(options = {}) {
+            const mode = options.mode || 'realtime';
+            const imageUrl = options.imageUrl || '';
+            const alt = imageUrl ? (options.alt || (mode === 'final' ? '生成的地图' : '地图实时预览')) : '';
+            const includeVector = mode !== 'final';
+            const imageAttrs = imageUrl
+                ? `src="${imageUrl}" onerror="this.onerror=null; showMapError('地图文件加载失败');"`
+                : 'aria-hidden="true" style="display:none;"';
+            const imageClass = imageUrl ? 'map-image is-visible' : 'map-image';
+            const emptyText = mode === 'final' ? '正在加载最终地图' : '等待后端 Matplotlib 渲染中间图';
+
+            return `
+                <div class="map-viewport ${mode === 'final' ? 'is-final' : 'is-realtime'}" id="mapViewport">
+                    ${includeVector ? '<svg id="vectorMapSvg" class="vector-map-svg realtime-svg-fallback" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet"></svg>' : ''}
+                    <div class="map-image-layer" id="mapImageLayer">
+                        <img id="mapImg" ${imageAttrs} alt="${alt}" class="${imageClass}">
+                    </div>
+                    ${includeVector ? `
+                        <div id="vectorMapEmpty" class="vector-map-empty">
+                            <i class="fas fa-map-marked-alt"></i>
+                            <div class="vector-empty-text">${emptyText}</div>
+                        </div>
+                    ` : ''}
+                    ${mapZoomToolbarHtml()}
+                </div>
+            `;
+        }
+
+        function ensureUnifiedMapViewport(reset = false) {
+            const mapContent = $('#mapContent');
+            const needsRebuild = reset || !document.getElementById('mapViewport') || !document.getElementById('mapImg');
+
+            if (needsRebuild) {
+                mapContent.html(mapViewportHtml({ mode: 'realtime' }));
+                initPanZoom();
+                $('.map-placeholder').hide();
+                return;
+            }
+
+            ensureRealtimeMapOverlays();
+        }
+
+        function ensureRealtimeMapOverlays() {
+            const viewport = document.getElementById('mapViewport');
+            if (!viewport) return;
+
+            if (!document.getElementById('vectorMapSvg')) {
+                const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                svg.setAttribute('id', 'vectorMapSvg');
+                svg.setAttribute('class', 'vector-map-svg realtime-svg-fallback');
+                svg.setAttribute('viewBox', '0 0 1000 700');
+                svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+                viewport.insertBefore(svg, viewport.firstChild);
+            }
+
+            if (!document.getElementById('vectorMapEmpty')) {
+                const empty = document.createElement('div');
+                empty.id = 'vectorMapEmpty';
+                empty.className = 'vector-map-empty';
+                empty.innerHTML = `
+                    <i class="fas fa-map-marked-alt"></i>
+                    <div class="vector-empty-text">等待后端 Matplotlib 渲染中间图</div>
+                `;
+                viewport.appendChild(empty);
+            }
+        }
+
+        function mapZoomToolbarHtml() {
+            return `
+                <div class="zoom-toolbar">
+                    <button id="zoomOutBtn" title="缩小">−</button>
+                    <div class="zoom-readout" id="zoomReadout">100%</div>
+                    <button id="zoomInBtn" title="放大">＋</button>
+                    <button id="zoomResetBtn" title="重置">重置</button>
+                </div>
+            `;
+        }
+
+        function showVectorMapWorkspace(resetPreview = true) {
+            if (resetPreview) {
+                lastRealtimePreviewFilename = null;
+                vectorPreviewState = {
+                    extent: null,
+                    title: '',
+                    map: {},
+                    layers: new Map(),
+                    legendItems: [],
+                    legends: [],
+                    annotations: [],
+                    elements: {},
+                    outputPath: null,
+                    previewImageUrl: null,
+                    lastStep: null
+                };
+            }
+
+            ensureUnifiedMapViewport(resetPreview);
+            if (resetPreview) {
+                clearRealtimePreviewImage();
+            }
+            $('#vectorStepBadge').text('实时预览准备中...');
+            $('#downloadBtnGroup').hide();
+            updateMapStatus('processing', '实时制图中');
+            renderVectorPreview();
+        }
+
+        function handleMapBuildEvent(payload) {
+            if (!payload || payload.type === 'connection_ready') return;
+
+            if (payload.view_state) {
+                applyVectorViewState(payload.view_state);
+            }
+
+            if (payload.map) {
+                vectorPreviewState.map = {
+                    ...(vectorPreviewState.map || {}),
+                    ...payload.map
+                };
+                vectorPreviewState.extent = payload.map.extent || vectorPreviewState.extent;
+                vectorPreviewState.title = payload.map.title || vectorPreviewState.title;
+            }
+
+            if (payload.layer && payload.layer.name) {
+                upsertVectorLayer(payload.layer);
+            }
+
+            if (payload.elements) {
+                vectorPreviewState.elements = {
+                    ...(vectorPreviewState.elements || {}),
+                    ...payload.elements
+                };
+            }
+
+            if (payload.preview && payload.preview.image_url) {
+                updateRealtimePreviewImage(payload.preview);
+            }
+
+            updateVectorStep(payload);
+            if (!vectorPreviewState.previewImageUrl) {
+                renderVectorPreview();
+            }
+
+            if (payload.type === 'map_completed') {
+                updateMapStatus('processing', '最终地图保存中');
+            }
+        }
+
+        function applyVectorViewState(viewState) {
+            const mapSummary = viewState.map || {};
+            vectorPreviewState.map = {
+                ...(vectorPreviewState.map || {}),
+                ...mapSummary
+            };
+            vectorPreviewState.extent = mapSummary.extent || vectorPreviewState.extent;
+            vectorPreviewState.title = mapSummary.title || vectorPreviewState.title;
+            vectorPreviewState.legendItems = Array.isArray(viewState.legend_items) ? viewState.legend_items : vectorPreviewState.legendItems;
+            vectorPreviewState.legends = Array.isArray(viewState.legends) ? viewState.legends : vectorPreviewState.legends;
+            vectorPreviewState.annotations = Array.isArray(viewState.annotations) ? viewState.annotations : vectorPreviewState.annotations;
+            vectorPreviewState.elements = viewState.elements || vectorPreviewState.elements || {};
+            vectorPreviewState.outputPath = viewState.output_path || vectorPreviewState.outputPath;
+
+            if (Array.isArray(viewState.layers)) {
+                const nextLayers = new Map();
+                viewState.layers.forEach(layer => {
+                    if (!layer || !layer.name) return;
+                    const existing = vectorPreviewState.layers.get(layer.name) || {};
+                    nextLayers.set(layer.name, normalizeVectorLayer(layer, existing));
+                });
+                vectorPreviewState.layers = nextLayers;
+            }
+        }
+
+        function upsertVectorLayer(layer) {
+            if (!layer || !layer.name) return;
+            const existing = vectorPreviewState.layers.get(layer.name) || {};
+            vectorPreviewState.layers.set(layer.name, normalizeVectorLayer(layer, existing));
+        }
+
+        function normalizeVectorLayer(layer, existing = {}) {
+            return {
+                ...existing,
+                ...layer,
+                style: {
+                    ...(existing.style || {}),
+                    ...(layer.style || {})
+                },
+                geojson: layer.geojson || existing.geojson
+            };
+        }
+
+        function updateVectorStep(payload) {
+            vectorPreviewState.lastStep = payload;
+            const badge = document.getElementById('vectorStepBadge');
+            if (!badge) return;
+            const toolName = payload.tool_name || payload.type || 'step';
+            const obs = payload.observation || '';
+            const previewSuffix = payload.preview && payload.preview.image_url ? ' · 后端PNG已更新' : '';
+            badge.textContent = `${toolName}: ${obs}${previewSuffix}`.slice(0, 140);
+
+            if (payload.type === 'map_completed') {
+                badge.textContent = '最终地图已生成';
+            }
+        }
+
+        function updateRealtimePreviewImage(preview) {
+            const img = document.getElementById('mapImg');
+            const svg = document.getElementById('vectorMapSvg');
+            const viewport = document.getElementById('mapViewport');
+            if (!img || !preview || !preview.image_url) return;
+
+            vectorPreviewState.previewImageUrl = preview.image_url;
+            const imageUrl = `${preview.image_url}?t=${preview.created_at_ms || Date.now()}`;
+            if (imageUrl === activeRealtimePreviewUrl) return;
+
+            const loadSeq = ++realtimePreviewLoadSeq;
+            const nextImage = new Image();
+            nextImage.onload = function () {
+                if (loadSeq !== realtimePreviewLoadSeq) return;
+                activeRealtimePreviewUrl = imageUrl;
+                img.src = imageUrl;
+                img.style.display = '';
+                img.removeAttribute('aria-hidden');
+                img.classList.add('is-visible');
+                $('#vectorMapEmpty').hide();
+                if (viewport) viewport.classList.add('is-visible');
+                if (svg) svg.style.display = 'none';
+            };
+            nextImage.onerror = function () {
+                if (loadSeq !== realtimePreviewLoadSeq) return;
+                vectorPreviewState.previewImageUrl = activeRealtimePreviewUrl;
+                if (!activeRealtimePreviewUrl) {
+                    img.classList.remove('is-visible');
+                    img.style.display = 'none';
+                    img.setAttribute('aria-hidden', 'true');
+                    if (svg) svg.style.display = 'block';
+                    renderVectorPreview();
+                }
+            };
+            nextImage.src = imageUrl;
+        }
+
+        function clearRealtimePreviewImage() {
+            const img = document.getElementById('mapImg');
+            const svg = document.getElementById('vectorMapSvg');
+            realtimePreviewLoadSeq += 1;
+            activeRealtimePreviewUrl = null;
+            vectorPreviewState.previewImageUrl = null;
+            if (img) {
+                img.classList.remove('is-visible');
+                img.style.display = 'none';
+                img.setAttribute('aria-hidden', 'true');
+                img.removeAttribute('src');
+            }
+            if (svg) {
+                svg.style.display = 'block';
+            }
+        }
+
+        function renderVectorPreview() {
+            const svg = document.getElementById('vectorMapSvg');
+            if (!svg) return;
+            if (vectorPreviewState.previewImageUrl) return;
+
+            const layout = getVectorMapLayout();
+            const layers = Array.from(vectorPreviewState.layers.values())
+                .filter(layer => layer.visible !== false && layer.geojson)
+                .sort((a, b) => (a.z_order || 0) - (b.z_order || 0));
+
+            const extent = vectorPreviewState.extent || computeExtentFromLayers(layers);
+            svg.innerHTML = '';
+            drawVectorMapBase(svg, layout, extent);
+
+            if (!extent || layers.length === 0) {
+                $('#vectorMapEmpty').show();
+                return;
+            }
+
+            $('#vectorMapEmpty').hide();
+
+            const defs = svgEl('defs');
+            const clipPath = svgEl('clipPath', { id: 'vectorMapClip' });
+            clipPath.appendChild(svgEl('rect', {
+                x: layout.mapFrame.x,
+                y: layout.mapFrame.y,
+                width: layout.mapFrame.w,
+                height: layout.mapFrame.h
+            }));
+            defs.appendChild(clipPath);
+            svg.appendChild(defs);
+
+            layers.forEach(layer => {
+                const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                group.setAttribute('data-layer', layer.name || '');
+                group.setAttribute('clip-path', 'url(#vectorMapClip)');
+                (layer.geojson.features || []).forEach(feature => {
+                    featureToSvgElements(feature, layer, extent, layout.mapFrame).forEach(el => group.appendChild(el));
+                });
+                svg.appendChild(group);
+            });
+
+            drawVectorLabels(svg, layers, extent, layout.mapFrame);
+            drawVectorLegend(svg, layers, layout.mapFrame);
+            drawVectorScalebar(svg, extent, layout.mapFrame);
+            drawVectorCompass(svg, layout.mapFrame);
+            drawVectorAnnotations(svg, layout);
+        }
+
+        function getVectorMapLayout() {
+            return {
+                width: 1000,
+                height: 700,
+                paper: { x: 34, y: 24, w: 932, h: 642 },
+                title: { x: 500, y: 66 },
+                mapFrame: { x: 82, y: 102, w: 836, h: 448 }
+            };
+        }
+
+        function drawVectorMapBase(svg, layout, extent) {
+            const map = vectorPreviewState.map || {};
+            const background = map.background_color || '#ffffff';
+            svg.appendChild(svgEl('rect', { x: 0, y: 0, width: layout.width, height: layout.height, fill: '#ffffff' }));
+            svg.appendChild(svgEl('rect', {
+                x: layout.paper.x,
+                y: layout.paper.y,
+                width: layout.paper.w,
+                height: layout.paper.h,
+                rx: 2,
+                fill: background
+            }));
+
+            if (vectorPreviewState.title) {
+                svg.appendChild(svgEl('text', {
+                    x: layout.title.x,
+                    y: layout.title.y,
+                    'text-anchor': 'middle',
+                    'font-size': 30,
+                    'font-weight': 700,
+                    fill: '#111827'
+                }, vectorPreviewState.title));
+            }
+
+            svg.appendChild(svgEl('rect', {
+                x: layout.mapFrame.x,
+                y: layout.mapFrame.y,
+                width: layout.mapFrame.w,
+                height: layout.mapFrame.h,
+                fill: background
+            }));
+
+            if (extent) {
+                drawVectorGrid(svg, extent, layout.mapFrame);
+            }
+        }
+
+        function drawVectorGrid(svg, extent, frame) {
+            const grid = svgEl('g', { opacity: 0.38 });
+            for (let i = 1; i < 4; i++) {
+                const x = frame.x + frame.w * i / 4;
+                const y = frame.y + frame.h * i / 4;
+                grid.appendChild(svgEl('line', { x1: x, y1: frame.y, x2: x, y2: frame.y + frame.h, stroke: '#cbd5e1', 'stroke-width': 0.8 }));
+                grid.appendChild(svgEl('line', { x1: frame.x, y1: y, x2: frame.x + frame.w, y2: y, stroke: '#cbd5e1', 'stroke-width': 0.8 }));
+            }
+            svg.appendChild(grid);
+
+            const [minX, minY, maxX, maxY] = extent.map(Number);
+            const tickStyle = { 'font-size': 10, fill: '#64748b' };
+            [[minX, frame.x], [maxX, frame.x + frame.w]].forEach(([value, x]) => {
+                svg.appendChild(svgEl('text', { x, y: frame.y + frame.h + 18, 'text-anchor': x === frame.x ? 'start' : 'end', ...tickStyle }, formatCoord(value)));
+            });
+            [[minY, frame.y + frame.h], [maxY, frame.y]].forEach(([value, y]) => {
+                svg.appendChild(svgEl('text', { x: frame.x - 10, y: y + 4, 'text-anchor': 'end', ...tickStyle }, formatCoord(value)));
+            });
+        }
+
+        function featureToSvgElements(feature, layer, extent, frame) {
+            const geom = feature.geometry;
+            if (!geom || !geom.coordinates) return [];
+
+            const style = resolveFeatureStyle(layer, feature);
+            const elements = [];
+
+            if (geom.type === 'Point') {
+                elements.push(makeSvgPoint(geom.coordinates, style, extent, frame));
+            } else if (geom.type === 'MultiPoint') {
+                geom.coordinates.forEach(coord => elements.push(makeSvgPoint(coord, style, extent, frame)));
+            } else if (geom.type === 'LineString') {
+                elements.push(makeSvgPolyline(geom.coordinates, style, extent, frame));
+            } else if (geom.type === 'MultiLineString') {
+                geom.coordinates.forEach(line => elements.push(makeSvgPolyline(line, style, extent, frame)));
+            } else if (geom.type === 'Polygon') {
+                elements.push(makeSvgPolygon(geom.coordinates, style, extent, frame));
+            } else if (geom.type === 'MultiPolygon') {
+                geom.coordinates.forEach(poly => elements.push(makeSvgPolygon(poly, style, extent, frame)));
+            }
+
+            return elements.filter(Boolean);
+        }
+
+        function makeSvgPoint(coord, style, extent, frame) {
+            const p = projectCoord(coord, extent, frame);
+            const radius = Math.max(3, Math.min(13, (Number(style.size) || 50) / 12));
+            const attrs = {
+                fill: style.color,
+                'fill-opacity': style.alpha,
+                stroke: style.edgecolor || '#ffffff',
+                'stroke-width': Math.max(1, Number(style.linewidth) || 1)
+            };
+            const marker = String(style.marker || 'o').toLowerCase();
+            if (['s', 'square', '方形'].includes(marker)) {
+                return svgEl('rect', { x: p.x - radius, y: p.y - radius, width: radius * 2, height: radius * 2, ...attrs });
+            }
+            if (['^', 'triangle', '三角形'].includes(marker)) {
+                const d = `M ${p.x} ${p.y - radius} L ${p.x + radius} ${p.y + radius} L ${p.x - radius} ${p.y + radius} Z`;
+                return svgEl('path', { d, ...attrs });
+            }
+            return svgEl('circle', { cx: p.x, cy: p.y, r: radius, ...attrs });
+        }
+
+        function makeSvgPolyline(coords, style, extent, frame) {
+            if (!coords || coords.length < 2) return null;
+            const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+            line.setAttribute('points', coords.map(coord => {
+                const p = projectCoord(coord, extent, frame);
+                return `${p.x},${p.y}`;
+            }).join(' '));
+            line.setAttribute('fill', 'none');
+            line.setAttribute('stroke', style.color);
+            line.setAttribute('stroke-opacity', style.alpha);
+            line.setAttribute('stroke-width', Math.max(1, Number(style.linewidth) || 1));
+            line.setAttribute('stroke-linecap', 'round');
+            line.setAttribute('stroke-linejoin', 'round');
+            const dash = lineStyleToDash(style.linestyle);
+            if (dash) line.setAttribute('stroke-dasharray', dash);
+            return line;
+        }
+
+        function makeSvgPolygon(rings, style, extent, frame) {
+            if (!rings || !rings.length) return null;
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            const d = rings.map(ring => {
+                return ring.map((coord, index) => {
+                    const p = projectCoord(coord, extent, frame);
+                    return `${index === 0 ? 'M' : 'L'} ${p.x} ${p.y}`;
+                }).join(' ') + ' Z';
+            }).join(' ');
+            path.setAttribute('d', d);
+            path.setAttribute('fill', style.facecolor || style.color);
+            path.setAttribute('fill-opacity', Math.max(0.08, Number(style.alpha) || 0.7));
+            path.setAttribute('stroke', style.edgecolor || '#ffffff');
+            path.setAttribute('stroke-width', Math.max(0.5, Number(style.linewidth) || 1));
+            path.setAttribute('fill-rule', 'evenodd');
+            return path;
+        }
+
+        function resolveFeatureStyle(layer, feature) {
+            const base = layer.style || {};
+            let color = base.color || base.facecolor || '#2563eb';
+            const attr = base.attribute_column;
+            if (attr && feature.properties && feature.properties[attr] !== undefined && feature.properties[attr] !== null) {
+                color = colorFromString(String(feature.properties[attr]));
+            }
+            return {
+                color: color,
+                facecolor: base.facecolor || color,
+                edgecolor: base.edgecolor,
+                alpha: base.alpha === undefined ? 0.75 : base.alpha,
+                linewidth: base.linewidth || 1,
+                linestyle: base.linestyle || '-',
+                marker: base.marker || 'o',
+                size: base.size || 50
+            };
+        }
+
+        function projectCoord(coord, extent, frame) {
+            const minX = Number(extent[0]);
+            const minY = Number(extent[1]);
+            const maxX = Number(extent[2]);
+            const maxY = Number(extent[3]);
+            const xSpan = Math.max(0.000001, maxX - minX);
+            const ySpan = Math.max(0.000001, maxY - minY);
+            return {
+                x: frame.x + ((Number(coord[0]) - minX) / xSpan) * frame.w,
+                y: frame.y + ((maxY - Number(coord[1])) / ySpan) * frame.h
+            };
+        }
+
+        function drawVectorLabels(svg, layers, extent, frame) {
+            const labelGroup = svgEl('g', { 'clip-path': 'url(#vectorMapClip)' });
+            let labelCount = 0;
+            layers.forEach(layer => {
+                const column = layer.style && layer.style.label_column;
+                if (!column || !layer.geojson || !Array.isArray(layer.geojson.features)) return;
+                for (const feature of layer.geojson.features) {
+                    if (labelCount >= 140) break;
+                    const value = feature.properties && feature.properties[column];
+                    if (value === undefined || value === null || String(value).trim() === '') continue;
+                    const coord = featureLabelCoord(feature.geometry);
+                    if (!coord) continue;
+                    const p = projectCoord(coord, extent, frame);
+                    const text = svgEl('text', {
+                        x: p.x,
+                        y: p.y,
+                        'text-anchor': 'middle',
+                        'font-size': 11,
+                        'paint-order': 'stroke',
+                        stroke: 'rgba(255,255,255,0.9)',
+                        'stroke-width': 3,
+                        fill: '#111827'
+                    }, String(value).slice(0, 16));
+                    labelGroup.appendChild(text);
+                    labelCount += 1;
+                }
+            });
+            svg.appendChild(labelGroup);
+        }
+
+        function featureLabelCoord(geometry) {
+            const coords = [];
+            collectCoords(geometry, coord => coords.push(coord));
+            if (!coords.length) return null;
+            const sum = coords.reduce((acc, coord) => {
+                acc[0] += Number(coord[0]);
+                acc[1] += Number(coord[1]);
+                return acc;
+            }, [0, 0]);
+            return [sum[0] / coords.length, sum[1] / coords.length];
+        }
+
+        function drawVectorLegend(svg, layers, frame) {
+            const entries = buildLegendEntries(layers).slice(0, 10);
+            if (!entries.length) return;
+
+            const extra = buildLegendEntries(layers).length - entries.length;
+            if (extra > 0) {
+                entries.push({ label: `其余 ${extra} 项`, type: 'text', style: { color: '#64748b' } });
+            }
+
+            const rowH = 22;
+            const width = 218;
+            const height = 34 + entries.length * rowH;
+            const x = frame.x + frame.w - width - 14;
+            const y = frame.y + frame.h - height - 14;
+            const group = svgEl('g');
+            group.appendChild(svgEl('rect', {
+                x,
+                y,
+                width,
+                height,
+                rx: 6,
+                fill: 'rgba(255,255,255,0.92)',
+                stroke: '#cbd5e1',
+                'stroke-width': 1
+            }));
+            group.appendChild(svgEl('text', {
+                x: x + 12,
+                y: y + 21,
+                'font-size': 13,
+                'font-weight': 700,
+                fill: '#1f2937'
+            }, '图例'));
+
+            entries.forEach((entry, index) => {
+                const yy = y + 42 + index * rowH;
+                drawLegendSymbol(group, x + 18, yy - 5, entry);
+                group.appendChild(svgEl('text', {
+                    x: x + 38,
+                    y: yy,
+                    'font-size': 12,
+                    fill: '#334155'
+                }, String(entry.label || '').slice(0, 22)));
+            });
+            svg.appendChild(group);
+        }
+
+        function buildLegendEntries(layers) {
+            const entries = [];
+            const explicitItems = vectorPreviewState.legendItems || [];
+            explicitItems.forEach(item => {
+                if (item && item.label) entries.push(item);
+            });
+
+            layers.forEach(layer => {
+                const style = layer.style || {};
+                const attr = style.attribute_column;
+                if (attr && layer.geojson && Array.isArray(layer.geojson.features)) {
+                    const seen = new Set();
+                    layer.geojson.features.forEach(feature => {
+                        const value = feature.properties && feature.properties[attr];
+                        if (value === undefined || value === null || seen.has(String(value)) || seen.size >= 6) return;
+                        seen.add(String(value));
+                        entries.push({
+                            label: `${layer.name}: ${value}`,
+                            type: layerLegendType(layer),
+                            style: { ...style, color: colorFromString(String(value)), facecolor: colorFromString(String(value)) }
+                        });
+                    });
+                } else if (!explicitItems.length) {
+                    entries.push({
+                        label: layer.name,
+                        type: layerLegendType(layer),
+                        style
+                    });
+                }
+            });
+
+            const deduped = [];
+            const keys = new Set();
+            entries.forEach(entry => {
+                const key = `${entry.label}-${entry.type}`;
+                if (keys.has(key)) return;
+                keys.add(key);
+                deduped.push(entry);
+            });
+            return deduped;
+        }
+
+        function layerLegendType(layer) {
+            const geometry = String(layer.geometry_type || '').toLowerCase();
+            if (geometry.includes('line')) return 'line';
+            if (geometry.includes('point')) return 'point';
+            return 'patch';
+        }
+
+        function drawLegendSymbol(group, x, y, entry) {
+            const style = resolveLegendStyle(entry.style || {});
+            if (entry.type === 'line') {
+                const line = svgEl('line', { x1: x - 6, y1: y, x2: x + 14, y2: y, stroke: style.color, 'stroke-width': Math.max(2, style.linewidth || 2), 'stroke-linecap': 'round' });
+                const dash = lineStyleToDash(style.linestyle);
+                if (dash) line.setAttribute('stroke-dasharray', dash);
+                group.appendChild(line);
+            } else if (entry.type === 'point') {
+                group.appendChild(svgEl('circle', { cx: x + 4, cy: y, r: 5, fill: style.color, stroke: style.edgecolor || '#ffffff', 'stroke-width': 1 }));
+            } else {
+                group.appendChild(svgEl('rect', { x: x - 4, y: y - 6, width: 16, height: 12, fill: style.facecolor || style.color, stroke: style.edgecolor || '#334155', 'stroke-width': 1, 'fill-opacity': style.alpha }));
+            }
+        }
+
+        function resolveLegendStyle(style) {
+            const color = style.color || style.facecolor || '#2563eb';
+            return {
+                color,
+                facecolor: style.facecolor || color,
+                edgecolor: style.edgecolor,
+                alpha: style.alpha === undefined ? 0.8 : style.alpha,
+                linewidth: style.linewidth || 2,
+                linestyle: style.linestyle || '-'
+            };
+        }
+
+        function drawVectorScalebar(svg, extent, frame) {
+            const scalebar = vectorPreviewState.elements && vectorPreviewState.elements.scalebar;
+            if (!scalebar) return;
+
+            const position = normalizeRelativePosition(scalebar.position, [0.08, 0.08]);
+            const x = frame.x + frame.w * position[0];
+            const y = frame.y + frame.h * (1 - position[1]);
+            const barWidth = Math.max(70, Math.min(180, frame.w * 0.18));
+            const units = scalebar.units || 'km';
+            const length = scalebar.length || estimateScaleLength(extent);
+            const group = svgEl('g');
+            group.appendChild(svgEl('line', { x1: x, y1: y, x2: x + barWidth, y2: y, stroke: '#111827', 'stroke-width': 4 }));
+            group.appendChild(svgEl('line', { x1: x, y1: y - 8, x2: x, y2: y + 8, stroke: '#111827', 'stroke-width': 2 }));
+            group.appendChild(svgEl('line', { x1: x + barWidth, y1: y - 8, x2: x + barWidth, y2: y + 8, stroke: '#111827', 'stroke-width': 2 }));
+            group.appendChild(svgEl('text', { x: x + barWidth / 2, y: y - 12, 'text-anchor': 'middle', 'font-size': 12, fill: '#111827' }, `${length} ${units}`));
+            svg.appendChild(group);
+        }
+
+        function drawVectorCompass(svg, frame) {
+            const compass = vectorPreviewState.elements && vectorPreviewState.elements.compass;
+            if (!compass) return;
+
+            const position = normalizeRelativePosition(compass.position, [0.9, 0.88]);
+            const size = Math.max(36, Math.min(76, Number(compass.size || 0.05) * frame.h * 2.4));
+            const x = frame.x + frame.w * position[0];
+            const y = frame.y + frame.h * (1 - position[1]);
+            const group = svgEl('g');
+            group.appendChild(svgEl('line', { x1: x, y1: y + size * 0.35, x2: x, y2: y - size * 0.35, stroke: '#111827', 'stroke-width': 3, 'stroke-linecap': 'round' }));
+            group.appendChild(svgEl('path', { d: `M ${x} ${y - size * 0.48} L ${x - 7} ${y - size * 0.28} L ${x + 7} ${y - size * 0.28} Z`, fill: '#111827' }));
+            group.appendChild(svgEl('text', { x, y: y - size * 0.58, 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, fill: '#111827' }, 'N'));
+            svg.appendChild(group);
+        }
+
+        function drawVectorAnnotations(svg, layout) {
+            const annotations = vectorPreviewState.annotations || [];
+            annotations.forEach(annotation => {
+                if (!annotation || !annotation.text) return;
+                const position = normalizeRelativePosition(annotation.position, [0.5, 0.06]);
+                const x = layout.paper.x + layout.paper.w * position[0];
+                const y = layout.paper.y + layout.paper.h * (1 - position[1]);
+                drawWrappedSvgText(svg, annotation.text, x, y, {
+                    fontSize: Number(annotation.font_size || 12),
+                    color: annotation.color || '#111827',
+                    align: annotation.alignment || 'center',
+                    maxChars: 38,
+                    background: annotation.background_color || 'rgba(255,255,255,0.9)'
+                });
+            });
+        }
+
+        function drawWrappedSvgText(svg, text, x, y, options) {
+            const lines = wrapText(String(text), options.maxChars || 38).slice(0, 4);
+            const lineHeight = (options.fontSize || 12) * 1.35;
+            const boxWidth = Math.min(640, Math.max(180, Math.max(...lines.map(line => line.length)) * (options.fontSize || 12) * 0.62));
+            const boxHeight = lines.length * lineHeight + 12;
+            svg.appendChild(svgEl('rect', { x: x - boxWidth / 2, y: y - boxHeight / 2, width: boxWidth, height: boxHeight, rx: 6, fill: options.background, stroke: '#d1d5db', 'stroke-width': 0.8 }));
+            const textEl = svgEl('text', { x, y: y - (lines.length - 1) * lineHeight / 2, 'text-anchor': options.align === 'left' ? 'start' : (options.align === 'right' ? 'end' : 'middle'), 'font-size': options.fontSize || 12, fill: options.color || '#111827' });
+            lines.forEach((line, index) => {
+                const tspan = svgEl('tspan', { x, dy: index === 0 ? 0 : lineHeight }, line);
+                textEl.appendChild(tspan);
+            });
+            svg.appendChild(textEl);
+        }
+
+        function normalizeRelativePosition(position, fallback) {
+            if (typeof position === 'string') {
+                const map = {
+                    '右上角': [0.9, 0.9],
+                    '左上角': [0.1, 0.9],
+                    '右下角': [0.9, 0.1],
+                    '左下角': [0.1, 0.1],
+                    'upper right': [0.9, 0.9],
+                    'upper left': [0.1, 0.9],
+                    'lower right': [0.9, 0.1],
+                    'lower left': [0.1, 0.1]
+                };
+                return map[position] || fallback;
+            }
+            if (!Array.isArray(position) || position.length < 2) return fallback;
+            return [
+                clamp(Number(position[0]), 0.02, 0.98),
+                clamp(Number(position[1]), 0.02, 0.98)
+            ];
+        }
+
+        function estimateScaleLength(extent) {
+            if (!extent) return 50;
+            const minX = Number(extent[0]);
+            const minY = Number(extent[1]);
+            const maxX = Number(extent[2]);
+            const maxY = Number(extent[3]);
+            const avgLat = (minY + maxY) / 2;
+            const kmPerDegree = 111.32 * Math.max(0.2, Math.cos(avgLat * Math.PI / 180));
+            const spanKm = Math.abs(maxX - minX) * kmPerDegree;
+            return niceNumber(spanKm * 0.18);
+        }
+
+        function niceNumber(value) {
+            if (!isFinite(value) || value <= 0) return 50;
+            const exp = Math.floor(Math.log10(value));
+            const base = Math.pow(10, exp);
+            const fraction = value / base;
+            const nice = fraction < 1.5 ? 1 : (fraction < 3.5 ? 2 : (fraction < 7.5 ? 5 : 10));
+            return Math.max(1, Math.round(nice * base));
+        }
+
+        function lineStyleToDash(linestyle) {
+            const value = String(linestyle || '').toLowerCase();
+            if (['--', 'dashed', '虚线'].includes(value)) return '8 5';
+            if ([':', 'dotted', '点线'].includes(value)) return '2 5';
+            if (['-.', 'dashdot'].includes(value)) return '8 4 2 4';
+            return '';
+        }
+
+        function svgEl(tag, attrs = {}, text) {
+            const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+            Object.entries(attrs || {}).forEach(([key, value]) => {
+                if (value === undefined || value === null) return;
+                el.setAttribute(key, value);
+            });
+            if (text !== undefined && text !== null) {
+                el.textContent = text;
+            }
+            return el;
+        }
+
+        function clamp(value, min, max) {
+            if (!isFinite(value)) return min;
+            return Math.max(min, Math.min(max, value));
+        }
+
+        function computeExtentFromLayers(layers) {
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            layers.forEach(layer => {
+                (layer.geojson.features || []).forEach(feature => {
+                    collectCoords(feature.geometry, coord => {
+                        minX = Math.min(minX, Number(coord[0]));
+                        minY = Math.min(minY, Number(coord[1]));
+                        maxX = Math.max(maxX, Number(coord[0]));
+                        maxY = Math.max(maxY, Number(coord[1]));
+                    });
+                });
+            });
+            if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) return null;
+            const marginX = Math.max((maxX - minX) * 0.04, 0.001);
+            const marginY = Math.max((maxY - minY) * 0.04, 0.001);
+            return [minX - marginX, minY - marginY, maxX + marginX, maxY + marginY];
+        }
+
+        function collectCoords(geometry, visit) {
+            if (!geometry || !geometry.coordinates) return;
+            const walk = coords => {
+                if (!Array.isArray(coords)) return;
+                if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+                    visit(coords);
+                    return;
+                }
+                coords.forEach(walk);
+            };
+            walk(geometry.coordinates);
+        }
+
+        function colorFromString(value) {
+            const palette = ['#2563eb', '#dc2626', '#16a34a', '#ca8a04', '#9333ea', '#0891b2', '#be123c', '#4f46e5', '#15803d', '#ea580c'];
+            let hash = 0;
+            for (let i = 0; i < value.length; i++) {
+                hash = ((hash << 5) - hash) + value.charCodeAt(i);
+                hash |= 0;
+            }
+            return palette[Math.abs(hash) % palette.length];
+        }
+
+        function formatCoord(value) {
+            if (!isFinite(value)) return '';
+            return Number(value).toFixed(Math.abs(value) >= 100 ? 1 : 2);
+        }
+
+        function wrapText(text, maxChars) {
+            if (!text || text.length <= maxChars) return [text || ''];
+            const lines = [];
+            let current = '';
+            Array.from(text).forEach(char => {
+                current += char;
+                if (current.length >= maxChars || /[。；;！!？?]/.test(char)) {
+                    lines.push(current);
+                    current = '';
+                }
+            });
+            if (current) lines.push(current);
+            return lines;
+        }
+
+        function escapeHtml(value) {
+            return String(value === undefined || value === null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function processMapRequest(requestId) {
+            // 显示地图生成状态
+            showMapLoading();
+            startRealtimeMapWorkspace(requestId, true);
+
+            // 开始轮询实时日志
+            startLogPolling(requestId);
+
+            $.ajax({
+                url: '/mapping/api/process-request/',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    request_id: requestId
+                }),
+                success: function (response) {
+                    if (response.processing) {
+                        updateMapStatus('processing', '后台制图中');
+                        return;
+                    }
+                    // 不在此处停止轮询，保持轮询直到服务端状态标记为 completed/failed
+                    if (response.success) {
+                        // ✅ 统一使用 response.response 作为助手回复
+                        addMessage('assistant', response.response);
+                        // 加载生成的地图
+                        loadGeneratedMaps(requestId);
+                    } else {
+                        addMessage('assistant', '地图制作失败：' + response.message);
+                        stopRealtimePreviewPolling();
+                        hideMapLoading();
+                    }
+                    setProcessing(false);
+                },
+                error: function () {
+                    // 不在此处停止轮询，交由轮询自身控制
+                    addMessage('assistant', '处理请求时发生错误，请稍后重试。');
+                    stopRealtimePreviewPolling();
+                    hideMapLoading();
+                    setProcessing(false);
+                }
+            });
+        }
+
+        function continueConversation(message) {
+            console.log('[DEBUG] continueConversation 被调用，currentRequestId:', currentRequestId);
+
+            // 显示系统消息
+            addMessage('system', '正在处理您的请求...');
+
+            // 显示地图加载状态
+            showMapLoading();
+            startRealtimeMapWorkspace(currentRequestId, true);
+
+            // ✅ 关键修复：在发送 AJAX 请求**之前**就启动轮询，确保能捕获到后端执行过程中的日志
+            console.log('[DEBUG] 准备启动轮询，currentRequestId:', currentRequestId);
+            startLogPolling(currentRequestId, false);
+            console.log('[DEBUG] 轮询已启动');
+
+            $.ajax({
+                url: '/mapping/api/continue-conversation/',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    request_id: currentRequestId,
+                    message: message
+                }),
+                success: function (response) {
+                    if (response.processing) {
+                        pendingAssistantReply = true;
+                        addMessage('assistant', '地图调整任务已启动，正在实时生成中间结果...');
+                        updateMapStatus('processing', '后台制图中');
+                        return;
+                    }
+
+                    // 不在此处停止轮询，由轮询根据服务端状态自行停止
+                    if (response.success) {
+                        // 显示助手回复
+                        addMessage('assistant', response.response);
+
+                        // 仅在同步完成时直接加载地图；后台任务会由轮询在 completed 时接管。
+                        loadGeneratedMaps(currentRequestId);
+                    } else {
+                        addMessage('assistant', '处理失败：' + response.message);
+                        stopRealtimePreviewPolling();
+                        hideMapLoading();
+                    }
+                    setProcessing(false);
+                },
+                error: function () {
+                    // 不在此处停止轮询，由轮询根据服务端状态自行停止
+                    addMessage('assistant', '处理请求时发生错误，请稍后重试。');
+                    stopRealtimePreviewPolling();
+                    hideMapLoading();
+                    setProcessing(false);
+                }
+            });
+        }
+
+        function loadGeneratedMaps(requestId) {
+            $.ajax({
+                url: `/mapping/api/generated-maps/${requestId}/`,
+                method: 'GET',
+                success: function (response) {
+                    if (response.success && response.maps.length > 0) {
+                        stopRealtimePreviewPolling();
+                        const map = response.maps[0]; // 显示第一张地图
+                        showMap(map);
+                        refreshHistoryMaps(true);
+                    } else {
+                        stopRealtimePreviewPolling();
+                        showMapError('未找到生成的地图文件');
+                    }
+                },
+                error: function () {
+                    stopRealtimePreviewPolling();
+                    showMapError('加载地图文件失败');
+                }
+            });
+        }
+
+        function showMap(mapData) {
+            if (mapData.file_exists) {
+                const mapContent = $('#mapContent');
+                const timestamp = new Date().getTime();
+                const imageUrl = `${mapData.file_path}?t=${timestamp}`;
+
+                mapContent.html(mapViewportHtml({
+                    mode: 'final',
+                    imageUrl: imageUrl,
+                    alt: '生成的地图'
+                }));
+                initPanZoom();
+                $('#vectorStepBadge').text('最终地图已生成');
+
+                $('#loadingSpinner').hide();
+                $('#downloadBtnGroup').show();
+                window.currentMapData = {
+                    url: mapData.file_path,
+                    filename: mapData.filename,
+                    map_id: mapData.id
+                };
+                if (mapData.request_id) {
+                    currentRequestId = mapData.request_id;
+                }
+                if (mapData.id) {
+                    selectedHistoryMapId = Number(mapData.id);
+                    highlightHistorySelection();
+                }
+                updateMapStatus('completed', '地图生成完成');
+            } else {
+                showMapError('地图文件不存在');
+            }
+        }
+
+        // ========== 图片缩放/平移 ==========
+        function initPanZoom() {
+            const viewport = document.getElementById('mapViewport');
+            const layer = document.getElementById('mapImageLayer');
+            const img = document.getElementById('mapImg');
+            const btnIn = document.getElementById('zoomInBtn');
+            const btnOut = document.getElementById('zoomOutBtn');
+            const btnReset = document.getElementById('zoomResetBtn');
+            const readout = document.getElementById('zoomReadout');
+            if (!viewport || !layer || !img) return;
+
+            // 状态
+            let scale = 1;
+            let tx = 0, ty = 0;
+            const MIN = 0.25, MAX = 6, STEP = 0.2;
+
+            // 工具栏事件不冒泡（只加这一处）
+            const toolbar = viewport.querySelector('.zoom-toolbar');
+            if (toolbar) {
+                ['click','dblclick','wheel','mousedown','touchstart','touchmove'].forEach(ev => {
+                toolbar.addEventListener(ev, (e) => {
+                    e.stopPropagation();
+                    if (ev === 'wheel' || ev.startsWith('touch')) e.preventDefault();
+                }, { passive: false });
+                });
+            }
+
+            function apply() {
+                layer.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+                if (readout) readout.textContent = Math.round(scale * 100) + '%';
+            }
+
+            function getCenterPivot() {
+                const rect = viewport.getBoundingClientRect();
+                return {
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top  + rect.height / 2
+                };
+            }
+
+            function zoomTo(newScale, pivot) {
+                newScale = Math.min(MAX, Math.max(MIN, newScale));
+                const rect = viewport.getBoundingClientRect();
+
+                // pivot：有就用事件点；没有就用视口中心
+                const px = pivot ? (pivot.clientX - rect.left) : rect.width  / 2;
+                const py = pivot ? (pivot.clientY - rect.top ) : rect.height / 2;
+
+                const k = newScale / scale;
+                // 补偿平移：让 pivot 位置尽量不动（transform-origin: 0 0 前提）
+                tx = px - k * (px - tx);
+                ty = py - k * (py - ty);
+
+                scale = newScale;
+                apply();
+            }
+
+            function reset() { scale = 1; tx = 0; ty = 0; apply(); }
+
+            // —— 按钮：以“视口中心”为基点缩放（只绑定这一套）——
+            if (btnIn)   btnIn.addEventListener('click',  (e) => { e.stopPropagation(); zoomTo(scale + STEP, getCenterPivot()); });
+            if (btnOut)  btnOut.addEventListener('click', (e) => { e.stopPropagation(); zoomTo(scale - STEP, getCenterPivot()); });
+            if (btnReset)btnReset.addEventListener('click',(e) => { e.stopPropagation(); reset(); });
+
+            // 双击仅在“图片区域”才重置（工具栏双击不触发）
+            viewport.addEventListener('dblclick', (e) => {
+                if (e.target.closest('.zoom-toolbar')) return;
+                reset();
+            });
+
+            // 滚轮缩放：以鼠标位置为 pivot
+            viewport.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const delta = e.deltaY || e.wheelDelta;
+                const dir = delta > 0 ? -1 : 1; // 向下滚 -> 缩小
+                zoomTo(scale + dir * STEP, e);
+            }, { passive: false });
+
+            // 拖拽平移
+            let dragging = false, sx = 0, sy = 0, startTx = 0, startTy = 0;
+            function down(e) {
+                if (e.button !== 0) return;
+                dragging = true;
+                layer.classList.add('dragging');
+                sx = e.clientX; sy = e.clientY;
+                startTx = tx; startTy = ty;
+                window.addEventListener('mousemove', move);
+                window.addEventListener('mouseup', up);
+            }
+            function move(e) {
+                if (!dragging) return;
+                tx = startTx + (e.clientX - sx);
+                ty = startTy + (e.clientY - sy);
+                apply();
+            }
+            function up() {
+                dragging = false;
+                layer.classList.remove('dragging');
+                window.removeEventListener('mousemove', move);
+                window.removeEventListener('mouseup', up);
+            }
+            layer.addEventListener('mousedown', down);
+
+            // 触摸：单指平移、双指以中点缩放
+            let touchMode = null, lastDist = 0, startMid = null, startScale = 1;
+            viewport.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 1) {
+                touchMode = 'pan';
+                dragging = true;
+                layer.classList.add('dragging');
+                sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+                startTx = tx; startTy = ty;
+                } else if (e.touches.length === 2) {
+                touchMode = 'pinch';
+                const [t1, t2] = e.touches;
+                lastDist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+                startScale = scale;
+                startMid = { clientX: (t1.clientX + t2.clientX)/2, clientY: (t1.clientY + t2.clientY)/2 };
+                }
+            }, { passive: true });
+
+            viewport.addEventListener('touchmove', (e) => {
+                if (touchMode === 'pan' && e.touches.length === 1) {
+                const dx = e.touches[0].clientX - sx;
+                const dy = e.touches[0].clientY - sy;
+                tx = startTx + dx; ty = startTy + dy;
+                apply();
+                } else if (touchMode === 'pinch' && e.touches.length === 2) {
+                const [t1, t2] = e.touches;
+                const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+                const k = dist / lastDist;
+                zoomTo(startScale * k, startMid);
+                }
+            }, { passive: true });
+
+            viewport.addEventListener('touchend', () => {
+                touchMode = null;
+                dragging = false;
+                layer.classList.remove('dragging');
+            });
+
+            // 初始一次
+            reset();
+        }
+
+
+
+        function showMapError(message) {
+            const mapContent = $('#mapContent');
+            mapContent.html(`
+        <div class="map-placeholder">
+            <i class="fas fa-exclamation-triangle" style="color: #dc3545;"></i>
+            <h4>地图加载失败</h4>
+            <p>${message}</p>
+        </div>
+    `);
+            // 隐藏下载按钮组
+            $('#downloadBtnGroup').hide();
+            updateMapStatus('failed', '生成失败');
+        }
+
+        function showMapLoading() {
+        $('#mapContent .map-placeholder').hide();
+        $('#loadingSpinner').show();
+        $('#downloadBtnGroup').hide();
+        updateMapStatus('processing', '正在生成');
+        }
+
+        function hideMapLoading() {
+            $('#loadingSpinner').hide();
+            $('#mapContent .map-placeholder').show();
+        }
+
+        function updateMapStatus(status, text) {
+            const statusElement = $('#mapStatus');
+            statusElement.html(`<span class="status-indicator status-${status}">${text}</span>`);
+        }
+
+        function setProcessing(processing) {
+            isProcessing = processing;
+            const sendBtn = $('#sendBtn');
+            const chatInput = $('#chatInput');
+
+            if (processing) {
+                sendBtn.prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> 处理中');
+                chatInput.prop('disabled', true);
+            } else {
+                sendBtn.prop('disabled', false).html('<i class="fas fa-paper-plane"></i> 发送');
+                chatInput.prop('disabled', false).focus();
+            }
+        }
+
+        // 开始轮询实时日志
+        // clearHistory: 是否清空历史日志显示（新建地图时为true，继续对话时为false）
+        function startLogPolling(requestId, clearHistory = true) {
+            console.log('[DEBUG] startLogPolling 被调用，requestId:', requestId, 'clearHistory:', clearHistory);
+
+            if (logPollingInterval) {
+                console.log('[DEBUG] 清除旧的轮询定时器');
+                clearInterval(logPollingInterval);
+            }
+
+            currentRequestId = requestId;
+
+            // ✅ 每次新请求都创建新的日志容器（不删除旧的）
+            // 每次开启新一轮轮询都先复位并发标志，避免上一次请求遗留导致本轮首个拉取被跳过
+            isFetchingLogs = false;
+
+            if (clearHistory) {
+                // 重置变量，准备创建新的日志容器
+                logContainer = null;
+                seenLogMessages.clear();
+                seenLogIds.clear();
+            }
+
+            // ✅ 关键修复：无论是否 clearHistory，都重置 lastLogTime 为 null
+            // 这样可以确保每次新的轮询都从头开始拉取该请求的所有日志
+            // 通过 seenLogIds 去重来避免重复显示
+            console.log('[DEBUG] 重置 lastLogTime 为 null，之前的值:', lastLogTime);
+            lastLogTime = null;
+
+            // 记录本轮轮询的启动时间
+            pollingStartTime = Date.now();
+            console.log('[DEBUG] 记录轮询启动时间:', pollingStartTime);
+
+            // 立即获取一次日志
+            console.log('[DEBUG] 立即调用 fetchProcessLogs');
+            fetchProcessLogs();
+
+            // 每1秒轮询一次，提高实时性
+            logPollingInterval = setInterval(fetchProcessLogs, 1000);
+
+            // 看门狗：若1.2秒内未成功发起/完成拉取，则强制触发一次（解决偶发的第一轮被跳过导致的滞后）
+            setTimeout(function() {
+                if (!logPollingInterval) return; // 已停止
+                if (Date.now() - lastPollAt > 1200) {
+                    isFetchingLogs = false; // 复位并发标记，确保能发出请求
+                    fetchProcessLogs();
+                }
+            }, 1200);
+        }
+
+        // 停止轮询实时日志
+        function stopLogPolling() {
+            if (logPollingInterval) {
+                clearInterval(logPollingInterval);
+                logPollingInterval = null;
+            }
+
+            // 停止并发请求标志
+            isFetchingLogs = false;
+
+            // 标记日志记录完成
+            finishLogging();
+
+            // 重置日志容器
+            logContainer = null;
+        }
+
+        // 获取处理日志
+        function fetchProcessLogs() {
+            if (!currentRequestId) {
+                console.log('[DEBUG] fetchProcessLogs: 没有 currentRequestId，跳过');
+                return;
+            }
+            if (isFetchingLogs) {
+                console.log('[DEBUG] fetchProcessLogs: 正在拉取中，跳过');
+                return; // 防止并发请求导致重复
+            }
+            isFetchingLogs = true;
+
+            let url = `/mapping/api/process-logs/${currentRequestId}/`;
+            if (lastLogTime) {
+                url += `?since=${lastLogTime}`;
+            }
+            console.log('[DEBUG] fetchProcessLogs: 发起 GET 请求:', url);
+
+            $.get(url)
+                .done(function (response) {
+                    if (response.success && response.logs.length > 0) {
+                        // 显示新的日志消息（基于日志ID去重）
+                        response.logs.forEach(function (log) {
+                            if (seenLogIds.has(log.id)) {
+                                return; // 跳过已显示的日志
+                            }
+                            seenLogIds.add(log.id);
+                            displayLogMessage(log);
+                            lastLogTime = log.created_at;
+                        });
+                    }
+
+                    // ✅ 关键修复：只有当日志的最新时间晚于本轮轮询启动时间时，才检查 completed 状态
+                    // 这样可以避免"继续对话"时因为旧的 completed 状态而立即停止轮询
+                    let shouldCheckStatus = true;
+                    if (response.logs && response.logs.length > 0) {
+                        // 获取最新日志的时间
+                        let latestLogTime = new Date(response.logs[response.logs.length - 1].created_at).getTime();
+                        // 如果最新日志的时间早于本轮轮询启动时间，说明这些都是旧日志，不应该停止
+                        if (latestLogTime < pollingStartTime) {
+                            shouldCheckStatus = false;
+                            console.log('[DEBUG] 最新日志时间早于轮询启动时间，不检查状态');
+                        }
+                    }
+
+                    // 无论本次是否有新日志，都检查状态以决定是否停止
+                    if (shouldCheckStatus && (response.status === 'completed' || response.status === 'failed')) {
+                        console.log('[DEBUG] 检测到完成状态，停止轮询');
+                        stopLogPolling();
+                        stopRealtimePreviewPolling();
+                        setProcessing(false);
+                        if (response.status === 'completed') {
+                            syncFinalAssistantReply(currentRequestId);
+                            loadGeneratedMaps(currentRequestId);
+                        } else {
+                            showMapError('地图生成失败，请查看左侧日志');
+                        }
+                    }
+                })
+                .always(function () {
+                    isFetchingLogs = false; // 请求结束，释放锁
+                    lastPollAt = Date.now();
+                })
+                .fail(function () {
+                    // 轮询失败时不显示错误，避免干扰用户
+                });
+        }
+
+        // 显示日志消息 - 流式输出到一个INFO窗口
+        function displayLogMessage(log) {
+            const chatMessages = $('#chatMessages');
+
+            // 如果还没有日志容器，创建一个流式输出窗口
+            if (!logContainer) {
+                // 创建一个INFO类型的消息窗口
+                const logContainerElement = $(`
+                    <div class="message-container">
+                        <div class="message assistant streaming-log">
+                            <div class="streaming-header">
+                                <i class="fas fa-info-circle"></i>
+                                <span class="streaming-title">制图过程实时输出</span>
+                                <span class="streaming-status">正在执行...</span>
+                            </div>
+                            <div class="streaming-content">
+                                <pre class="log-stream"></pre>
+                            </div>
+                        </div>
+                    </div>
+                `);
+
+                chatMessages.append(logContainerElement);
+                logContainer = logContainerElement.find('.log-stream');
+            }
+
+            // ✅ 移除前端去重逻辑，直接显示所有日志（后端已经通过 since 参数保证不重复）
+            // 将新的日志内容追加到流式输出中
+            const currentContent = logContainer.text();
+            const newContent = currentContent + log.message + '\n';
+            logContainer.text(newContent);
+
+            // 自动滚动到最新内容
+            chatMessages.scrollTop(chatMessages[0].scrollHeight);
+
+            // 滚动日志容器到最新内容
+            const streamingContent = logContainer.parent();
+            streamingContent.scrollTop(streamingContent[0].scrollHeight);
+        }
+
+        function syncFinalAssistantReply(requestId) {
+            if (!requestId) return;
+
+            $.ajax({
+                url: `/mapping/api/chat-messages/${requestId}/`,
+                method: 'GET',
+                success: function (response) {
+                    if (!response.success || !response.messages || response.messages.length === 0) {
+                        return;
+                    }
+
+                    const assistantMessages = response.messages.filter(msg => msg.type === 'assistant' && msg.content);
+                    if (assistantMessages.length === 0) {
+                        return;
+                    }
+
+                    const latestAssistant = assistantMessages[assistantMessages.length - 1];
+                    if (lastSyncedAssistantMessageId === latestAssistant.id) {
+                        return;
+                    }
+
+                    if (pendingAssistantReply) {
+                        const assistantDom = $('#chatMessages .message.assistant').not('.streaming-log').last();
+                        if (assistantDom.length > 0) {
+                            assistantDom.html(latestAssistant.content);
+                        } else {
+                            addMessage('assistant', latestAssistant.content);
+                        }
+                    } else {
+                        addMessage('assistant', latestAssistant.content);
+                    }
+
+                    pendingAssistantReply = false;
+                    lastSyncedAssistantMessageId = latestAssistant.id;
+                }
+            });
+        }
+
+        // 完成日志记录时调用
+        function finishLogging() {
+            if (logContainer) {
+                const statusElement = logContainer.closest('.message').find('.streaming-status');
+                statusElement.text('执行完成').removeClass('executing').addClass('completed');
+
+                // 在日志末尾添加完成标记
+                const currentContent = logContainer.text();
+                logContainer.text(currentContent + '\n=== 制图过程完成 ===\n');
+
+                // 滚动到最新内容
+                const streamingContent = logContainer.parent();
+                streamingContent.scrollTop(streamingContent[0].scrollHeight);
+            }
+        }
+    </script>
+
+</body>
+
+</html>

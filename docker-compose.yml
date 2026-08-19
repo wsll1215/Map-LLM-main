@@ -1,0 +1,120 @@
+services:
+  neo4j:
+    image: neo4j:5.22-community
+    container_name: map2-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-map2neo4j123}
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_PLUGINS: '[]'
+      NEO4J_dbms_default__listen__address: 0.0.0.0
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER} -p ${NEO4J_PASSWORD} 'RETURN 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: map2-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  web:
+    build: .
+    container_name: map2-web
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: xy_neo4j.settings
+      DJANGO_DEBUG: "False"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,web
+      DJANGO_DB_PATH: /app/outputs/django.db
+      NEO4J_URI: ${NEO4J_URL:-bolt://neo4j:7687}
+      NEO4J_URL: ${NEO4J_URL:-bolt://neo4j:7687}
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
+      OUTPUT_DIR: /app/outputs
+      DATA_DIRECTORY_BASE: /app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/app
+      - ./assets/fonts:/usr/share/fonts/truetype/custom:ro
+      - staticfiles:/app/staticfiles
+      - generated_maps:/app/generated_maps
+      - outputs:/app/outputs
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    command: ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "xy_neo4j.asgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-"]
+
+  neo4j-init:
+    build: .
+    container_name: map2-neo4j-init
+    restart: "no"
+    profiles: ["init"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: xy_neo4j.settings
+      DJANGO_DEBUG: "False"
+      DJANGO_DB_PATH: /app/outputs/django.db
+      NEO4J_URI: ${NEO4J_URL:-bolt://neo4j:7687}
+      NEO4J_URL: ${NEO4J_URL:-bolt://neo4j:7687}
+      REDIS_URL: redis://redis:6379/0
+      DATA_DIRECTORY_BASE: /app/data
+      NEO4J_CLEAR_DB: "false"
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/app
+      - outputs:/app/outputs
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    command: ["python", "-m", "xy_neo4j.import_neo4j_data"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: map2-nginx
+    restart: unless-stopped
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - staticfiles:/staticfiles:ro
+      - generated_maps:/generated_maps:ro
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  staticfiles:
+  generated_maps:
+  outputs:

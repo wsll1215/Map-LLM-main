@@ -1,0 +1,33 @@
+/* 对话容器 */
+.chat-container {
+    background: #f8f9fa;
+    border-radius: 8px;
+    padding: 15px;
+}
+
+/* 问题气泡 */
+.question-bubble {
+    background: white;
+    border-radius: 15px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    margin-bottom: 1rem;
+}
+
+/* 回答气泡 */
+.answer-bubble {
+    background: #e3f2fd;
+    border-radius: 15px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+/* 状态颜色 */
+.border-success {
+    border-color: #28a745 !important;
+}
+
+/* 加载动画 */
+.spinner-border {
+    vertical-align: -0.125em;
+    border: 0.2em solid currentColor;
+    border-right-color: transparent;
+}
