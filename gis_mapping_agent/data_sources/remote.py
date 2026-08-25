@@ -18,6 +18,11 @@ from ..utils.logger import get_logger
 LOGGER = get_logger("RemoteDataSource")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = (
+    OVERPASS_URL,
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
 USER_AGENT = "MapLLM/1.0 (local GIS mapping application)"
 
 
@@ -28,7 +33,7 @@ def extract_location_query(user_request: str) -> Optional[str]:
         return None
 
     match = re.search(
-        r"(?:帮我|请|给我)?(?:绘制|画|制作)(?:一下|一张|出)?(.+?)(?:的)?地图(?:[。！!？?].*)?$",
+        r"(?:帮我|请|给我)?(?:绘制|画|制作)(?:一下|一张|出)?(.+?)(?:的)?地图",
         text,
     )
     if match:
@@ -136,39 +141,48 @@ def fetch_remote_waterways(
         f"way[waterway='river'][name]({south},{west},{north},{east});"
         "out tags geom;"
     )
-    try:
-        response = requests.post(
-            OVERPASS_URL,
-            data={"data": overpass_query},
-            headers={"User-Agent": USER_AGENT},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        elements = response.json().get("elements", [])
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        LOGGER.warning(f"远程河流数据获取失败: {place}: {exc}")
-        return None
-
     features = []
-    for element in elements:
-        geometry = element.get("geometry") or []
-        coordinates = [
-            [point["lon"], point["lat"]]
-            for point in geometry
-            if "lon" in point and "lat" in point
-        ]
-        if len(coordinates) < 2:
+    errors = []
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            response = requests.post(
+                endpoint,
+                data={"data": overpass_query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            elements = response.json().get("elements", [])
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append(f"{endpoint}: {exc}")
+            LOGGER.warning(f"远程河流数据端点失败: {place}: {endpoint}: {exc}")
             continue
-        features.append(
-            {
-                "type": "Feature",
-                "id": f"way-{element.get('id', len(features))}",
-                "properties": element.get("tags") or {},
-                "geometry": {"type": "LineString", "coordinates": coordinates},
-            }
-        )
+
+        for element in elements:
+            geometry = element.get("geometry") or []
+            coordinates = [
+                [point["lon"], point["lat"]]
+                for point in geometry
+                if "lon" in point and "lat" in point
+            ]
+            if len(coordinates) < 2:
+                continue
+            features.append(
+                {
+                    "type": "Feature",
+                    "id": f"way-{element.get('id', len(features))}",
+                    "properties": element.get("tags") or {},
+                    "geometry": {"type": "LineString", "coordinates": coordinates},
+                }
+            )
+        if features:
+            break
+
+        LOGGER.warning(f"远程河流数据端点无结果: {place}: {endpoint}")
+
     if not features:
-        LOGGER.warning(f"远程河流数据为空: {place}")
+        detail = f"；失败端点：{' | '.join(errors)}" if errors else ""
+        LOGGER.warning(f"远程河流数据为空: {place}{detail}")
         return None
 
     output_path.write_text(

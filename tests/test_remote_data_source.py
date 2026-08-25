@@ -1,5 +1,8 @@
 import json
 
+import requests
+
+import gis_mapping_agent.data_sources.remote as remote
 from gis_mapping_agent.data_sources.remote import (
     extract_location_query,
     fetch_remote_boundary,
@@ -12,6 +15,8 @@ from gis_mapping_agent.data_sources.remote import (
 def test_extract_location_query_from_natural_language() -> None:
     assert extract_location_query("帮我绘制石家庄的地图") == "石家庄"
     assert extract_location_query("绘制燕山大学西校区的地图") == "燕山大学西校区"
+    assert extract_location_query("绘制广东省的地图，要标定出广东省下的所有城市以及道路河流") == "广东省"
+    assert extract_location_query("请绘制石家庄地图，显示行政区边界") == "石家庄"
 
 
 def test_fetch_remote_boundary_caches_geojson(tmp_path, monkeypatch) -> None:
@@ -95,6 +100,42 @@ def test_fetch_remote_waterways_caches_lines(tmp_path, monkeypatch) -> None:
     assert payload["features"][0]["geometry"]["type"] == "LineString"
     assert payload["features"][0]["properties"]["name"] == "珠江"
     assert "waterway='river'][name]" in captured["data"]["data"]
+
+
+def test_fetch_remote_waterways_retries_configured_overpass_endpoints(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "id": 7,
+                        "tags": {"waterway": "river", "name": "珠江"},
+                        "geometry": [
+                            {"lon": 113.8, "lat": 23.0},
+                            {"lon": 113.9, "lat": 23.1},
+                        ],
+                    }
+                ]
+            }
+
+    def post(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.RequestException("first endpoint unavailable")
+        return Response()
+
+    monkeypatch.setattr(remote, "OVERPASS_ENDPOINTS", ("https://first.example", "https://second.example"))
+    monkeypatch.setattr(remote.requests, "post", post)
+
+    path = fetch_remote_waterways("广东省", [109.6, 20.2, 117.4, 25.6], cache_dir=tmp_path)
+
+    assert path is not None
+    assert calls == ["https://first.example", "https://second.example"]
 
 
 def test_normalize_point_to_extent_preserves_real_location() -> None:

@@ -24,12 +24,12 @@ body { margin: 0; min-width: 1180px; background: #f8fafc; }
 button, textarea { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 
-.workbench { min-height: 100vh; padding: 24px 30px 36px; background: #f5f7fa; }
-.topbar { display: flex; justify-content: space-between; align-items: flex-end; max-width: 1600px; margin: 0 auto 18px; gap: 24px; }
+.workbench { min-height: 100vh; padding: 16px 30px 28px; background: #f5f7fa; }
+.topbar { display: flex; justify-content: space-between; align-items: center; max-width: 1600px; margin: 0 auto 12px; gap: 24px; }
 .brand-block { min-width: 0; }
 .eyebrow, .section-kicker { color: #718096; font: 600 10px/1.2 "Fira Code", monospace; letter-spacing: .08em; }
-.brand-block h1 { margin: 7px 0 3px; color: var(--heading); font-size: 30px; line-height: 1.15; letter-spacing: -.02em; }
-.brand-block p { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.45; }
+.brand-block h1 { margin: 5px 0 2px; color: var(--heading); font-size: 28px; line-height: 1.15; letter-spacing: -.02em; }
+.brand-block p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.35; }
 .topbar-actions { display: flex; align-items: center; gap: 16px; }
 .connection { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; white-space: nowrap; }
 .connection i { width: 8px; height: 8px; border-radius: 50%; background: #a8b3bf; }
@@ -161,6 +161,8 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .status-card-completed .status-icon { color: #fff; background: var(--green); }
 .status-card-failed .status-icon { color: #fff; background: var(--red); }
 .status-card p { margin: 10px 0 0; overflow-wrap: anywhere; color: #587083; font-size: 13px; line-height: 1.55; }
+.trace-line { display: flex; align-items: center; gap: 8px; min-width: 0; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(190, 205, 215, .7); color: #728797; font-size: 11px; }
+.trace-line code { min-width: 0; overflow: hidden; color: #567083; font: 11px "Fira Code", monospace; text-overflow: ellipsis; white-space: nowrap; }
 .transport-notice { margin-top: 11px; padding: 9px 10px; border: 1px solid #ead2a1; border-radius: 5px; color: #8a5a0c; background: #fff8e9; font-size: 12px; line-height: 1.5; }
 .inspector-section { margin-top: 19px; }
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; color: #2b4962; font-size: 14px; font-weight: 700; }
@@ -177,10 +179,11 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .file-action { min-height: 32px; margin-left: auto; flex: 0 0 auto; padding: 6px 9px; border: 1px solid #a7cdbb; border-radius: 5px; color: #21714e; background: #fff; font-size: 12px; font-weight: 700; text-decoration: none; white-space: nowrap; }
 .file-unavailable { margin-left: auto; flex: 0 0 auto; color: #a45a54!important; font-size: 12px!important; font-family: inherit!important; }
 .result-note { margin: 0; padding: 12px; color: #668273; font-size: 13px; line-height: 1.5; }
-.error-box { margin-top: 18px; padding: 13px; overflow-wrap: anywhere; border: 1px solid #efc8c5; border-radius: 6px; color: var(--red); background: #fff0ef; }
-.error-box strong { display: block; font-size: 14px; }
-.error-box p { margin: 6px 0 10px; color: #894b4a; font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
-.retry-button { min-height: 32px; padding: 5px 0; border: 0; color: var(--red); background: transparent; font-size: 13px; font-weight: 700; }
+.failure-detail { margin-top: 14px; padding-top: 12px; border-top: 1px solid #efc8c5; overflow-wrap: anywhere; color: #894b4a; }
+.failure-detail strong { display: block; color: var(--red); font-size: 13px; }
+.failure-detail p { margin: 5px 0 7px; color: #894b4a; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+.failure-detail > span { display: block; margin-bottom: 6px; color: #8f5d5a; font-size: 12px; line-height: 1.45; }
+.retry-button { min-height: 32px; padding: 6px 10px; border: 1px solid #d99d99; border-radius: 5px; color: var(--red); background: #fff; font-size: 13px; font-weight: 700; }
 
 .composer { padding: 16px 17px 17px; border-top: 1px solid #dbe5ed; background: #fff; }
 .composer label { display: block; margin-bottom: 8px; color: #294760; font-size: 14px; font-weight: 700; }
@@ -204,6 +207,16 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .map-data-error, .map-data-loading { position: absolute; left: 14px; right: 14px; top: 14px; z-index: 3; padding: 11px 13px; border: 1px solid #e7b7b0; border-radius: 5px; color: #8f3028; background: rgba(255,248,247,.96); font-size: 14px; box-shadow: 0 3px 12px rgba(31,52,69,.12); }
 .map-data-loading { right: auto; border-color: #c5d7e2; color: #31516a; background: rgba(248,252,254,.96); }
 .layer-context { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #607186; }
+
+.progress-dock { position: absolute; left: 14px; right: 14px; bottom: 14px; z-index: 5; padding: 10px 13px 9px; border: 1px solid rgba(194, 208, 219, .95); border-radius: 7px; background: rgba(255, 255, 255, .94); box-shadow: 0 5px 18px rgba(31, 52, 69, .16); backdrop-filter: blur(8px); }
+.progress-dock-heading { display: flex; align-items: baseline; gap: 10px; min-width: 0; margin-bottom: 7px; }
+.progress-dock-heading strong { flex: 0 0 auto; color: #294760; font-size: 13px; }
+.progress-dock-heading span { min-width: 0; overflow: hidden; color: #6d8191; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.progress-dock .progress-steps { gap: 8px; padding: 0; border: 0; }
+.progress-dock .progress-step { gap: 6px; font-size: 12px; }
+.progress-dock .progress-step span { width: 20px; height: 20px; }
+.progress-dock-failed { border-color: #e7b4b0; background: rgba(255, 247, 246, .96); }
+.progress-dock-failed .progress-dock-heading strong { color: #a13d39; }
 
 @media (max-height: 760px) {
   .workbench { padding-top: 18px; }

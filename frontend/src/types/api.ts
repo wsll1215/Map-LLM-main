@@ -75,6 +75,7 @@ export interface MapRequestSummary {
   latest_run?: {
     id: number;
     status: string;
+    trace_id?: string;
     error_code?: string;
     error_message?: string;
     map_version?: number | null;

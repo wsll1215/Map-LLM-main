@@ -7,7 +7,7 @@ const TERMINAL = new Set<MapRequestSummary["status"]>(["completed", "needs_clari
 export function useTaskStatus(
   requestId: number | null,
   active: boolean,
-  dispatch: (action: { type: "task_status"; status: MapRequestSummary["status"]; error: string | null; message?: string; clarification?: MapRequestSummary["clarification"] } | { type: "task_status_error"; message: string }) => void,
+  dispatch: (action: { type: "task_status"; status: MapRequestSummary["status"]; error: string | null; message?: string; clarification?: MapRequestSummary["clarification"]; traceId?: string | null } | { type: "task_status_error"; message: string }) => void,
 ) {
   const dispatchRef = useRef(dispatch);
   dispatchRef.current = dispatch;
@@ -27,6 +27,7 @@ export function useTaskStatus(
           error: task.error_message || task.latest_run?.error_message || null,
           message: task.result_message || undefined,
           clarification: task.clarification,
+          traceId: task.latest_run?.trace_id || null,
         });
         if (!TERMINAL.has(task.status)) timer = window.setTimeout(() => void poll(), 2000);
       } catch (error) {

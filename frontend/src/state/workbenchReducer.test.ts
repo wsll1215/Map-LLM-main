@@ -219,6 +219,15 @@ describe("workbenchReducer", () => {
     ]);
   });
 
+  it("restores process logs when loading a historical task", () => {
+    const state = workbenchReducer(initialWorkbenchState, {
+      type: "logs_loaded",
+      logs: [{ step: "数据源校验", message: "未找到可用的河流数据" }],
+    });
+
+    expect(state.logs).toEqual([{ step: "数据源校验", message: "未找到可用的河流数据" }]);
+  });
+
   it("restores historical map context for the final PNG view", () => {
     const state = workbenchReducer(initialWorkbenchState, {
       type: "history_loaded",
@@ -234,5 +243,18 @@ describe("workbenchReducer", () => {
     expect(state.status).toBe("completed");
     expect(state.viewState?.map?.title).toBe("北京市地图");
     expect(state.layers[0]?.name).toBe("北京边界");
+  });
+
+  it("restores the trace and failure reason for a historical failed run", () => {
+    const state = workbenchReducer(initialWorkbenchState, {
+      type: "history_loaded",
+      requestId: 116,
+      status: "failed",
+      traceId: "web_session_116:create",
+      error: "数据源校验未通过：未找到可用的河流数据",
+    });
+
+    expect(state.traceId).toBe("web_session_116:create");
+    expect(state.error).toBe("数据源校验未通过：未找到可用的河流数据");
   });
 });

@@ -1182,6 +1182,7 @@ def get_history_maps(request):
 
         sessions_data = []
         for map_request in requests:
+            latest_run = map_request.runs.order_by("-created_at", "-id").first()
             maps_data = []
             for map_obj in map_request.generated_maps.order_by("-created_at"):
                 full_file_path = os.path.join(settings.GENERATED_MAPS_DIR, map_obj.file_path)
@@ -1210,6 +1211,13 @@ def get_history_maps(request):
                 "maps": maps_data,
                 "clarification": map_request.clarification_data or None,
                 "view_state": _load_latest_view_state(map_request),
+                "latest_run": {
+                    "id": latest_run.id,
+                    "status": latest_run.status,
+                    "trace_id": latest_run.trace_id,
+                    "error_code": latest_run.error_code,
+                    "error_message": latest_run.error_message,
+                } if latest_run else None,
             })
 
         return JsonResponse({

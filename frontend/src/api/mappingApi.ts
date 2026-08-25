@@ -8,5 +8,6 @@ export const mappingApi = {
   status: (id: number) => apiFetch<MapRequestSummary>(`/mapping/api/map-requests/${id}/`),
   async history() { const result = await apiFetch<{ sessions: MapRequestSummary[] }>("/mapping/api/history-maps/"); return result.sessions ?? []; },
   async messages(id: number) { const result = await apiFetch<{ messages: ChatMessage[] }>(`/mapping/api/chat-messages/${id}/`); return result.messages ?? []; },
+  async logs(id: number) { const result = await apiFetch<{ logs: Array<Record<string, unknown>> }>(`/mapping/api/process-logs/${id}/`); return result.logs ?? []; },
   async generated(id: number) { const result = await apiFetch<{ maps: GeneratedMap[] }>(`/mapping/api/generated-maps/${id}/`); return result.maps ?? []; },
 };

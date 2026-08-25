@@ -79,6 +79,9 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
       OUTPUT_DIR: /app/outputs
       DATA_DIRECTORY_BASE: /app/data
+      HTTP_PROXY: ${MAP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${MAP_HTTPS_PROXY:-}
+      NO_PROXY: ${MAP_NO_PROXY:-localhost,127.0.0.1,web,redis,neo4j,postgis,host.docker.internal}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -117,6 +120,9 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
       OUTPUT_DIR: /app/outputs
       DATA_DIRECTORY_BASE: /app/data
+      HTTP_PROXY: ${MAP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${MAP_HTTPS_PROXY:-}
+      NO_PROXY: ${MAP_NO_PROXY:-localhost,127.0.0.1,web,redis,neo4j,postgis,host.docker.internal}
     volumes:
       - ./:/app
       - ./assets/fonts:/usr/share/fonts/truetype/custom:ro
@@ -147,6 +153,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATA_DIRECTORY_BASE: /app/data
       NEO4J_CLEAR_DB: "false"
+      HTTP_PROXY: ${MAP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${MAP_HTTPS_PROXY:-}
+      NO_PROXY: ${MAP_NO_PROXY:-localhost,127.0.0.1,web,redis,neo4j,postgis,host.docker.internal}
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
     extra_hosts:
