@@ -10,7 +10,8 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from ..models.schemas import MapState
 from ..utils.config import Config
 from ..utils.logger import setup_logger, get_logger
-from ..utils.data_path_resolver import extract_data_info_from_request, resolve_data_path
+from ..utils.data_path_resolver import data_path_resolver, extract_data_info_from_request, resolve_data_path
+from ..data_sources.remote import extract_location_query, fetch_remote_boundary
 from ..gis import calculate_extent_from_files, format_extent_for_request
 from ..state import get_generalization_context
 from ..tools.registry import ALL_UNIFIED_TOOLS
@@ -40,6 +41,8 @@ class ThinkingGISMappingAgent:
         # 设置日志
         setup_logger()
         self.logger = get_logger("ThinkingGISMappingAgent")
+        self._default_data_file_path = None
+        self._explicit_data_files = False
 
         # 验证配置
         self._validate_config()
@@ -86,7 +89,23 @@ class ThinkingGISMappingAgent:
             self.logger.info(f"开始处理制图请求")
 
             # 从用户请求中提取数据目录和文件信息
+            explicit_data_files = data_path_resolver.find_data_files_in_request(user_request)
             data_dir_from_request, data_files_from_request = extract_data_info_from_request(user_request)
+            self._explicit_data_files = bool(explicit_data_files)
+            self._default_data_file_path = None
+            if not self._explicit_data_files and data_dir_from_request and data_files_from_request:
+                self._default_data_file_path = resolve_data_path(data_dir_from_request) / data_files_from_request[0]
+
+            # Prefer a real remote boundary when the local catalog has no match.
+            # The LLM must never invent a local shapefile path for a place request.
+            if not self._explicit_data_files and not data_files_from_request:
+                location_query = extract_location_query(user_request)
+                if location_query:
+                    remote_path = fetch_remote_boundary(location_query)
+                    if remote_path:
+                        data_dir_from_request = str(remote_path.parent)
+                        data_files_from_request = [remote_path.name]
+                        self._default_data_file_path = remote_path
 
             # 自动计算范围
             self.auto_extent, self.auto_extent_str = self._calculate_auto_extent(
@@ -306,6 +325,10 @@ class ThinkingGISMappingAgent:
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """执行指定的工具（工具调用版）"""
         try:
+            if tool_name == "add_layer" and self._default_data_file_path and not self._explicit_data_files:
+                tool_input = dict(tool_input)
+                tool_input["data_path"] = self._default_data_file_path.as_posix()
+
             # 特殊处理init_map工具，自动注入计算好的范围
             if tool_name == "init_map" and self.auto_extent:
                 # 如果用户没有指定extent或extent为空，使用自动计算的范围
@@ -380,11 +403,10 @@ class ThinkingGISMappingAgent:
         if "session_id" not in fields:
             return tool_input
 
+        if tool_input.get("session_id"):
+            return tool_input
+
         tool_input = dict(tool_input)
-        if tool_input.get("session_id") and tool_input.get("session_id") != session_id:
-            self.logger.warning(
-                f"工具 {getattr(tool, 'name', '<unknown>')} 的 session_id 参数与当前会话不一致，已覆盖为当前会话"
-            )
         tool_input["session_id"] = session_id
         return tool_input
 
@@ -429,19 +451,23 @@ class ThinkingGISMappingAgent:
 
     def _enhance_request_with_auto_extent(self, user_request: str) -> str:
         """增强用户请求，添加自动计算的范围"""
-        if not self.auto_extent_str:
+        instructions = []
+        if self.auto_extent_str:
+            instructions.append("🎯 系统已自动计算最佳地图范围，在初始化地图时会自动使用。")
+        if self._default_data_file_path and not self._explicit_data_files:
+            instructions.append(
+                f"📁 系统已解析出可用数据文件 {self._default_data_file_path.as_posix()}，添加图层时必须使用该文件，禁止猜测其他路径。"
+            )
+        if not instructions:
             return user_request
 
         if "extent=" in user_request.lower() or "范围" in user_request:
-            self.logger.info("用户请求中已包含范围信息，不使用自动计算的范围")
+            instructions = [item for item in instructions if not item.startswith("🎯")]
+
+        if not instructions:
             return user_request
 
-        enhanced_request = f"""{user_request}
-
-🎯 系统已自动计算最佳地图范围，在初始化地图时会自动使用。"""
-
-        
-        return enhanced_request
+        return f"{user_request}\n\n" + "\n".join(instructions)
 
     def _get_final_map_state(self) -> Optional[MapState]:
         """获取最终的地图状态

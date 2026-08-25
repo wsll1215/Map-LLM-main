@@ -97,6 +97,13 @@ class LayerConfig(BaseModel):
     style: LayerStyle = Field(default_factory=LayerStyle, description="图层样式")
     visible: bool = Field(default=True, description="是否可见")
     z_order: int = Field(default=0, description="绘制顺序")
+    data_hash: Optional[str] = Field(default=None, description="图层数据哈希")
+    feature_count: int = Field(default=0, ge=0, description="要素数量")
+    extent: Optional[List[float]] = Field(default=None, description="图层范围")
+    render_mode: Literal["geojson", "geojson-worker", "mvt", "pmtiles"] = Field(
+        default="geojson", description="前端渲染模式"
+    )
+    data_url: Optional[str] = Field(default=None, description="图层数据地址")
     gdf: Optional[gpd.GeoDataFrame] = None
 
     class Config:
@@ -226,6 +233,13 @@ class MapState(BaseModel):
     created_at: Optional[str] = Field(default=None, description="创建时间")
     updated_at: Optional[str] = Field(default=None, description="更新时间")
     output_path: Optional[str] = Field(default=None, description="地图输出路径")
+    schema_version: int = Field(default=1, ge=1, description="快照协议版本")
+    spec_json: Optional[Dict[str, Any]] = Field(default=None, description="MapSpec 快照")
+    spec_hash: Optional[str] = Field(default=None, description="MapSpec 哈希")
+    source_fingerprints: Dict[str, Any] = Field(
+        default_factory=dict, description="源数据指纹"
+    )
+    latest_event_seq: int = Field(default=0, ge=0, description="最新事件序号")
 
     # 新增：会话和版本管理字段
     session_info: SessionInfo = Field(default_factory=SessionInfo, description="会话信息")

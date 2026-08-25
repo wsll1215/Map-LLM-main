@@ -1,6 +1,7 @@
 from django.urls import path
 from . import views
 from . import api_views
+from . import rest_api
 
 app_name = 'mapping'
 
@@ -19,6 +20,22 @@ urlpatterns = [
     path('api/realtime-preview/<int:request_id>/', views.get_latest_realtime_preview, name='realtime_preview'),
     path('api/process-logs/<int:request_id>/', views.get_process_logs, name='process_logs'),
     path('api/convert-map-format/', views.convert_map_format, name='convert_map_format'),  # 新增：格式转换
+
+    # Versioned REST resources
+    path('api/map-requests/', rest_api.map_request_collection, name='map-request-collection'),
+    path('api/map-requests/<int:request_id>/', rest_api.map_request_detail, name='map-request-detail'),
+    path('api/map-requests/<int:request_id>/messages/', rest_api.map_message_collection, name='map-message-collection'),
+    path('api/map-requests/<int:request_id>/runs/', rest_api.map_run_collection, name='map-run-collection'),
+    path('api/map-requests/<int:request_id>/runs/<int:run_id>/', rest_api.map_run_detail, name='map-run-detail'),
+    path('api/map-requests/<int:request_id>/snapshots/current/', rest_api.map_snapshot_current, name='map-snapshot-current'),
+    path('api/map-requests/<int:request_id>/snapshots/<int:version>/', rest_api.map_snapshot_detail, name='map-snapshot-detail'),
+    path('api/map-requests/<int:request_id>/snapshots/<int:version>/layers/<str:layer_id>/', rest_api.map_layer_manifest, name='map-layer-manifest'),
+    path('api/map-requests/<int:request_id>/snapshots/<int:version>/layers/<str:layer_id>/data/', rest_api.map_layer_data, name='map-layer-data'),
+    path('api/map-requests/<int:request_id>/snapshots/current/layers/<str:layer_id>/data/', rest_api.map_layer_data_current, name='map-layer-data-current'),
+    path('api/map-requests/<int:request_id>/artifacts/', rest_api.map_artifact_collection, name='map-artifact-collection'),
+    path('api/datasets/', rest_api.dataset_collection, name='dataset-collection'),
+    path('api/datasets/<str:dataset_id>/', rest_api.dataset_detail, name='dataset-detail'),
+    path('api/datasets/<str:dataset_id>/features/', rest_api.dataset_feature_collection, name='dataset-feature-collection'),
 
     # 管理 API 接口
     path('api/admin/sessions/', api_views.list_user_sessions, name='api_list_sessions'),

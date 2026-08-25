@@ -23,6 +23,17 @@ def _geometry_type_label(geometry_type: GeometryType) -> str:
     return "面图层"
 
 
+def _is_global_placeholder_extent(extent: Any) -> bool:
+    """Return whether an extent is the init-map global fallback."""
+    if not isinstance(extent, (list, tuple)) or len(extent) != 4:
+        return False
+    try:
+        min_x, min_y, max_x, max_y = [float(value) for value in extent]
+    except (TypeError, ValueError):
+        return False
+    return min_x <= -180 and min_y <= -90 and max_x >= 180 and max_y >= 90
+
+
 class MapOperationsMixin:
     def init_map(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """初始化地图范围、坐标系和背景色
@@ -262,6 +273,27 @@ class MapOperationsMixin:
             if gdf.crs != target_crs:
                 gdf = gdf.to_crs(target_crs)
 
+            # A plain request such as "绘制北京地图" may initialize the map
+            # before the model resolves the shapefile. Replace the global
+            # placeholder with the first layer's real bounds so the rendered
+            # map is geographically meaningful instead of mostly blank.
+            current_extent = self.current_map_state.config.extent
+            if _is_global_placeholder_extent(current_extent):
+                min_x, min_y, max_x, max_y = [float(value) for value in gdf.total_bounds]
+                if min_x < max_x and min_y < max_y:
+                    x_margin = (max_x - min_x) * 0.05
+                    y_margin = (max_y - min_y) * 0.05
+                    self.current_map_state.config.extent = [
+                        min_x - x_margin,
+                        min_y - y_margin,
+                        max_x + x_margin,
+                        max_y + y_margin,
+                    ]
+                    self.logger.info(
+                        "地图范围未明确指定，已根据图层数据自动调整为: %s",
+                        self.current_map_state.config.extent,
+                    )
+
             # 自动检测几何类型（如果未指定）
             if geometry_type is None:
                 # 获取数据中最常见的几何类型
@@ -321,6 +353,11 @@ class MapOperationsMixin:
                 layer_config.style.color = new_color
                 self.current_map_state.color_index += 1
                 self.logger.info(f"已为图层 '{name}' 自动设置显示样式")
+
+                if geometry_type in [GeometryType.POLYGON, GeometryType.MULTIPOLYGON]:
+                    layer_config.style.facecolor = '#DDECCF'
+                    layer_config.style.edgecolor = '#334155'
+                    layer_config.style.linewidth = 1.1
 
             # 为点图层优化显示效果（只在没有提供样式时）
             if geometry_type == GeometryType.POINT and not (style and isinstance(style, dict)):

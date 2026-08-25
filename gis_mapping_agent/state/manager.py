@@ -75,8 +75,8 @@ class MapStateManager:
     def _migrate_database(self, cursor):
         """Keep old SQLite files compatible with newer MapState fields."""
         cursor.execute("PRAGMA table_info(map_states)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        new_columns = {
+        existing_map_state_columns = {row[1] for row in cursor.fetchall()}
+        map_state_columns = {
             "output_path": "TEXT",
             "generalization_algorithm": "TEXT",
             "generalization_params": "TEXT",
@@ -84,10 +84,28 @@ class MapStateManager:
             "generalization_output_path": "TEXT",
             "generalization_metrics": "TEXT",
             "generalization_result_meta": "TEXT",
+            "schema_version": "INTEGER DEFAULT 1",
+            "spec_json": "TEXT",
+            "spec_hash": "TEXT",
+            "source_fingerprints": "TEXT",
+            "latest_event_seq": "INTEGER DEFAULT 0",
         }
-        for column, column_type in new_columns.items():
-            if column not in existing_columns:
+        for column, column_type in map_state_columns.items():
+            if column not in existing_map_state_columns:
                 cursor.execute(f"ALTER TABLE map_states ADD COLUMN {column} {column_type}")
+
+        cursor.execute("PRAGMA table_info(layers)")
+        existing_layer_columns = {row[1] for row in cursor.fetchall()}
+        layer_columns = {
+            "data_hash": "TEXT",
+            "feature_count": "INTEGER DEFAULT 0",
+            "extent": "TEXT",
+            "render_mode": "TEXT DEFAULT 'geojson'",
+            "data_url": "TEXT",
+        }
+        for column, column_type in layer_columns.items():
+            if column not in existing_layer_columns:
+                cursor.execute(f"ALTER TABLE layers ADD COLUMN {column} {column_type}")
 
     def _create_tables_inline(self, cursor):
         """内联创建数据库表（备用方案）"""
@@ -122,6 +140,11 @@ class MapStateManager:
                 auto_compass INTEGER DEFAULT 1,
                 scalebar TEXT,
                 compass TEXT,
+                schema_version INTEGER DEFAULT 1,
+                spec_json TEXT,
+                spec_hash TEXT,
+                source_fingerprints TEXT,
+                latest_event_seq INTEGER DEFAULT 0,
                 output_path TEXT,
                 is_generalization_task INTEGER DEFAULT 0,
                 generalization_algorithm TEXT,
@@ -155,6 +178,11 @@ class MapStateManager:
                 label_style TEXT,
                 visible INTEGER DEFAULT 1,
                 z_order INTEGER DEFAULT 0,
+                data_hash TEXT,
+                feature_count INTEGER DEFAULT 0,
+                extent TEXT,
+                render_mode TEXT DEFAULT 'geojson',
+                data_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (state_id) REFERENCES map_states(id) ON DELETE CASCADE
             )
@@ -276,12 +304,13 @@ class MapStateManager:
                 session_id, version, map_id, title, extent, crs,
                 background_color, figsize, dpi, maintain_data_aspect,
                 fit_figsize_to_extent, auto_legend, auto_scalebar, auto_compass,
-                scalebar, compass, output_path, is_generalization_task,
+                scalebar, compass, schema_version, spec_json, spec_hash,
+                source_fingerprints, latest_event_seq, output_path, is_generalization_task,
                 generalization_algorithm, generalization_params,
                 generalization_input_path, generalization_output_path,
                 generalization_metrics, generalization_result_meta, generalization_result,
                 parent_version, description, is_current, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             map_state.get_session_id(),
             map_state.get_current_version(),
@@ -299,6 +328,11 @@ class MapStateManager:
             1 if config.auto_compass else 0,
             json.dumps(map_state.scalebar) if map_state.scalebar else None,
             json.dumps(map_state.compass) if map_state.compass else None,
+            map_state.schema_version,
+            json.dumps(map_state.spec_json, ensure_ascii=False) if map_state.spec_json else None,
+            map_state.spec_hash,
+            json.dumps(map_state.source_fingerprints, ensure_ascii=False),
+            map_state.latest_event_seq,
             map_state.output_path,
             1 if map_state.is_generalization_task else 0,
             algorithm,
@@ -363,8 +397,9 @@ class MapStateManager:
             cursor.execute("""
                 INSERT INTO layers (
                     state_id, layer_id, name, data_source, geometry_type,
-                    style, label_column, label_style, visible, z_order
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    style, label_column, label_style, visible, z_order,
+                    data_hash, feature_count, extent, render_mode, data_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 state_id,
                 layer.layer_id,
@@ -375,7 +410,12 @@ class MapStateManager:
                 label_column,
                 None,  # label_style 暂时为 None
                 1 if layer.visible else 0,
-                i  # z_order
+                i,  # z_order
+                layer.data_hash,
+                layer.feature_count,
+                json.dumps(layer.extent) if layer.extent else None,
+                layer.render_mode,
+                layer.data_url,
             ))
 
     def _insert_annotations(self, cursor, state_id: int, annotations: List):
@@ -524,6 +564,11 @@ class MapStateManager:
                 geometry_type=GeometryType(layer_row['geometry_type']) if layer_row['geometry_type'] else GeometryType.POLYGON,
                 style=LayerStyle(**style_dict) if style_dict else LayerStyle(),
                 visible=bool(layer_row['visible']),
+                data_hash=self._row_get(layer_row, 'data_hash'),
+                feature_count=self._row_get(layer_row, 'feature_count', 0) or 0,
+                extent=json.loads(self._row_get(layer_row, 'extent')) if self._row_get(layer_row, 'extent') else None,
+                render_mode=self._row_get(layer_row, 'render_mode', 'geojson') or 'geojson',
+                data_url=self._row_get(layer_row, 'data_url'),
                 gdf=None  # GeoDataFrame 不存储在数据库中
             )
             layers.append(layer)
@@ -574,6 +619,11 @@ class MapStateManager:
             scalebar=json.loads(state_row['scalebar']) if state_row['scalebar'] else None,
             compass=json.loads(state_row['compass']) if state_row['compass'] else None,
             output_path=self._row_get(state_row, 'output_path'),
+            schema_version=self._row_get(state_row, 'schema_version', 1) or 1,
+            spec_json=json.loads(self._row_get(state_row, 'spec_json')) if self._row_get(state_row, 'spec_json') else None,
+            spec_hash=self._row_get(state_row, 'spec_hash'),
+            source_fingerprints=json.loads(self._row_get(state_row, 'source_fingerprints')) if self._row_get(state_row, 'source_fingerprints') else {},
+            latest_event_seq=self._row_get(state_row, 'latest_event_seq', 0) or 0,
             session_info=session_info,
             version_info=map_version,
             is_generalization_task=bool(state_row['is_generalization_task']),

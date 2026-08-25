@@ -16,6 +16,9 @@ class MapStatesRouter:
         'MapStateLegend',
         'MapStateAnnotation',
         'MapStateModificationRecord',
+        'MapSession',
+        'Layer',
+        'Annotation',
     }
     
     def db_for_read(self, model, **hints):
@@ -52,5 +55,14 @@ class MapStatesRouter:
         """
         if model_name in [m.lower() for m in self.map_states_models]:
             return db == 'map_states'
+        if model_name == 'datasetfeature':
+            # SQLite is retained for lightweight unit tests; normalized spatial
+            # features are created only on a PostGIS default database.
+            return db == 'default' and self._is_postgis('default')
         return None
 
+    @staticmethod
+    def _is_postgis(alias):
+        from django.conf import settings
+
+        return settings.DATABASES[alias].get('ENGINE') == 'django.contrib.gis.db.backends.postgis'

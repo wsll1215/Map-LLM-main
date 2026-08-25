@@ -1,12 +1,4 @@
-FROM node:20-alpine AS frontend-build
-
-WORKDIR /app/frontend
-COPY frontend/package*.json ./
-RUN npm install --ignore-scripts --no-audit --no-fund
-COPY frontend/ ./
-RUN npm run build
-
-FROM python:3.10-slim
+FROM python:3.10-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -16,18 +8,30 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i \
+    -e 's|deb.debian.org/debian|mirrors.aliyun.com/debian|g' \
+    -e 's|deb.debian.org/debian-security|mirrors.aliyun.com/debian-security|g' \
+    /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::Retries=10 update && apt-get -o Acquire::Retries=10 install -y --no-install-recommends \
     fontconfig \
     fonts-noto-cjk \
+    libgdal32 \
+    libgeos-c1v5 \
     && rm -rf /var/lib/apt/lists/*
 
+ENV GDAL_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libgdal.so.32 \
+    GEOS_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libgeos_c.so.1
+
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install --retries 10 --timeout 100 --index-url https://download.pytorch.org/whl/cpu torch==2.12.1 && \
-    pip install --retries 10 --timeout 100 -r requirements.txt
+COPY .docker-wheels/torch-2.12.1+cpu-cp310-cp310-manylinux_2_28_x86_64.whl /tmp/torch-2.12.1+cpu-cp310-cp310-manylinux_2_28_x86_64.whl
+RUN pip install --no-cache-dir --no-deps /tmp/torch-2.12.1+cpu-cp310-cp310-manylinux_2_28_x86_64.whl && \
+    pip install --retries 10 --timeout 120 \
+        --index-url http://mirrors.aliyun.com/pypi/simple \
+        --trusted-host mirrors.aliyun.com \
+        -r requirements.txt && \
+    rm -f /tmp/torch-2.12.1+cpu-cp310-cp310-manylinux_2_28_x86_64.whl
 
 COPY . /app
-COPY --from=frontend-build /app/static/frontend /app/static/frontend
 
 RUN chmod +x /app/entrypoint.sh
 

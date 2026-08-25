@@ -57,7 +57,7 @@ def do_register(request):
 def user_login(request):
     try:
         if request.user.is_authenticated:
-            return redirect("/")
+            return redirect("/mapping/")
         if request.method == 'POST':
             login_form = LoginForm(request.POST)
             if login_form.is_valid():
@@ -71,7 +71,7 @@ def user_login(request):
                 else:
                     errorinfo = "账号或密码不正确"
                     return render(request, 'login.html', {'login_form': login_form, "errorinfo":errorinfo})
-                return redirect("/")
+                return redirect("/mapping/")
             else:
                 errorinfo = "账号或密码不正确或格式错误"
                 return render(request, 'login.html', {'login_form': login_form, "errorinfo":errorinfo})

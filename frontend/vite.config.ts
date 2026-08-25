@@ -5,18 +5,17 @@ export default defineConfig({
   plugins: [react()],
   base: "/static/frontend/",
   server: {
-    port: 5173,
+    port: 5200,
     proxy: {
-      "/mapping": "http://127.0.0.1:8000",
-      "/accounts": "http://127.0.0.1:8000",
-      "/generated_maps": "http://127.0.0.1:8000",
-      "/static": "http://127.0.0.1:8000"
+      "/mapping": "http://127.0.0.1:8001",
+      "/accounts": "http://127.0.0.1:8001",
+      "/generated_maps": "http://127.0.0.1:8001"
     },
   },
   build: {
     outDir: "../static/frontend",
     emptyOutDir: true,
     manifest: false,
-    rollupOptions: { output: { entryFileNames: "assets/app.js", chunkFileNames: "assets/[name].js", assetFileNames: "assets/[name][extname]" } },
+    rollupOptions: { output: { entryFileNames: "assets/app.js", chunkFileNames: "assets/[name].js", assetFileNames: (assetInfo) => assetInfo.name?.endsWith(".css") ? "assets/app.css" : "assets/[name][extname]" } },
   },
 });

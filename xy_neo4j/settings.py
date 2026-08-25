@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/3.2/ref/settings/
 
 from pathlib import Path
 import os
+import sys
+from urllib.parse import parse_qs, unquote, urlparse
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -20,6 +22,35 @@ try:
     load_dotenv(BASE_DIR / '.env')
 except Exception:
     pass
+
+
+def _configure_gis_library_paths():
+    """Make GeoDjango use libraries bundled by pyogrio when available."""
+    if os.name == "nt":
+        try:
+            import glob
+
+            conda_libs_dir = Path(sys.prefix) / "Library" / "bin"
+            wheel_libs_dir = Path(sys.prefix) / "Lib" / "site-packages" / "pyogrio.libs"
+            libs_dir = conda_libs_dir if (conda_libs_dir / "gdal.dll").exists() else wheel_libs_dir
+            gdal_candidates = glob.glob(str(libs_dir / "gdal*.dll"))
+            geos_candidates = glob.glob(str(libs_dir / "geos_c*.dll"))
+            if gdal_candidates:
+                os.environ.setdefault("GDAL_LIBRARY_PATH", gdal_candidates[0])
+            if geos_candidates:
+                os.environ.setdefault("GEOS_LIBRARY_PATH", geos_candidates[0])
+            if hasattr(os, "add_dll_directory") and libs_dir.exists():
+                os.add_dll_directory(str(libs_dir))
+        except (ImportError, OSError):
+            pass
+    else:
+        os.environ.setdefault("GDAL_LIBRARY_PATH", "/usr/lib/x86_64-linux-gnu/libgdal.so.32")
+        os.environ.setdefault("GEOS_LIBRARY_PATH", "/usr/lib/x86_64-linux-gnu/libgeos_c.so.1")
+
+
+_configure_gis_library_paths()
+GDAL_LIBRARY_PATH = os.getenv("GDAL_LIBRARY_PATH", "") or None
+GEOS_LIBRARY_PATH = os.getenv("GEOS_LIBRARY_PATH", "") or None
 
 
 # Quick-start development settings - unsuitable for production
@@ -42,6 +73,7 @@ ALLOWED_HOSTS = [host.strip() for host in os.getenv('DJANGO_ALLOWED_HOSTS', 'loc
 INSTALLED_APPS = [
     'simpleui',
     'channels',
+    'django.contrib.gis',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -87,6 +119,13 @@ WSGI_APPLICATION = 'xy_neo4j.wsgi.application'
 ASGI_APPLICATION = 'xy_neo4j.asgi.application'
 
 REDIS_URL = os.getenv('REDIS_URL', '').strip()
+MAP_GEOJSON_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_LIMIT', '5000')))
+MAP_WORKER_LIMIT = max(MAP_GEOJSON_LIMIT, int(os.getenv('MAP_WORKER_LIMIT', '30000')))
+MAP_GEOJSON_FALLBACK_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_FALLBACK_LIMIT', '1000')))
+MAP_MVT_ENABLED = os.getenv('MAP_MVT_ENABLED', 'false').lower() == 'true'
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
+CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', 'False').lower() == 'true'
 # Channels is retained for session/auth middleware; map progress now uses the
 # dedicated Redis Streams or in-memory SSE broker rather than channel groups.
 CHANNEL_LAYERS = {
@@ -99,8 +138,47 @@ CHANNEL_LAYERS = {
 # Database
 # https://docs.djangoproject.com/en/3.2/ref/settings/#databases
 
+
+def _postgres_database_from_env():
+    """Build a Django PostGIS connection from DATABASE_URL or DB_* values."""
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        parsed = urlparse(database_url)
+        if parsed.scheme not in {"postgres", "postgresql", "postgis"}:
+            raise ValueError("DATABASE_URL 必须使用 postgres、postgresql 或 postgis 协议")
+        query = parse_qs(parsed.query)
+        options = {
+            key: values[-1]
+            for key, values in query.items()
+            if values and key in {"sslmode", "sslrootcert", "connect_timeout"}
+        }
+        config = {
+            "ENGINE": "django.contrib.gis.db.backends.postgis",
+            "NAME": unquote(parsed.path.lstrip("/")),
+            "USER": unquote(parsed.username or ""),
+            "PASSWORD": unquote(parsed.password or ""),
+            "HOST": parsed.hostname or "localhost",
+            "PORT": str(parsed.port or 5432),
+        }
+        if options:
+            config["OPTIONS"] = options
+        return config
+
+    if os.getenv("DB_ENGINE", "").strip().lower() in {"postgis", "postgres", "postgresql"}:
+        return {
+            "ENGINE": "django.contrib.gis.db.backends.postgis",
+            "NAME": os.getenv("DB_NAME", "map2"),
+            "USER": os.getenv("DB_USER", "map2"),
+            "PASSWORD": os.getenv("DB_PASSWORD", "map2postgres123"),
+            "HOST": os.getenv("DB_HOST", "localhost"),
+            "PORT": os.getenv("DB_PORT", "5432"),
+        }
+    return None
+
+
+_postgres_database = _postgres_database_from_env()
 DATABASES = {
-    'default': {
+    'default': _postgres_database or {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': str(DJANGO_DB_PATH),
     },
@@ -172,6 +250,7 @@ DATAS_DIR = os.path.join(BASE_DIR, "datas")
 
 # 生成的地图文件存储目录（与 static 同级）
 GENERATED_MAPS_DIR = os.path.join(BASE_DIR, "generated_maps")
+DATA_CACHE_DIR = os.path.abspath(os.getenv("DATA_CACHE_DIR", os.path.join(BASE_DIR, "data_cache")))
 
 X_FRAME_OPTIONS = 'SAMEORIGIN'
 ZHIPUAI_API_KEY = os.getenv('ZHIPUAI_API_KEY', '')
@@ -236,6 +315,18 @@ from .ai_deepseek import *
 
 CLASSIFIER = QuestionClassifier()
 PARSER = QuestionPaser()
-SEACHER = AnswerSearcher()
+try:
+    SEACHER = AnswerSearcher()
+except Exception as exc:
+    # Keep Django and the mapping workbench usable when Neo4j is not running;
+    # graph-backed queries will return no results until the service is available.
+    import logging
+    logging.getLogger(__name__).warning("Neo4j unavailable during startup: %s", exc)
+
+    class _UnavailableAnswerSearcher:
+        def search_main(self, sqls):
+            return []
+
+    SEACHER = _UnavailableAnswerSearcher()
 ZHIPU = GetZhipuResponse()
 DEEPSEEK = GetDeepseek()

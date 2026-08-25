@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs
 
 from channels.db import database_sync_to_async
 
@@ -14,6 +15,7 @@ from .sse_protocol import TERMINAL_EVENTS, format_sse_event, get_event_broker
 
 
 REQUEST_PATH = re.compile(r"^/mapping/api/stream/(?P<request_id>\d+)/?$")
+TERMINAL_REQUEST_STATUSES = {"completed", "failed", "needs_clarification"}
 
 
 class MapBuildSSEApplication:
@@ -47,19 +49,22 @@ class MapBuildSSEApplication:
         await send({"type": "http.response.start", "status": 200, "headers": headers})
         await send({"type": "http.response.body", "body": b": connected\n\n", "more_body": True})
 
-        after_id = self._header(scope, "last-event-id")
+        after_id = self._event_cursor(scope)
         broker = get_event_broker()
         events = broker.subscribe(str(request_id), after_id=after_id or None)
         iterator = events.__aiter__()
+        disconnect_task = asyncio.create_task(receive())
+        event_task = asyncio.create_task(iterator.__anext__())
         try:
             while True:
-                try:
-                    event_id, event_name, payload = await asyncio.wait_for(
-                        iterator.__anext__(), timeout=15
-                    )
-                except asyncio.TimeoutError:
+                completed, _ = await asyncio.wait(
+                    {event_task, disconnect_task},
+                    timeout=15,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not completed:
                     status = await self._request_status(request_id)
-                    if status in {"completed", "failed"}:
+                    if status in TERMINAL_REQUEST_STATUSES:
                         payload = {"request_id": request_id, "status": status}
                         rendered = format_sse_event(
                             event_id=f"status-{request_id}",
@@ -82,8 +87,21 @@ class MapBuildSSEApplication:
                         }
                     )
                     continue
+
+                if disconnect_task in completed:
+                    message = disconnect_task.result()
+                    if message.get("type") == "http.disconnect":
+                        return
+                    disconnect_task = asyncio.create_task(receive())
+
+                if event_task not in completed:
+                    continue
+
+                try:
+                    event_id, event_name, payload = event_task.result()
                 except StopAsyncIteration:
-                    break
+                    return
+                event_task = asyncio.create_task(iterator.__anext__())
 
                 rendered = format_sse_event(
                     event_id=event_id,
@@ -102,6 +120,10 @@ class MapBuildSSEApplication:
         except asyncio.CancelledError:
             raise
         finally:
+            for task in (event_task, disconnect_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(event_task, disconnect_task, return_exceptions=True)
             close = getattr(events, "aclose", None)
             if close is not None:
                 await close()
@@ -113,6 +135,15 @@ class MapBuildSSEApplication:
             if key.lower() == target:
                 return value.decode("utf-8", errors="ignore")
         return ""
+
+    @classmethod
+    def _event_cursor(cls, scope: Dict[str, Any]) -> str:
+        """Read the explicit cursor first so proxies cannot replay an old run."""
+        query_string = scope.get("query_string", b"")
+        if isinstance(query_string, bytes):
+            query_string = query_string.decode("ascii", errors="ignore")
+        query_cursor = parse_qs(query_string).get("after", [""])[0]
+        return query_cursor or cls._header(scope, "last-event-id")
 
     @staticmethod
     async def _send_json(send: Any, status: int, payload: Dict[str, Any]) -> None:

@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -21,25 +22,39 @@ class Config:
     OUTPUT_DIR: Path = PROJECT_ROOT / Path(os.getenv("OUTPUT_DIR", "outputs"))
     TEMP_DIR: Path = PROJECT_ROOT / Path(os.getenv("TEMP_DIR", "temp"))
     DATA_DIRECTORY_BASE: Path = PROJECT_ROOT / Path(os.getenv("DATA_DIRECTORY_BASE", "data"))
+    DATA_CACHE_DIR: Path = Path(
+        os.getenv("DATA_CACHE_DIR", str(PROJECT_ROOT / "data_cache"))
+    )
 
     @staticmethod
     def _normalize_base_url(raw_url: str) -> str:
         url = (raw_url or "").strip() or "https://api.openai-proxy.org/v1"
-        if "api.deepseek.com" in url and not url.rstrip("/").endswith("/v1"):
-            return url.rstrip("/") + "/v1"
-        return url
+        parts = urlsplit(url)
+        path = parts.path.rstrip("/")
+        if not path or path == "/":
+            path = "/v1"
+        elif path == "/v1":
+            path = "/v1"
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
     @staticmethod
     def _resolve_openai_api_key() -> str:
         mapping_key = os.getenv("MAPPING_OPENAI_API_KEY", "").strip()
+        llm_key = os.getenv("LLM_API_KEY", "").strip()
         fallback_key = os.getenv("OPENAI_API_KEY", "").strip()
-        return mapping_key or fallback_key
+        return mapping_key or llm_key or fallback_key
 
     OPENAI_BASE_URL: str = _normalize_base_url.__func__(
-        os.getenv("MAPPING_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL", "https://api.openai-proxy.org/v1")
+        os.getenv("MAPPING_OPENAI_BASE_URL")
+        or os.getenv("LLM_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL", "https://api.openai-proxy.org/v1")
     )
     OPENAI_API_KEY: str = ""
-    OPENAI_MODEL: str = os.getenv("MAPPING_OPENAI_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_MODEL: str = (
+        os.getenv("MAPPING_OPENAI_MODEL")
+        or os.getenv("LLM_MODEL")
+        or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    )
 
     DEFAULT_DPI: int = HyperParameters.DEFAULT_DPI
     DEFAULT_FIGSIZE: tuple = HyperParameters.DEFAULT_FIGSIZE

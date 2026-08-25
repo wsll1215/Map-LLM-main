@@ -1,4 +1,4 @@
-import type { LayerPayload, MapStreamEvent, ViewStatePayload } from "../types/api";
+import type { ClarificationData, LayerPayload, MapStreamEvent, ViewStatePayload } from "../types/api";
 
 export interface WorkbenchMessage {
   role: "user" | "assistant" | "system";
@@ -7,7 +7,8 @@ export interface WorkbenchMessage {
 
 export interface WorkbenchState {
   requestId: number | null;
-  status: "idle" | "pending" | "processing" | "completed" | "failed";
+  submissionInFlight: boolean;
+  status: "idle" | "pending" | "processing" | "needs_clarification" | "completed" | "failed";
   messages: WorkbenchMessage[];
   logs: Array<Record<string, unknown>>;
   layers: LayerPayload[];
@@ -15,10 +16,14 @@ export interface WorkbenchState {
   previewUrl: string | null;
   lastEventId: string;
   error: string | null;
+  transportStatus: "idle" | "connecting" | "connected" | "reconnecting";
+  transportError: string | null;
+  clarification: ClarificationData | null;
 }
 
 export const initialWorkbenchState: WorkbenchState = {
   requestId: null,
+  submissionInFlight: false,
   status: "idle",
   messages: [],
   logs: [],
@@ -27,13 +32,25 @@ export const initialWorkbenchState: WorkbenchState = {
   previewUrl: null,
   lastEventId: "",
   error: null,
+  transportStatus: "idle",
+  transportError: null,
+  clarification: null,
 };
 
 export type WorkbenchAction =
+  | { type: "submission_started" }
+  | { type: "submission_finished" }
   | { type: "request_created"; requestId: number }
+  | { type: "history_loaded"; requestId: number; status: WorkbenchState["status"]; viewState?: ViewStatePayload | null; clarification?: ClarificationData | null }
+  | { type: "conversation_started" }
   | { type: "user_message"; content: string }
+  | { type: "message_loaded"; role: "user" | "assistant" | "system"; content: string }
   | { type: "stream_event"; event: MapStreamEvent }
   | { type: "stream_error"; message: string }
+  | { type: "stream_status"; status: Exclude<WorkbenchState["transportStatus"], "idle"> }
+  | { type: "task_status"; status: Exclude<WorkbenchState["status"], "idle">; error: string | null; message?: string; clarification?: ClarificationData | null }
+  | { type: "task_status_error"; message: string }
+  | { type: "task_error"; message: string }
   | { type: "reset" };
 
 function mergeLayer(layers: LayerPayload[], incoming: LayerPayload): LayerPayload[] {
@@ -46,22 +63,66 @@ function mergeLayer(layers: LayerPayload[], incoming: LayerPayload): LayerPayloa
 
 export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction): WorkbenchState {
   switch (action.type) {
+    case "submission_started":
+      return { ...state, submissionInFlight: true, error: null };
+    case "submission_finished":
+      return { ...state, submissionInFlight: false };
     case "request_created":
-      return { ...initialWorkbenchState, requestId: action.requestId, status: "pending" };
+      return { ...initialWorkbenchState, requestId: action.requestId, submissionInFlight: true, status: "pending", transportStatus: "connecting" };
+    case "history_loaded":
+      return {
+        ...initialWorkbenchState,
+        requestId: action.requestId,
+        status: action.status,
+        viewState: action.viewState ?? null,
+        layers: action.viewState?.layers ?? [],
+        clarification: action.clarification ?? null,
+        transportStatus: action.status === "pending" || action.status === "processing" ? "connecting" : "idle",
+      };
+    case "conversation_started":
+      return { ...state, status: "processing", error: null, clarification: null };
     case "user_message":
       return { ...state, messages: [...state.messages, { role: "user", content: action.content }] };
+    case "message_loaded":
+      return { ...state, messages: [...state.messages, { role: action.role, content: action.content }] };
     case "stream_error":
-      return { ...state, status: "failed", error: action.message };
+      return { ...state, transportStatus: "reconnecting", transportError: action.message };
+    case "stream_status":
+      return { ...state, transportStatus: action.status, transportError: null };
+    case "task_status":
+      return {
+        ...state,
+        status: action.status,
+        error: action.status === "failed" ? action.error || "地图任务失败" : null,
+        transportStatus: action.status === "pending" || action.status === "processing" ? "connected" : "idle",
+        transportError: null,
+        clarification: action.status === "needs_clarification" ? action.clarification ?? state.clarification : null,
+        messages: action.message && !state.messages.some((message) => message.role === "assistant" && message.content === action.message)
+          ? [...state.messages, { role: "assistant", content: action.message }]
+          : state.messages,
+      };
+    case "task_status_error":
+      return { ...state, transportStatus: "reconnecting", transportError: action.message };
+    case "task_error":
+      return { ...state, submissionInFlight: false, status: "failed", error: action.message };
     case "reset":
       return initialWorkbenchState;
     case "stream_event": {
       const { event } = action;
       if (event.id && event.id === state.lastEventId) return state;
       const data = event.data;
-      const next: WorkbenchState = { ...state, lastEventId: event.id || state.lastEventId };
+      const next: WorkbenchState = { ...state, lastEventId: event.id || state.lastEventId, transportStatus: "connected", transportError: null };
       if (event.event === "request_started") next.status = "processing";
       if (event.event === "assistant_message" && typeof data.content === "string") {
         next.messages = [...state.messages, { role: "assistant", content: data.content }];
+      }
+      if (event.event === "request_needs_clarification") {
+        next.status = "needs_clarification";
+        next.error = null;
+        next.clarification = data.clarification as ClarificationData | undefined ?? null;
+        if (typeof data.message === "string" && !next.messages.some((message) => message.role === "assistant" && message.content === data.message)) {
+          next.messages = [...next.messages, { role: "assistant", content: data.message }];
+        }
       }
       if (event.event === "process_log") next.logs = [...state.logs, data];
       if (event.event === "layer_upserted" && data.layer && typeof data.layer === "object") {
@@ -80,6 +141,22 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
       if (event.event === "request_failed") {
         next.status = "failed";
         next.error = typeof data.message === "string" ? data.message : "地图任务失败";
+      }
+      if (event.event === "done") {
+        const terminalStatus = data.status;
+        if (terminalStatus === "completed") next.status = "completed";
+        if (terminalStatus === "needs_clarification") {
+          next.status = "needs_clarification";
+          next.error = null;
+          next.clarification = data.clarification as ClarificationData | undefined ?? null;
+          if (typeof data.message === "string" && !next.messages.some((message) => message.role === "assistant" && message.content === data.message)) {
+            next.messages = [...next.messages, { role: "assistant", content: data.message }];
+          }
+        }
+        if (terminalStatus === "failed") {
+          next.status = "failed";
+          next.error = typeof data.message === "string" ? data.message : "地图任务失败";
+        }
       }
       return next;
     }

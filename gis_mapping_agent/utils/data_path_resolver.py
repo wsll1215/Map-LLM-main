@@ -69,18 +69,23 @@ class DataPathResolver:
                     self.logger.info(f"🔍 从用户请求中解析到数据目录")
                     return data_dir
 
-        # 如果没有找到明确的数据目录指定，检查是否是广东数据相关的请求
-        # 广东数据的特征文件名（data1目录中的文件）
-        guangdong_files = [
-            "Guangdong", "guangdong", "广东",
-            "Core City of the Pearl River Delta", "珠三角"
-        ]
+        # 如果没有找到明确的数据目录指定，根据项目内置数据的地名解析目录。
+        location_directories = {
+            "data1": [
+                "Guangdong",
+                "guangdong",
+                "广东",
+                "Core City of the Pearl River Delta",
+                "珠三角",
+            ],
+            "data2": ["Wuhan", "wuhan", "武汉", "武汉市"],
+            "data8": ["Beijing", "beijing", "北京", "北京市"],
+        }
 
-        # 检查请求中是否包含广东数据相关的文件名
-        for keyword in guangdong_files:
-            if keyword in user_request:
-                self.logger.info(f"🔍 检测到广东数据相关请求，默认使用data1目录")
-                return "data1"
+        for data_dir, keywords in location_directories.items():
+            if any(keyword in user_request for keyword in keywords):
+                self.logger.info(f"🔍 检测到{data_dir}对应的地名请求，使用该目录")
+                return data_dir
 
         self.logger.debug("未从用户请求中找到明确的数据目录指定")
         return None
@@ -95,7 +100,8 @@ class DataPathResolver:
             Path: 解析后的完整数据路径
         """
         if data_directory:
-            final_path = self.base_path / data_directory
+            candidate = Path(data_directory)
+            final_path = candidate.resolve() if candidate.is_absolute() else self.base_path / candidate
         else:
             final_path = self.base_path
             
@@ -172,6 +178,24 @@ class DataPathResolver:
             self.logger.info(f"🔍 从用户请求中提取到数据文件")
         
         return files
+
+    def extract_data_info(self, user_request: str) -> Tuple[Optional[str], List[str]]:
+        """Resolve a request's directory and a safe default file when available."""
+        data_directory = self.parse_data_directory_from_request(user_request)
+        data_files = self.find_data_files_in_request(user_request)
+        if data_files or not data_directory:
+            return data_directory, data_files
+
+        defaults = {
+            "data1": "Guangdong.shp",
+            "data2": "Wuhan.shp",
+            "data8": "Beijing.shp",
+        }
+        default_file = defaults.get(data_directory)
+        if default_file and (self.resolve_data_path(data_directory) / default_file).is_file():
+            self.logger.info(f"使用 {data_directory} 中已验证的默认数据文件: {default_file}")
+            return data_directory, [default_file]
+        return data_directory, data_files
     
     def _is_valid_directory_name(self, name: str) -> bool:
         """检查是否是有效的目录名
@@ -237,7 +261,4 @@ def extract_data_info_from_request(user_request: str) -> Tuple[Optional[str], Li
     Returns:
         Tuple[Optional[str], List[str]]: (数据目录, 数据文件列表)
     """
-    data_dir = data_path_resolver.parse_data_directory_from_request(user_request)
-    data_files = data_path_resolver.find_data_files_in_request(user_request)
-    
-    return data_dir, data_files
+    return data_path_resolver.extract_data_info(user_request)

@@ -12,9 +12,12 @@ export async function apiFetch<T>(url: string, init: RequestInit = {}): Promise<
   if (token) headers.set("X-CSRFToken", decodeURIComponent(token));
   const response = await fetch(url, { ...init, headers, credentials: "same-origin" });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const parsed = apiErrorSchema.safeParse(body);
-    throw new Error(parsed.success ? parsed.data.error : `请求失败 (${response.status})`);
+  const parsed = apiErrorSchema.safeParse(body);
+  if (!response.ok || (parsed.success && parsed.data.success === false)) {
+    const message = parsed.success
+      ? parsed.data.error || parsed.data.message
+      : undefined;
+    throw new Error(message || `请求失败 (${response.status})`);
   }
   return body as T;
 }

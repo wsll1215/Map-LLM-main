@@ -180,9 +180,11 @@ class ElementOperationsMixin:
             text = params.get('text', '')
             fontsize = params.get('fontsize', 14)
 
-            # 使用固定的底部位置，确保注记在横坐标轴下方
-            position = [0.5, 0.03]  # 固定位置：水平居中，垂直在横坐标轴下方
-            self.logger.debug(f"使用固定底部位置: {position}")
+            position = params.get("position") or [0.5, 0.03]
+            if not isinstance(position, (list, tuple)) or len(position) != 2:
+                position = [0.5, 0.03]
+            position = [max(0.02, min(0.98, float(position[0]))), max(0.02, min(0.98, float(position[1])))]
+            self.logger.debug(f"使用注记位置: {position}")
 
             # 安全检查：防止与主标题重复
             if self.current_map_state.config.title and text == self.current_map_state.config.title:

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, DefaultDict, Dict, List, Optional, Tuple
 
 
-TERMINAL_EVENTS = {"done", "request_completed", "request_failed"}
+TERMINAL_EVENTS = {"done", "request_completed", "request_failed", "request_needs_clarification"}
 
 
 def format_sse_event(*, event_id: str, event_name: str, payload: Dict[str, Any]) -> str:
@@ -44,7 +44,10 @@ class InMemoryEventBroker:
 
     def publish_sync(self, request_key: str, event_name: str, payload: Dict[str, Any]) -> str:
         self._next_ids[request_key] += 1
-        event = EventRecord(str(self._next_ids[request_key]), event_name, dict(payload))
+        event_id = str(self._next_ids[request_key])
+        event_payload = dict(payload)
+        event_payload.setdefault("event_seq", self._next_ids[request_key])
+        event = EventRecord(event_id, event_name, event_payload)
         self._events[request_key].append(event)
         for subscriber in tuple(self._subscribers[request_key]):
             subscriber.put_nowait(event)
@@ -102,11 +105,15 @@ class RedisStreamBroker:
 
             client = redis.Redis.from_url(self.redis_url, decode_responses=True)
             stream_key = self._stream_key(request_key)
+            sequence = client.incr(f"{stream_key}:seq")
+            client.expire(f"{stream_key}:seq", self.ttl_seconds)
+            event_payload = dict(payload)
+            event_payload.setdefault("event_seq", sequence)
             event_id = client.xadd(
                 stream_key,
                 {
                     "event": event_name,
-                    "payload": json.dumps(payload, ensure_ascii=False),
+                    "payload": json.dumps(event_payload, ensure_ascii=False),
                 },
                 maxlen=self.maxlen,
                 approximate=True,

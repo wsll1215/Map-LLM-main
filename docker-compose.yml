@@ -1,4 +1,22 @@
 services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: map2-postgis
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME:-map2}
+      POSTGRES_USER: ${DB_USER:-map2}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-map2postgres123}
+    volumes:
+      - ./runtime/postgis:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-map2} -d ${DB_NAME:-map2}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   neo4j:
     image: neo4j:5.22-community
     container_name: map2-neo4j
@@ -40,6 +58,8 @@ services:
     container_name: map2-web
     restart: unless-stopped
     depends_on:
+      postgis:
+        condition: service_healthy
       neo4j:
         condition: service_healthy
       redis:
@@ -51,8 +71,9 @@ services:
       DJANGO_DEBUG: "False"
       DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,web
       DJANGO_DB_PATH: /app/outputs/django.db
-      NEO4J_URI: ${NEO4J_URL:-bolt://neo4j:7687}
-      NEO4J_URL: ${NEO4J_URL:-bolt://neo4j:7687}
+      DATABASE_URL: postgis://${DB_USER:-map2}:${DB_PASSWORD:-map2postgres123}@postgis:5432/${DB_NAME:-map2}
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_URL: bolt://neo4j:7687
       REDIS_URL: redis://redis:6379/0
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
@@ -69,12 +90,15 @@ services:
     entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
     command: ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "xy_neo4j.asgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-"]
 
-  neo4j-init:
+  map-worker:
     build: .
-    container_name: map2-neo4j-init
-    restart: "no"
-    profiles: ["init"]
+    container_name: map2-map-worker
+    restart: unless-stopped
     depends_on:
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
       neo4j:
         condition: service_healthy
     env_file:
@@ -83,8 +107,43 @@ services:
       DJANGO_SETTINGS_MODULE: xy_neo4j.settings
       DJANGO_DEBUG: "False"
       DJANGO_DB_PATH: /app/outputs/django.db
-      NEO4J_URI: ${NEO4J_URL:-bolt://neo4j:7687}
-      NEO4J_URL: ${NEO4J_URL:-bolt://neo4j:7687}
+      DATABASE_URL: postgis://${DB_USER:-map2}:${DB_PASSWORD:-map2postgres123}@postgis:5432/${DB_NAME:-map2}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-map2neo4j123}
+      OUTPUT_DIR: /app/outputs
+      DATA_DIRECTORY_BASE: /app/data
+    volumes:
+      - ./:/app
+      - ./assets/fonts:/usr/share/fonts/truetype/custom:ro
+      - generated_maps:/app/generated_maps
+      - outputs:/app/outputs
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    command: ["celery", "-A", "xy_neo4j", "worker", "--loglevel=INFO", "--concurrency=1"]
+
+  neo4j-init:
+    build: .
+    container_name: map2-neo4j-init
+    restart: "no"
+    profiles: ["init"]
+    depends_on:
+      postgis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: xy_neo4j.settings
+      DJANGO_DEBUG: "False"
+      DJANGO_DB_PATH: /app/outputs/django.db
+      DATABASE_URL: postgis://${DB_USER:-map2}:${DB_PASSWORD:-map2postgres123}@postgis:5432/${DB_NAME:-map2}
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_URL: bolt://neo4j:7687
       REDIS_URL: redis://redis:6379/0
       DATA_DIRECTORY_BASE: /app/data
       NEO4J_CLEAR_DB: "false"
@@ -106,12 +165,14 @@ services:
       - web
     ports:
       - "80:80"
+      - "8001:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - staticfiles:/staticfiles:ro
       - generated_maps:/generated_maps:ro
 
 volumes:
+  # The bind mount keeps PostgreSQL data under the project directory.
   neo4j_data:
   neo4j_logs:
   neo4j_import:

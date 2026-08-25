@@ -27,6 +27,7 @@ from ..adjustment import get_modification_engine
 from ..rendering.renderer import get_map_renderer
 from ..tools.conversation_tools import CONVERSATION_TOOLS
 from ..tools.registry import ALL_UNIFIED_TOOLS
+from .ambiguity import detect_ambiguity
 from .thinking import ThinkingGISMappingAgent
 
 
@@ -43,6 +44,8 @@ class ConversationState(TypedDict):
     error: Optional[str]
     requires_confirmation: bool
     clarification_questions: List[str]
+    needs_clarification: bool
+    clarification_data: Dict[str, Any]
     last_operation: Optional[str]
     conversation_history: List[Dict[str, Any]]
 
@@ -178,6 +181,10 @@ class ConversationalMappingAgent:
                 "error": result.get("error"),
                 "requires_confirmation": result.get("requires_confirmation", False),
                 "clarification_questions": result.get("clarification_questions", []),
+                "status": "needs_clarification" if result.get("needs_clarification") else (
+                    "failed" if result.get("error") else "completed"
+                ),
+                "clarification": result.get("clarification_data", {}),
                 "current_map_state": result.get("current_map_state") is not None,
                 "last_operation": result.get("last_operation")
             }
@@ -283,6 +290,8 @@ class ConversationalMappingAgent:
             error=None,
             requires_confirmation=False,
             clarification_questions=[],
+            needs_clarification=False,
+            clarification_data={},
             last_operation=None,
             conversation_history=[]
         )
@@ -325,6 +334,8 @@ class ConversationalMappingAgent:
             state["patch"] = None
             state["render_result"] = None
             state["error"] = None
+            state["needs_clarification"] = False
+            state["clarification_data"] = {}
 
             # 检查是否是确认回复
             if state.get("requires_confirmation", False):
@@ -340,6 +351,16 @@ class ConversationalMappingAgent:
                     return state
 
             has_map_state = state.get("current_map_state") is not None
+
+            ambiguity = detect_ambiguity(user_input, has_map_state=has_map_state)
+            if ambiguity:
+                state["user_intent"] = "clarification"
+                state["task_type"] = "clarification"
+                state["needs_clarification"] = True
+                state["clarification_data"] = ambiguity
+                state["clarification_questions"] = [ambiguity["question"]]
+                state["messages"].append(AIMessage(content=ambiguity["question"]))
+                return state
 
             # 构建系统提示
             system_prompt = f"""你是一个GIS制图系统的意图分类器。你需要判断用户的请求是以下哪种类型：
@@ -402,7 +423,7 @@ class ConversationalMappingAgent:
             has_map_state = state.get("current_map_state") is not None
             state["user_intent"] = self._fallback_intent_classification(last_message.content, has_map_state)
             state["task_type"] = state["user_intent"]
-            state["error"] = str(e)
+            state["error"] = None
             return state
 
     def _rule_intent_classification(self, user_input: str, has_map_state: bool) -> Optional[str]:
@@ -454,8 +475,8 @@ class ConversationalMappingAgent:
         intent = self._rule_intent_classification(user_input, has_map_state)
         if intent:
             return intent
-        # 默认：有地图状态则为修改，否则为创建
-        return "modify" if has_map_state else "create"
+        # Do not guess create/modify when the request has no actionable intent.
+        return "clarification"
 
     def _mark_graph_step(self, state: ConversationState, task_type: str, operation: Optional[str] = None) -> None:
         """Record lightweight graph-level execution metadata."""
@@ -490,10 +511,14 @@ class ConversationalMappingAgent:
             return "query"
         elif intent in ["confirmation", "cancel"]:
             return "confirmation"
+        elif intent == "clarification":
+            return "response"
         else:
             return "response"
 
     def _route_after_task(self, state: ConversationState) -> str:
+        if state.get("needs_clarification"):
+            return "response"
         render_result = state.get("render_result")
         if state.get("error") or (render_result and not render_result.get("success", False)):
             return "error"
@@ -791,7 +816,16 @@ class ConversationalMappingAgent:
         """修改地图"""
         try:
             if not state.get("current_map_state"):
-                state["messages"].append(AIMessage(content="没有可修改的地图，请先创建地图。"))
+                payload = {
+                    "question": "当前还没有地图。请先说明区域和图层类型，例如“北京行政区划图”。",
+                    "missing_fields": ["map_scope", "layer_type"],
+                    "suggestions": ["北京行政区划图", "武汉道路图"],
+                    "reason": "modify_without_map",
+                }
+                state["needs_clarification"] = True
+                state["clarification_data"] = payload
+                state["clarification_questions"] = [payload["question"]]
+                state["messages"].append(AIMessage(content=payload["question"]))
                 return state
 
             self._mark_graph_step(state, state.get("task_type") or "modify", "modify_map")
@@ -819,6 +853,15 @@ class ConversationalMappingAgent:
             if analysis.clarification_questions:
                 questions = analysis.clarification_questions
                 response = f"❓ 需要澄清以下信息：\n" + "\n".join(f"- {q}" for q in questions)
+                state["needs_clarification"] = True
+                state["clarification_data"] = {
+                    "question": questions[0],
+                    "missing_fields": ["target", "change"],
+                    "suggestions": ["把道路改成深绿色", "隐藏建筑图层", "标注清华大学的位置"],
+                    "reason": "modification_engine_clarification",
+                }
+                state["clarification_questions"] = questions
+                state["error"] = None
                 state["messages"].append(AIMessage(content=response))
                 return state
 
@@ -828,6 +871,15 @@ class ConversationalMappingAgent:
 
             if not patch.operations:
                 response = f"❌ 无法理解修改请求：{user_request}\n\n请提供更具体的描述，例如：\n- 修改Highway图层颜色为红色\n- 删除Railway图层\n- 添加注记'这是广东省地图'"
+                state["needs_clarification"] = True
+                state["clarification_data"] = {
+                    "question": "请说明要修改哪个图层，以及希望如何修改。",
+                    "missing_fields": ["target", "change"],
+                    "suggestions": ["把道路改成深绿色", "隐藏建筑图层", "添加注记：市中心"],
+                    "reason": "empty_modification_plan",
+                }
+                state["clarification_questions"] = [state["clarification_data"]["question"]]
+                state["error"] = None
                 state["messages"].append(AIMessage(content=response))
                 return state
 
@@ -876,7 +928,8 @@ class ConversationalMappingAgent:
                     display_path = file_path
                 # response += f"📁 地图已更新并保存到：{display_path}"
             else:
-                response += "⚠️ 地图渲染失败，但修改已保存"
+                state["error"] = render_result.get("error") or render_result.get("message") or "地图渲染失败"
+                response = f"❌ 地图渲染失败：{state['error']}"
 
             state["messages"].append(AIMessage(content=response))
             return state

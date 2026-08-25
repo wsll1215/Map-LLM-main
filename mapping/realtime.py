@@ -7,14 +7,12 @@ break map generation.
 
 from __future__ import annotations
 
-import json
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-MAX_VECTOR_FEATURES = 800
 MAX_PREVIEW_FILES_PER_REQUEST = 40
 
 
@@ -52,7 +50,7 @@ def publish_agent_map_event(
     publish_map_build_event(request_id, payload)
 
 
-def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> None:
+def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> str:
     """Publish a structured event to the SSE broker.
 
     The broker is Redis-backed when ``REDIS_URL`` is configured and falls back
@@ -63,9 +61,9 @@ def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> None:
 
         broker = get_event_broker()
         event_name = str(payload.get("type") or "message")
-        broker.publish_sync(str(request_id), event_name, payload)
+        return str(broker.publish_sync(str(request_id), event_name, payload) or "")
     except Exception:
-        return
+        return ""
 
 
 def _request_id_from_session(session_id: Optional[str]) -> Optional[int]:
@@ -98,15 +96,20 @@ def _build_payload(
         "observation": str(observation)[:500],
         "created_at_ms": int(time.time() * 1000),
     }
+    version_info = getattr(map_state, "version_info", None)
+    map_version = getattr(version_info, "version", None) if version_info else None
+    if map_version is not None:
+        payload["map_version"] = map_version
+        payload["snapshot_version"] = map_version
 
     if map_state is not None:
         payload["map"] = _map_summary(map_state)
-        payload["view_state"] = _view_state(map_state)
+        payload["view_state"] = _view_state(map_state, map_version)
         payload["elements"] = _elements_summary(map_state)
 
     target_layer = _target_layer_for_tool(map_state, tool_name, tool_input)
     if target_layer is not None:
-        payload["layer"] = _layer_payload(target_layer)
+        payload["layer"] = _layer_payload(target_layer, map_version)
 
     if tool_name == "map_save" and map_state is not None:
         payload["output_path"] = getattr(map_state, "output_path", None)
@@ -246,11 +249,15 @@ def _map_summary(map_state: Any) -> Dict[str, Any]:
     }
 
 
-def _view_state(map_state: Any) -> Dict[str, Any]:
-    """Build a complete but bounded browser-preview state."""
+def _view_state(map_state: Any, map_version: Optional[int] = None) -> Dict[str, Any]:
+    """Build a versioned metadata-only browser-preview state."""
     return {
         "map": _map_summary(map_state),
-        "layers": [_layer_payload(layer) for layer in (getattr(map_state, "layers", []) or [])],
+        "map_version": map_version,
+        "layers": [
+            _layer_payload(layer, map_version)
+            for layer in (getattr(map_state, "layers", []) or [])
+        ],
         "legend_items": [_dump_model(item) for item in (getattr(map_state, "legend_items", []) or [])],
         "legends": [_dump_model(legend) for legend in (getattr(map_state, "legends", []) or [])],
         "annotations": [_dump_model(annotation) for annotation in (getattr(map_state, "annotations", []) or [])],
@@ -284,7 +291,7 @@ def _target_layer_for_tool(map_state: Any, tool_name: str, tool_input: Dict[str,
     return layers[-1] if tool_name in {"add_layer", "style_layer"} else None
 
 
-def _layer_payload(layer: Any) -> Dict[str, Any]:
+def _layer_payload(layer: Any, version: Optional[int] = None) -> Dict[str, Any]:
     style = getattr(layer, "style", None)
     style_payload = style.model_dump() if hasattr(style, "model_dump") else dict(style or {})
     return {
@@ -294,9 +301,32 @@ def _layer_payload(layer: Any) -> Dict[str, Any]:
         "visible": getattr(layer, "visible", True),
         "z_order": getattr(layer, "z_order", 0),
         "data_source": getattr(layer, "data_source", None),
+        "version": version,
+        "data_hash": getattr(layer, "data_hash", None),
+        "feature_count": getattr(layer, "feature_count", 0),
+        "extent": getattr(layer, "extent", None),
+        "render_mode": _effective_render_mode(layer),
+        "data_url": getattr(layer, "data_url", None),
         "style": style_payload,
-        "geojson": _geojson_from_layer(layer),
     }
+
+
+def _effective_render_mode(layer: Any) -> str:
+    explicit = getattr(layer, "render_mode", "geojson")
+    if explicit in {"mvt", "pmtiles"}:
+        return explicit
+    feature_count = getattr(layer, "feature_count", 0) or 0
+    try:
+        from django.conf import settings
+
+        geojson_limit = getattr(settings, "MAP_GEOJSON_LIMIT", 5000)
+        worker_limit = getattr(settings, "MAP_WORKER_LIMIT", 30000)
+        mvt_enabled = getattr(settings, "MAP_MVT_ENABLED", False)
+    except Exception:
+        geojson_limit, worker_limit, mvt_enabled = 5000, 30000, False
+    if feature_count > worker_limit:
+        return "mvt" if mvt_enabled else "geojson-worker"
+    return "geojson-worker" if feature_count > geojson_limit else "geojson"
 
 
 def _dump_model(value: Any) -> Dict[str, Any]:
@@ -313,36 +343,6 @@ def _dump_model(value: Any) -> Dict[str, Any]:
         if hasattr(value, key):
             result[key] = getattr(value, key)
     return result
-
-
-def _geojson_from_layer(layer: Any) -> Optional[Dict[str, Any]]:
-    gdf = getattr(layer, "gdf", None)
-    if gdf is None:
-        return None
-    try:
-        if getattr(gdf, "empty", False):
-            return {"type": "FeatureCollection", "features": []}
-
-        export_gdf = gdf
-        if len(export_gdf) > MAX_VECTOR_FEATURES:
-            export_gdf = export_gdf.head(MAX_VECTOR_FEATURES).copy()
-            truncated = True
-        else:
-            truncated = False
-
-        crs = getattr(export_gdf, "crs", None)
-        if crs is not None:
-            try:
-                export_gdf = export_gdf.to_crs(epsg=4326)
-            except Exception:
-                pass
-
-        geojson = json.loads(export_gdf.to_json())
-        geojson["truncated"] = truncated
-        geojson["feature_count"] = int(len(gdf))
-        return geojson
-    except Exception:
-        return None
 
 
 def _summarize_tool_input(tool_input: Dict[str, Any]) -> Dict[str, Any]:

@@ -5,15 +5,19 @@ from openai import OpenAI
 
 class GetDeepseek:
     def __init__(self):
-        base_url = (os.getenv("OPENAI_BASE_URL", "") or "").strip()
+        base_url = (
+            os.getenv("LLM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL", "")
+            or ""
+        ).strip()
         if base_url and "api.deepseek.com" in base_url and not base_url.rstrip("/").endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
 
         self.client = OpenAI(
-            api_key=(os.getenv("OPENAI_API_KEY", "") or "").strip(),
+            api_key=(os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", "") or "").strip(),
             base_url=base_url or None,
         )
-        self.model = (os.getenv("OPENAI_MODEL", "gpt-4o-mini") or "").strip()
+        self.model = (os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o-mini") or "").strip()
 
     def get_chatglm_response(self, prompt, final_answers=None):
         if final_answers:

@@ -162,10 +162,9 @@ class IntentClassifierV2:
             ]
             
             # 绑定函数
-            llm_with_tools = self.llm.bind_tools(
-                [IntentAnalysisV2],
-                tool_choice={"type": "function", "function": {"name": "IntentAnalysisV2"}}
-            )
+            # Let the provider choose whether to call the schema. DeepSeek's
+            # thinking models reject the OpenAI-specific forced tool payload.
+            llm_with_tools = self.llm.bind_tools([IntentAnalysisV2])
 
             self.logger.info("正在调用LLM进行意图识别...")
             try:
@@ -193,14 +192,30 @@ class IntentClassifierV2:
                 
         except Exception as e:
             self.logger.error(f"意图识别失败: {e}")
-            return IntentAnalysisV2(
-                intent="unknown",
-                confidence=0.0,
-                requires_confirmation=False,
-                clarification_questions=["系统错误，请重试"],
-                reasoning=f"系统错误: {str(e)}"
-            )
+            fallback = self._fallback_analyze_request(user_input, current_state)
+            fallback.reasoning = f"LLM调用失败，使用规则兜底: {e}"
+            return fallback
     
+    def _fallback_analyze_request(self, user_input: str, current_state: MapState) -> IntentAnalysisV2:
+        """Return a deterministic intent when the provider cannot classify."""
+        text = user_input.lower()
+        if any(word in text for word in ["画", "绘制", "添加", "加入", "新增"]):
+            if any(word in text for word in ["路线", "道路", "铁路", "高铁", "路网", "图层"]):
+                return IntentAnalysisV2(
+                    request=user_input,
+                    intent="add_layer",
+                    confidence=0.6,
+                    target="高铁路线" if "高铁" in text else "路线",
+                    reasoning="Rule-based fallback intent analysis",
+                )
+        return IntentAnalysisV2(
+            request=user_input,
+            intent="unknown",
+            confidence=0.0,
+            clarification_questions=["无法识别该修改请求，请明确说明要添加、删除或调整的图层。"],
+            reasoning="Rule-based fallback could not identify the request",
+        )
+
     def _build_system_prompt(self, current_state: MapState) -> str:
         """构建简洁的系统提示"""
         
@@ -458,12 +473,51 @@ class IntentClassifierV2:
                 if len(current_state.layers) <= 1:
                     # 移除确认问题，改为日志记录
                     self.logger.warning("正在删除最后一个图层，地图将为空")
+
+            if analysis.intent == "add_annotation" and not analysis.position:
+                from ..data_sources.remote import geocode_place, normalize_point_to_extent
+
+                place = self._extract_annotation_place(analysis)
+                location = geocode_place(place) if place else None
+                if location:
+                    longitude, latitude, _ = location
+                    analysis.position = normalize_point_to_extent(
+                        longitude, latitude, current_state.config.extent
+                    )
+                    analysis.clarification_questions = [
+                        question
+                        for question in analysis.clarification_questions
+                        if "标注位置" not in question and "坐标" not in question
+                    ]
+                else:
+                    analysis.clarification_questions.append(
+                        f"无法定位“{place or '该地点'}”，请提供经纬度（经度、纬度）"
+                    )
             
             return analysis
             
         except Exception as e:
             self.logger.error(f"验证意图失败: {e}")
             return analysis
+
+    @staticmethod
+    def _extract_annotation_place(analysis: IntentAnalysisV2) -> str:
+        """Extract a place name from structured fields or the original sentence."""
+        candidate = (analysis.text or "").strip()
+        if candidate and candidate not in {"默认注记文本", "注记", "标注"}:
+            return candidate.strip("'\"“”‘’（）()，,。；; ")
+        candidate = (analysis.target or "").strip()
+        if candidate and candidate not in {"annotation", "注记", "标注"}:
+            return candidate.strip("'\"“”‘’（）()，,。；; ")
+
+        request = (analysis.request or "").strip()
+        match = re.search(
+            r"(?:标注|标记|注记|标示|定位)(?:一下|一个|一处)?(.+?)(?:的位置|的坐标|坐标|地点|在地图上)?$",
+            request,
+        )
+        if match:
+            return match.group(1).strip("'\"“”‘’（）()，,。；; ")
+        return ""
 
 @singleton
 class _IntentClassifierV2Singleton:

@@ -427,8 +427,8 @@ class ModificationEngine:
 
         request_lower = request.lower()
 
-        if any(keyword in request_lower for keyword in ["\u6dfb\u52a0", "\u52a0\u5165", "\u65b0\u589e"]):
-            if "\u56fe\u5c42" in request_lower:
+        if any(keyword in request_lower for keyword in ["\u6dfb\u52a0", "\u52a0\u5165", "\u65b0\u589e", "\u753b", "\u7ed8\u5236"]):
+            if any(keyword in request_lower for keyword in ["\u56fe\u5c42", "\u8def\u7ebf", "\u9053\u8def", "\u94c1\u8def", "\u9ad8\u94c1", "\u8def\u7f51"]):
                 intent = "add_layer"
             elif any(keyword in request_lower for keyword in ["\u6ce8\u8bb0", "\u6587\u5b57", "\u8bf4\u660e", "\u6807\u6ce8"]):
                 intent = "add_annotation"

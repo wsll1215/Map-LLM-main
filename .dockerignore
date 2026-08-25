@@ -8,5 +8,12 @@ __pycache__
 db.sqlite3
 outputs
 generated_maps
+runtime
 temp
+data_cache
 .env
+.conda-pkgs
+.pip-cache
+frontend/node_modules
+frontend/.npm-cache*
+.docker-wheels/parts

@@ -10,10 +10,14 @@ db.sqlite3
 *.db
 outputs/
 generated_maps/
+runtime/
 temp/
+data_cache/
 staticfiles/
 frontend/node_modules/
-frontend/.npm-cache/
+frontend/.npm-cache*/
+static/frontend/
 frontend/dist/
 frontend/node_modules/
 frontend/.npm-cache/
+tests/manual_*.png

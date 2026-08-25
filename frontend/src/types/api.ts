@@ -23,6 +23,12 @@ export interface LayerPayload {
   data_source?: string | null;
   style?: Record<string, unknown>;
   geojson?: GeoJsonFeatureCollection | null;
+  version?: number;
+  data_hash?: string | null;
+  feature_count?: number;
+  extent?: [number, number, number, number] | null;
+  render_mode?: "geojson" | "geojson-worker" | "mvt" | "pmtiles";
+  data_url?: string | null;
 }
 
 export interface ViewStatePayload {
@@ -39,9 +45,11 @@ export interface ViewStatePayload {
   output_path?: string | null;
 }
 
+export type MapStreamEventName = "request_started" | "tool_finished" | "map_initialized" | "layer_upserted" | "map_element_updated" | "process_log" | "assistant_message" | "request_completed" | "request_failed" | "request_needs_clarification" | "done";
+
 export interface MapStreamEvent {
   id: string;
-  event: string;
+  event: MapStreamEventName | string;
   data: Record<string, unknown>;
 }
 
@@ -57,10 +65,31 @@ export interface MapRequestSummary {
   request_id: number;
   title: string;
   request_text?: string;
-  status: "pending" | "processing" | "completed" | "failed";
+  status: "pending" | "processing" | "needs_clarification" | "completed" | "failed";
   created_at?: string;
   updated_at?: string;
   maps?: GeneratedMap[];
+  view_state?: ViewStatePayload | null;
+  result_message?: string;
+  error_message?: string;
+  latest_run?: {
+    id: number;
+    status: string;
+    error_code?: string;
+    error_message?: string;
+    map_version?: number | null;
+  } | null;
+  latest_successful_run?: MapRequestSummary["latest_run"];
+  has_available_result?: boolean;
+  latest_map_version?: number | null;
+  clarification?: ClarificationData | null;
+}
+
+export interface ClarificationData {
+  question?: string;
+  missing_fields?: string[];
+  suggestions?: string[];
+  reason?: string;
 }
 
 export interface GeneratedMap {

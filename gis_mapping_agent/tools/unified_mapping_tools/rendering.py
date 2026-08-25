@@ -53,14 +53,15 @@ class RenderingMixin:
                 # 根据几何类型设置不同的绘图参数
                 if layer.geometry_type in [GeometryType.POLYGON, GeometryType.MULTIPOLYGON]:
                     # 使用用户设置的边框颜色和线宽，如果没有设置则使用默认值
-                    plot_params['edgecolor'] = layer.style.edgecolor if layer.style.edgecolor else 'white'
-                    plot_params['linewidth'] = layer.style.linewidth if layer.style.linewidth else 0.8
+                    # Keep administrative boundaries legible in the final PNG and the
+                    # realtime vector preview when a request did not specify a style.
+                    plot_params['edgecolor'] = layer.style.edgecolor or '#334155'
+                    plot_params['linewidth'] = max(layer.style.linewidth or 0.8, 1.1)
                     self.logger.debug(
                         f"面图层 '{layer.name}' 边框设置: 颜色={plot_params['edgecolor']}，线宽={plot_params['linewidth']}"
                     )
                     # 如果设置了facecolor，使用它；否则使用color
-                    if layer.style.facecolor:
-                        plot_params['facecolor'] = layer.style.facecolor
+                    plot_params['facecolor'] = layer.style.facecolor or layer.style.color
                 elif layer.geometry_type == GeometryType.POINT:
                     plot_params['marker'] = layer.style.marker
                     plot_params['markersize'] = layer.style.size
@@ -69,7 +70,7 @@ class RenderingMixin:
                         plot_params['edgecolor'] = layer.style.edgecolor
                         plot_params['linewidth'] = layer.style.linewidth
                 else: # a line
-                    plot_params['linewidth'] = layer.style.linewidth
+                    plot_params['linewidth'] = max(layer.style.linewidth or 0.8, 0.8)
 
                 # 应用颜色和线型
                 if layer.style.attribute_column and layer.style.attribute_column in layer.gdf.columns:

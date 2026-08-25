@@ -1,5 +1,7 @@
 from django.db import models
+from django.contrib.gis.db import models as gis_models
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 import json
 import os
@@ -15,6 +17,7 @@ class MapRequest(models.Model):
     STATUS_CHOICES = [
         ('pending', '等待处理'),
         ('processing', '处理中'),
+        ('needs_clarification', '等待补充信息'),
         ('completed', '已完成'),
         ('failed', '失败'),
     ]
@@ -30,6 +33,7 @@ class MapRequest(models.Model):
     # 处理结果
     result_message = models.TextField(verbose_name='处理结果消息', blank=True)
     error_message = models.TextField(verbose_name='错误信息', blank=True)
+    clarification_data = models.JSONField(default=dict, verbose_name='澄清信息', blank=True)
     
     # 时间戳
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
@@ -81,6 +85,209 @@ class MapRequest(models.Model):
         logger.info(f"删除数据库记录: MapRequest {self.id}")
         super().delete(*args, **kwargs)
         logger.info(f"✅ 会话 {self.id} 已完全删除")
+
+
+class MapRun(models.Model):
+    """一次地图生成执行，归属于一个 MapRequest。"""
+
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+    STATUS_AWAITING_INPUT = 'awaiting_input'
+    STATUS_COMPLETED = 'completed'
+    STATUS_FAILED = 'failed'
+    STATUS_CANCEL_REQUESTED = 'cancel_requested'
+    STATUS_CANCELLED = 'cancelled'
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, '等待处理'),
+        (STATUS_RUNNING, '处理中'),
+        (STATUS_AWAITING_INPUT, '等待补充信息'),
+        (STATUS_COMPLETED, '已完成'),
+        (STATUS_FAILED, '失败'),
+        (STATUS_CANCEL_REQUESTED, '取消中'),
+        (STATUS_CANCELLED, '已取消'),
+    ]
+
+    _TRANSITIONS = {
+        STATUS_PENDING: {STATUS_RUNNING, STATUS_FAILED, STATUS_CANCEL_REQUESTED},
+        STATUS_RUNNING: {
+            STATUS_AWAITING_INPUT,
+            STATUS_COMPLETED,
+            STATUS_FAILED,
+            STATUS_CANCEL_REQUESTED,
+        },
+        STATUS_AWAITING_INPUT: set(),
+        STATUS_CANCEL_REQUESTED: {STATUS_CANCELLED, STATUS_FAILED},
+        STATUS_COMPLETED: set(),
+        STATUS_FAILED: set(),
+        STATUS_CANCELLED: set(),
+    }
+
+    request = models.ForeignKey(
+        MapRequest,
+        on_delete=models.CASCADE,
+        related_name='runs',
+        verbose_name='关联请求',
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        verbose_name='运行状态',
+    )
+    idempotency_key = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        verbose_name='幂等键',
+    )
+    trace_id = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name='智能体调用链标识',
+    )
+    map_version = models.PositiveIntegerField(null=True, blank=True, verbose_name='地图版本')
+    attempt = models.PositiveIntegerField(default=1, verbose_name='尝试次数')
+    heartbeat_at = models.DateTimeField(null=True, blank=True, verbose_name='心跳时间')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+    error_code = models.CharField(max_length=100, blank=True, verbose_name='错误代码')
+    error_message = models.TextField(blank=True, verbose_name='错误信息')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '地图运行'
+        verbose_name_plural = '地图运行'
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['request', 'idempotency_key'],
+                name='mapping_run_request_idempotency_key_uniq',
+            )
+        ]
+
+    def __str__(self):
+        return f'Run {self.pk} for request {self.request_id} ({self.status})'
+
+    def transition_to(self, status, *, error_code=None, error_message=None):
+        """执行受约束的状态变更，并记录运行时间。"""
+        if self.pk is None:
+            raise ValueError('MapRun must be saved before changing status')
+        if status not in dict(self.STATUS_CHOICES):
+            raise ValidationError({'status': f'未知的运行状态: {status}'})
+        if status not in self._TRANSITIONS[self.status]:
+            raise ValidationError(
+                {'status': f'不允许从 {self.status} 变更为 {status}'}
+            )
+
+        now = timezone.now()
+        self.status = status
+        update_fields = {'status', 'updated_at'}
+        if status == self.STATUS_RUNNING:
+            self.started_at = self.started_at or now
+            self.heartbeat_at = now
+            update_fields.update({'started_at', 'heartbeat_at'})
+        elif status in {
+            self.STATUS_COMPLETED,
+            self.STATUS_AWAITING_INPUT,
+            self.STATUS_FAILED,
+            self.STATUS_CANCELLED,
+        }:
+            self.finished_at = now
+            self.heartbeat_at = now
+            update_fields.update({'finished_at', 'heartbeat_at'})
+        if error_code is not None:
+            self.error_code = error_code
+            update_fields.add('error_code')
+        if error_message is not None:
+            self.error_message = error_message
+            update_fields.add('error_message')
+        self.save(update_fields=update_fields)
+
+
+class Dataset(models.Model):
+    """A discoverable local or remote geospatial dataset."""
+
+    SOURCE_LOCAL = "local"
+    SOURCE_REMOTE = "remote"
+    SOURCE_UPLOAD = "upload"
+    SOURCE_CHOICES = [
+        (SOURCE_LOCAL, "本地数据"),
+        (SOURCE_REMOTE, "远程数据"),
+        (SOURCE_UPLOAD, "用户上传"),
+    ]
+
+    STATUS_AVAILABLE = "available"
+    STATUS_PENDING = "pending"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_AVAILABLE, "可用"),
+        (STATUS_PENDING, "处理中"),
+        (STATUS_FAILED, "失败"),
+    ]
+
+    dataset_id = models.CharField(max_length=200, unique=True, verbose_name="数据集ID")
+    name = models.CharField(max_length=255, verbose_name="数据集名称")
+    aliases = models.JSONField(default=list, blank=True, verbose_name="名称别名")
+    source_type = models.CharField(
+        max_length=20, choices=SOURCE_CHOICES, default=SOURCE_LOCAL, verbose_name="数据来源类型"
+    )
+    source_url = models.URLField(blank=True, verbose_name="数据来源地址")
+    local_path = models.CharField(max_length=500, blank=True, verbose_name="本地相对路径")
+    geometry_type = models.CharField(max_length=40, blank=True, verbose_name="几何类型")
+    crs = models.CharField(max_length=100, blank=True, verbose_name="坐标系")
+    bbox = models.JSONField(default=list, blank=True, verbose_name="空间范围")
+    feature_count = models.PositiveBigIntegerField(null=True, blank=True, verbose_name="要素数量")
+    license = models.CharField(max_length=255, blank=True, verbose_name="许可证")
+    checksum = models.CharField(max_length=128, blank=True, verbose_name="校验哈希")
+    version = models.CharField(max_length=100, default="1", verbose_name="数据版本")
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_AVAILABLE, verbose_name="状态"
+    )
+    metadata = models.JSONField(default=dict, blank=True, verbose_name="数据元信息")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "数据集"
+        verbose_name_plural = "数据集"
+        ordering = ["name", "dataset_id"]
+        indexes = [
+            models.Index(fields=["source_type", "status"]),
+            models.Index(fields=["name"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.dataset_id})"
+
+
+class DatasetFeature(models.Model):
+    """Normalized feature storage used by PostGIS spatial queries."""
+
+    dataset = models.ForeignKey(
+        Dataset,
+        on_delete=models.CASCADE,
+        related_name="features",
+        verbose_name="所属数据集",
+    )
+    source_fid = models.CharField(max_length=255, verbose_name="源要素ID")
+    geom = gis_models.GeometryField(srid=4326, spatial_index=True, verbose_name="几何")
+    properties = models.JSONField(default=dict, blank=True, verbose_name="属性")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "数据集要素"
+        verbose_name_plural = "数据集要素"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dataset", "source_fid"],
+                name="mapping_dataset_feature_source_uniq",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.dataset_id}:{self.source_fid}"
 
 
 class GeneratedMap(models.Model):

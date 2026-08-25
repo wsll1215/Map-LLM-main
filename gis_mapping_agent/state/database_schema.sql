@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS map_states (
     auto_legend INTEGER DEFAULT 1,
     auto_scalebar INTEGER DEFAULT 1,
     auto_compass INTEGER DEFAULT 1,
+    schema_version INTEGER DEFAULT 1,
+    spec_json TEXT,
+    spec_hash TEXT,
+    source_fingerprints TEXT,
+    latest_event_seq INTEGER DEFAULT 0,
     
     -- 其他配置（JSON 格式）
     scalebar TEXT,  -- JSON
@@ -79,6 +84,11 @@ CREATE TABLE IF NOT EXISTS layers (
     -- 其他配置
     visible INTEGER DEFAULT 1,
     z_order INTEGER DEFAULT 0,
+    data_hash TEXT,
+    feature_count INTEGER DEFAULT 0,
+    extent TEXT,
+    render_mode TEXT DEFAULT 'geojson',
+    data_url TEXT,
     
     -- 时间戳
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
