@@ -27,7 +27,9 @@ export default function App() {
   const [finalMapLoading, setFinalMapLoading] = useState(false);
   const [finalMapError, setFinalMapError] = useState<string | null>(null);
   const [historyNotice, setHistoryNotice] = useState<string | null>(null);
+  const [historyQuery, setHistoryQuery] = useState("");
   const mapStageRef = useRef<HTMLDivElement | null>(null);
+  const historyListRef = useRef<HTMLDivElement | null>(null);
   const submitInFlightRef = useRef(false);
   const { history, loading: historyLoading, error: historyError, refresh: loadHistory } = useSessionHistory();
   const stream = useMapBuildStream(dispatch);
@@ -43,6 +45,10 @@ export default function App() {
   const terminalWithResult = (state.status === "completed" || state.status === "failed") && hasStoredMap;
   const showingFinalMap = terminalWithResult && Boolean(availableMap) && !finalMapError;
   const progressStep = state.status === "idle" ? 0 : state.status === "pending" ? 1 : state.status === "processing" ? 2 : state.status === "needs_clarification" ? 1 : state.status === "completed" ? 3 : 2;
+  const normalizedHistoryQuery = historyQuery.trim().toLocaleLowerCase();
+  const visibleHistory = normalizedHistoryQuery
+    ? history.filter((item) => [item.title, item.request_text, item.result_message].filter(Boolean).some((value) => String(value).toLocaleLowerCase().includes(normalizedHistoryQuery)))
+    : history;
   useTaskStatus(state.requestId, isWorking, dispatch);
 
   const loadGeneratedMaps = useCallback(async (requestId: number) => {
@@ -147,11 +153,13 @@ export default function App() {
 
       <section className="workspace-grid">
         <aside className="panel history-panel">
-          <div className="panel-heading"><div><span className="section-kicker">ARCHIVE</span><h2>历史成果</h2></div><button className="text-button" type="button" onClick={() => void loadHistory()} disabled={historyLoading}>{historyLoading ? "读取中" : "刷新"}</button></div>
+          <div className="panel-heading history-heading"><div><span className="section-kicker">ARCHIVE</span><div className="heading-row"><h2>历史成果</h2><span className="history-total">{history.length}</span></div></div><div className="history-heading-actions"><button className="icon-button" type="button" onClick={() => historyListRef.current?.scrollTo({ top: 0, behavior: "smooth" })} disabled={!history.length} aria-label="跳到最新历史" title="跳到最新历史">↑</button><button className="icon-button" type="button" onClick={() => { const list = historyListRef.current; list?.scrollTo({ top: list.scrollHeight, behavior: "smooth" }); }} disabled={!history.length} aria-label="跳到最早历史" title="跳到最早历史">↓</button><button className="text-button" type="button" onClick={() => void loadHistory()} disabled={historyLoading}>{historyLoading ? "读取中" : "刷新"}</button></div></div>
           <div className="history-intro">选择一条记录，恢复地图版本和对话。</div>
+          <div className="history-search"><label htmlFor="history-search-input">搜索历史</label><input id="history-search-input" type="search" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder="按需求或编号搜索" /></div>
           {historyError && <div className="inline-notice error-notice" role="alert">{historyError}</div>}
           {historyNotice && <div className="inline-notice" role="status">{historyNotice}</div>}
-          <div className="history-list">{history.length === 0 ? <p className="muted">暂无已生成地图</p> : history.map((item) => <button className="history-item" type="button" key={item.request_id} onClick={() => { setHistoryNotice(null); setFinalMapError(null); setGeneratedMaps(item.maps || []); void openHistory(item, dispatch, stream, setGeneratedMaps).catch((error) => setHistoryNotice(error instanceof Error ? error.message : "历史成果加载失败")); }}><span className="history-item-title">{item.title}</span><span className="history-item-meta"><span className={`history-dot status-dot-${item.status}`} />{statusLabel(item.status)}<b>#{item.request_id}</b></span></button>)}</div>
+          <div className="history-list" ref={historyListRef} aria-label="历史成果列表">{historyLoading && history.length === 0 ? <p className="muted">正在读取历史成果…</p> : visibleHistory.length === 0 ? <p className="muted">{history.length === 0 ? "暂无已生成地图" : "没有匹配的历史记录"}</p> : visibleHistory.map((item) => <button className={`history-item ${state.requestId === item.request_id ? "history-item-selected" : ""}`} type="button" key={item.request_id} onClick={() => { setHistoryNotice(null); setFinalMapError(null); setGeneratedMaps(item.maps || []); void openHistory(item, dispatch, stream, setGeneratedMaps).catch((error) => setHistoryNotice(error instanceof Error ? error.message : "历史成果加载失败")); }}><span className="history-item-title">{item.title}</span><span className="history-item-meta"><span className={`history-dot status-dot-${item.status}`} />{statusLabel(item.status)}<b>#{item.request_id}</b></span></button>)}</div>
+          <div className="history-footer"><span>{normalizedHistoryQuery ? `${visibleHistory.length} / ${history.length} 条记录` : "按时间倒序"}</span><button type="button" onClick={() => historyListRef.current?.scrollTo({ top: 0, behavior: "smooth" })} disabled={!history.length}>回到最新</button></div>
         </aside>
 
         <section className="center-column">
