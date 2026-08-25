@@ -333,7 +333,9 @@ class MapOperationsMixin:
                 data_source=data_source_to_save,
                 visible=visible,
                 gdf=gdf,
-                z_order=z_order
+                z_order=z_order,
+                feature_count=len(gdf),
+                extent=[float(value) for value in gdf.total_bounds],
             )
 
             # 处理样式：如果提供了样式参数，使用它；否则自动分配颜色

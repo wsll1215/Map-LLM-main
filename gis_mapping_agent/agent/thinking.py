@@ -1,5 +1,6 @@
 """思考型GIS制图智能体 - 实现显式的思考-行动-观察循环"""
 
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
@@ -11,7 +12,12 @@ from ..models.schemas import MapState
 from ..utils.config import Config
 from ..utils.logger import setup_logger, get_logger
 from ..utils.data_path_resolver import data_path_resolver, extract_data_info_from_request, resolve_data_path
-from ..data_sources.remote import extract_location_query, fetch_remote_boundary
+from ..data_sources.remote import (
+    extract_location_query,
+    fetch_remote_boundary,
+    fetch_remote_waterways,
+)
+from ..data_sources.planner import plan_local_sources
 from ..gis import calculate_extent_from_files, format_extent_for_request
 from ..state import get_generalization_context
 from ..tools.registry import ALL_UNIFIED_TOOLS
@@ -43,6 +49,7 @@ class ThinkingGISMappingAgent:
         self.logger = get_logger("ThinkingGISMappingAgent")
         self._default_data_file_path = None
         self._explicit_data_files = False
+        self._semantic_data_plan = None
 
         # 验证配置
         self._validate_config()
@@ -93,6 +100,7 @@ class ThinkingGISMappingAgent:
             data_dir_from_request, data_files_from_request = extract_data_info_from_request(user_request)
             self._explicit_data_files = bool(explicit_data_files)
             self._default_data_file_path = None
+            self._semantic_data_plan = None
             if not self._explicit_data_files and data_dir_from_request and data_files_from_request:
                 self._default_data_file_path = resolve_data_path(data_dir_from_request) / data_files_from_request[0]
 
@@ -106,6 +114,24 @@ class ThinkingGISMappingAgent:
                         data_dir_from_request = str(remote_path.parent)
                         data_files_from_request = [remote_path.name]
                         self._default_data_file_path = remote_path
+
+            if not self._explicit_data_files:
+                self._semantic_data_plan = plan_local_sources(user_request)
+                self._semantic_data_plan = self._add_remote_river_source(
+                    user_request, self._semantic_data_plan
+                )
+                if self._semantic_data_plan.issues:
+                    message = "数据源校验未通过：" + "；".join(self._semantic_data_plan.issues)
+                    self.logger.error(message)
+                    return {
+                        "success": False,
+                        "message": message,
+                        "error": message,
+                    }
+                if self._semantic_data_plan.boundary_path:
+                    self._default_data_file_path = resolve_data_path(
+                        self._semantic_data_plan.boundary_path.removeprefix("data/")
+                    )
 
             # 自动计算范围
             self.auto_extent, self.auto_extent_str = self._calculate_auto_extent(
@@ -325,9 +351,44 @@ class ThinkingGISMappingAgent:
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """执行指定的工具（工具调用版）"""
         try:
-            if tool_name == "add_layer" and self._default_data_file_path and not self._explicit_data_files:
+            if tool_name == "add_layer" and not self._explicit_data_files:
                 tool_input = dict(tool_input)
-                tool_input["data_path"] = self._default_data_file_path.as_posix()
+                plan = getattr(self, "_semantic_data_plan", None)
+                planned_path = plan.path_for_layer(tool_input.get("name", "")) if plan else None
+                if plan and plan.requires_layer(tool_input.get("name", "")) and not planned_path:
+                    role = plan.role_for_layer(tool_input.get("name", "")) or "请求的"
+                    return f"错误：{role}图层没有经过校验的数据源，已阻止使用默认文件。"
+                if planned_path:
+                    tool_input["data_path"] = planned_path
+                elif self._default_data_file_path:
+                    tool_input["data_path"] = self._default_data_file_path.as_posix()
+
+                if plan and planned_path:
+                    style = dict(tool_input.get("style") or {})
+                    role = plan.role_for_layer(tool_input.get("name", ""))
+                    semantic_defaults = {
+                        "boundary": {
+                            "facecolor": "#E2E8F0",
+                            "edgecolor": "#334155",
+                            "alpha": 0.45,
+                            "linewidth": 1.2,
+                        },
+                        "road": {
+                            "color": "#D97706",
+                            "alpha": 0.9,
+                            "linewidth": 1.4,
+                        },
+                        "river": {
+                            "color": "#0284C7",
+                            "alpha": 0.9,
+                            "linewidth": 1.5,
+                        },
+                    }
+                    for key, value in semantic_defaults.get(role, {}).items():
+                        style.setdefault(key, value)
+                    if role == "boundary" and plan.city_label_column:
+                        style.setdefault("label_column", plan.city_label_column)
+                    tool_input["style"] = style
 
             # 特殊处理init_map工具，自动注入计算好的范围
             if tool_name == "init_map" and self.auto_extent:
@@ -364,6 +425,28 @@ class ThinkingGISMappingAgent:
         except Exception as e:
             import traceback
             return f"工具 '{tool_name}' 执行失败: {e}\n{traceback.format_exc()}"
+
+    def _add_remote_river_source(self, user_request: str, plan):
+        """Fill a missing river role from a place-scoped remote source."""
+        if "river" not in plan.requested_roles or plan.river_path:
+            return plan
+        boundary_path = plan.boundary_path
+        location_query = extract_location_query(user_request)
+        if not boundary_path or not location_query:
+            return plan
+        try:
+            import geopandas as gpd
+
+            boundary_file = resolve_data_path(boundary_path.removeprefix("data/"))
+            bbox = gpd.read_file(boundary_file).total_bounds.tolist()
+            remote_path = fetch_remote_waterways(location_query, bbox)
+        except Exception as exc:
+            self.logger.warning(f"远程河流数据准备失败: {exc}")
+            return plan
+        if not remote_path:
+            return plan
+        issues = tuple(issue for issue in plan.issues if "河流" not in issue)
+        return replace(plan, river_path=str(remote_path), issues=issues)
 
     def _publish_realtime_tool_event(
         self,
@@ -458,6 +541,9 @@ class ThinkingGISMappingAgent:
             instructions.append(
                 f"📁 系统已解析出可用数据文件 {self._default_data_file_path.as_posix()}，添加图层时必须使用该文件，禁止猜测其他路径。"
             )
+        plan = getattr(self, "_semantic_data_plan", None)
+        if plan and not self._explicit_data_files:
+            instructions.append(plan.prompt_instructions())
         if not instructions:
             return user_request
 

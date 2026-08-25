@@ -3,7 +3,7 @@ from pathlib import Path
 from gis_mapping_agent.tools.unified_mapping_tools import UnifiedMappingTools
 
 
-def test_layer_data_replaces_global_init_extent() -> None:
+def test_layer_data_replaces_global_init_extent(tmp_path) -> None:
     tools = UnifiedMappingTools()
     initialized = tools.init_map({"title": "北京地图", "extent": [-180, -90, 180, 90]})
     assert initialized["success"] is True
@@ -19,3 +19,10 @@ def test_layer_data_replaces_global_init_extent() -> None:
     assert 39 < min_y < 40
     assert 117 < max_x < 118
     assert 40 < max_y < 42
+    assert tools.current_map_state.layers[0].feature_count == result["feature_count"]
+    assert tools.current_map_state.layers[0].feature_count > 0
+
+    saved = tools.map_save({"filename": "non_empty_map.png", "output_dir": str(tmp_path)})
+
+    assert saved["success"] is True
+    assert saved["file_size"] > 1000

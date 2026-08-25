@@ -17,6 +17,32 @@ from ...models.schemas import GeometryType
 from ...rendering.elements import MapQualityChecker
 from ...utils.config import Config
 
+
+_CITY_LABEL_ALIASES = {
+    "Chaozhou": "潮州",
+    "Dongyuan": "东莞",
+    "Foshan": "佛山",
+    "Guangzhou": "广州",
+    "Heyuan": "河源",
+    "Huizhou": "惠州",
+    "Jiangmen": "江门",
+    "Jieyang": "揭阳",
+    "Maoming": "茂名",
+    "Meizhou": "梅州",
+    "Qingyuan": "清远",
+    "Shantou": "汕头",
+    "Shanwei": "汕尾",
+    "Shaoguan": "韶关",
+    "Shenzhen": "深圳",
+    "Yangjiang": "阳江",
+    "Yunfu": "云浮",
+    "Zhanjiang": "湛江",
+    "Zhaoqing": "肇庆",
+    "Zhongshan": "中山",
+    "Zhuhai": "珠海",
+}
+
+
 class RenderingMixin:
     def _redraw_map(self):
         """清除并根据当前状态重新绘制所有图层和元素"""
@@ -98,6 +124,7 @@ class RenderingMixin:
                     for _, row in layer.gdf.iterrows():
                         centroid = row.geometry.centroid
                         label_text = row[layer.style.label_column]
+                        label_text = _CITY_LABEL_ALIASES.get(str(label_text), label_text)
 
                         # 设置标签样式，包括中文字体支持
                         text_props = {
@@ -140,7 +167,13 @@ class RenderingMixin:
                 if not english_name:
                     english_name = item.label  # 如果没找到映射，使用原始名称
 
-                layer_config = next((l for l in self.current_map_state.layers if l.name == english_name), None)
+                layer_config = next(
+                    (l for l in self.current_map_state.layers if l.name == item.label),
+                    None,
+                ) or next(
+                    (l for l in self.current_map_state.layers if l.name == english_name),
+                    None,
+                )
                 if not layer_config or layer_config.gdf is None:
                     continue
 
@@ -317,7 +350,9 @@ class RenderingMixin:
             # self.logger.info(f"地图保存DPI设置为: {dpi}")
             file_format = params.get('format', 'png')
 
-            # 不再重新绘制图层，直接保存当前图形状态
+            # add_layer 负责更新状态，保存前统一重绘，避免没有额外
+            # style_layer/render_map 调用时把空画布误保存为成功结果。
+            self._redraw_map()
 
 
             # 确保输出目录存在
