@@ -33,6 +33,7 @@ def detect_ambiguity(user_input: str, *, has_map_state: bool) -> Optional[Dict[s
     has_layer = bool(
         re.search(r"行政区划|边界|道路|公路|铁路|高铁|交通|建筑|学校|河流|水系|地铁|路网|图层", text)
     )
+    has_default_map = bool(re.search(r"地图|底图|区域图", text))
     has_map_action = bool(re.search(r"画|绘制|制作|生成|创建|制图|地图|出图|draw|create|generate", text, re.I))
 
     if not has_map_state:
@@ -43,14 +44,17 @@ def detect_ambiguity(user_input: str, *, has_map_state: bool) -> Optional[Dict[s
                 ["北京行政区划图", "北京道路图", "北京建筑图"],
                 "location_without_map_type",
             )
-        if has_map_action and (not has_location or not has_layer) and not has_data:
+        if has_map_action and (not has_location or (not has_layer and not has_default_map)) and not has_data:
             return _decision(
                 "我还缺少关键信息：请说明地图范围，以及要显示的图层或数据源。",
-                [field for field, missing in (("map_scope", not has_location), ("layer_type", not has_layer)) if missing],
+                [field for field, missing in (
+                    ("map_scope", not has_location),
+                    ("layer_type", not has_layer and not has_default_map),
+                ) if missing],
                 ["北京行政区划图", "北京道路和铁路图", "上传或指定 Shapefile/GeoJSON"],
                 "incomplete_create_request",
             )
-        if len(text) <= 8 and not has_layer and not has_data:
+        if len(text) <= 8 and not has_layer and not has_default_map and not has_data:
             return _decision(
                 "请再具体一点：要绘制哪个区域、哪些内容？",
                 ["map_scope", "layer_type"],

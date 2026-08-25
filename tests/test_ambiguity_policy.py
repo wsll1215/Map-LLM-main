@@ -40,6 +40,12 @@ def test_specific_map_request_is_not_blocked():
     assert result is None
 
 
+def test_place_map_request_uses_boundary_map_as_default_layer():
+    result = detect_ambiguity("帮我绘制秦皇岛市的地图", has_map_state=False)
+
+    assert result is None
+
+
 def test_specific_adjustment_is_not_blocked():
     result = detect_ambiguity("把道路图层改成深绿色", has_map_state=True)
 
