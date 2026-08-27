@@ -40,6 +40,7 @@ class DatasetDescriptor:
     bbox: List[float]
     feature_count: Optional[int]
     metadata: dict
+    role: Optional[str] = None
 
 
 def _normalize(value: str) -> str:
@@ -86,6 +87,9 @@ class LocalDatasetCatalog:
                 "driver": info.get("driver", ""),
                 "fields": [str(field) for field in info.get("fields", [])],
             },
+            role="boundary"
+            if "polygon" in str(info.get("geometry_type") or "").lower()
+            else None,
         )
 
     def scan(self) -> List[DatasetDescriptor]:
@@ -135,3 +139,73 @@ class LocalDatasetCatalog:
                 "total_bounds": (),
                 "driver": "",
             }
+
+
+class DjangoDatasetCatalog:
+    """Runtime catalog backed by Django's Dataset and DatasetFeature tables."""
+
+    def __init__(self, dataset_model=None):
+        self.dataset_model = dataset_model
+        self.logger = get_logger("DjangoDatasetCatalog")
+
+    def scan(self) -> List[DatasetDescriptor]:
+        try:
+            model = self.dataset_model
+            if model is None:
+                from mapping.models import Dataset
+
+                model = Dataset
+            queryset = model.objects.filter(
+                status=model.STATUS_AVAILABLE,
+                source_type=getattr(model, "SOURCE_LOCAL", "local"),
+            )
+            descriptors = []
+            for dataset in queryset:
+                metadata = dict(dataset.metadata or {})
+                feature_count = dataset.feature_count
+                # DatasetFeature is authoritative when it is available. The
+                # fallback keeps lightweight SQLite catalogs usable in tests.
+                try:
+                    feature_count = dataset.features.count()
+                except Exception:
+                    pass
+                if feature_count is None or feature_count <= 0:
+                    continue
+                descriptors.append(
+                    DatasetDescriptor(
+                        dataset_id=dataset.dataset_id,
+                        name=dataset.name,
+                        aliases=list(dataset.aliases or []),
+                        source_type=dataset.source_type,
+                        local_path=dataset.local_path or "",
+                        geometry_type=dataset.geometry_type or "",
+                        crs=dataset.crs or "EPSG:4326",
+                        bbox=[float(value) for value in (dataset.bbox or [])],
+                        feature_count=int(feature_count),
+                        metadata=metadata,
+                        role=_dataset_role(dataset, metadata),
+                    )
+                )
+            return descriptors
+        except Exception as exc:
+            self.logger.warning(f"运行时数据目录不可用: {exc}")
+            return []
+
+
+def _dataset_role(dataset, metadata: dict) -> Optional[str]:
+    roles = metadata.get("roles") or metadata.get("role")
+    if isinstance(roles, str):
+        return roles
+    if roles:
+        return str(next(iter(roles)))
+    name = str(getattr(dataset, "name", "")).lower()
+    geometry_type = str(getattr(dataset, "geometry_type", "")).lower()
+    if any(term in name for term in ("highway", "road", "道路", "公路")):
+        return "road"
+    if any(term in name for term in ("railway", "铁路", "高铁")):
+        return "railway"
+    if any(term in name for term in ("river", "河流", "河道")):
+        return "river"
+    if "polygon" in geometry_type or "multipolygon" in geometry_type:
+        return "boundary"
+    return None

@@ -15,7 +15,7 @@ from .sse_protocol import TERMINAL_EVENTS, format_sse_event, get_event_broker
 
 
 REQUEST_PATH = re.compile(r"^/mapping/api/stream/(?P<request_id>\d+)/?$")
-TERMINAL_REQUEST_STATUSES = {"completed", "failed", "needs_clarification"}
+TERMINAL_REQUEST_STATUSES = {"completed", "partial", "failed", "needs_clarification"}
 
 
 class MapBuildSSEApplication:

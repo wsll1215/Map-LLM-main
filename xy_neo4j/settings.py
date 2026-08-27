@@ -122,7 +122,7 @@ REDIS_URL = os.getenv('REDIS_URL', '').strip()
 MAP_GEOJSON_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_LIMIT', '5000')))
 MAP_WORKER_LIMIT = max(MAP_GEOJSON_LIMIT, int(os.getenv('MAP_WORKER_LIMIT', '30000')))
 MAP_GEOJSON_FALLBACK_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_FALLBACK_LIMIT', '1000')))
-MAP_MVT_ENABLED = os.getenv('MAP_MVT_ENABLED', 'false').lower() == 'true'
+MAP_MVT_ENABLED = os.getenv('MAP_MVT_ENABLED', 'true').lower() == 'true'
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
 CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', 'False').lower() == 'true'

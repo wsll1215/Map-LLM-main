@@ -18,12 +18,16 @@ from django.db import close_old_connections
 from .models import MapRequest, MapRun, GeneratedMap, ChatMessage, ProcessLog
 from .realtime import publish_map_build_event
 from .task_dispatch import dispatch_conversation, dispatch_map_request
+from .finalization import LayerValidation, finalize_execution
+from .trace import record_trace_event, trace_event_to_dict
 
 MAP_LLM_DIR = settings.BASE_DIR
 if str(MAP_LLM_DIR) not in sys.path:
     sys.path.insert(0, str(MAP_LLM_DIR))
 
 MAP_LLM_EXECUTION_LOCK = threading.RLock()
+_PREVIEW_CLEANUP_TIMERS = {}
+_PREVIEW_CLEANUP_LOCK = threading.RLock()
 
 
 def _publish_lifecycle_event(map_request, event_type, **extra):
@@ -35,11 +39,65 @@ def _publish_lifecycle_event(map_request, event_type, **extra):
         "created_at_ms": int(timezone.now().timestamp() * 1000),
     }
     payload.update(extra)
+    run = (
+        MapRun.objects.filter(request=map_request)
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    if run:
+        is_terminal_event = event_type in {
+            'request_completed', 'request_partial', 'request_failed',
+            'request_needs_clarification', 'done',
+        }
+        if event_type == 'done' and run.process_logs.filter(event_type='run_finished').exists():
+            return publish_map_build_event(map_request.id, payload)
+        trace_type = 'run_finished' if event_type in {
+            'request_completed', 'request_partial', 'request_failed',
+            'request_needs_clarification', 'done',
+        } else 'run'
+        terminal_status = extra.get('status') or map_request.status
+        trace_status = (
+            'success' if terminal_status == 'completed'
+            else 'error' if terminal_status == 'failed'
+            else 'warning' if terminal_status in {'partial', 'needs_clarification'}
+            else 'running'
+        )
+        event = record_trace_event(
+            run=run,
+            event_type=trace_type,
+            phase='lifecycle',
+            status=trace_status,
+            summary=str(extra.get('message') or event_type),
+            output_data={'request_status': terminal_status if is_terminal_event else map_request.status},
+            error=extra.get('error') if isinstance(extra.get('error'), dict) else None,
+        )
+        payload['trace_event'] = trace_event_to_dict(event, include_payload=False)
+        stream_id = publish_map_build_event(map_request.id, payload)
+        publish_map_build_event(map_request.id, {
+            'type': 'trace_event',
+            'request_id': map_request.id,
+            'trace_event': payload['trace_event'],
+        })
+        return stream_id
     return publish_map_build_event(map_request.id, payload)
 
 
-def _publish_process_log_event(map_request, message, *, level='info', step=None, progress=None):
-    publish_map_build_event(map_request.id, {
+def _current_run_context(map_request, run=None):
+    if run is not None:
+        return {'run_id': run.id, 'trace_id': run.trace_id or None}
+    run = (
+        MapRun.objects.filter(request=map_request)
+        .only('id', 'trace_id')
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    if not run:
+        return {'run_id': None, 'trace_id': None}
+    return {'run_id': run.id, 'trace_id': run.trace_id or None}
+
+
+def _publish_process_log_event(map_request, message, *, level='info', step=None, progress=None, run=None):
+    payload = {
         'type': 'process_log',
         'request_id': map_request.id,
         'level': level,
@@ -47,7 +105,151 @@ def _publish_process_log_event(map_request, message, *, level='info', step=None,
         'step': step,
         'progress': progress,
         'created_at_ms': int(timezone.now().timestamp() * 1000),
+    }
+    payload.update(_current_run_context(map_request, run))
+    current_run = run or MapRun.objects.filter(request=map_request).order_by('-created_at', '-id').first()
+    if current_run:
+        event_type = 'tool_call' if '工具' in str(step or '') else 'process_log'
+        event = record_trace_event(
+            run=current_run,
+            event_type=event_type,
+            phase=str(step or 'execution'),
+            status='error' if level == 'error' else 'warning' if level == 'warning' else 'success',
+            summary=str(message),
+            output_data={'progress': progress} if progress is not None else {},
+            error={'error_code': 'process_error', 'retryable': False, 'next_action': 'inspect_trace'}
+            if level == 'error' else None,
+            progress=progress,
+        )
+        payload['trace_event'] = trace_event_to_dict(event, include_payload=False)
+        publish_map_build_event(map_request.id, payload)
+        publish_map_build_event(map_request.id, {
+            'type': 'trace_event',
+            'request_id': map_request.id,
+            'trace_event': payload['trace_event'],
+        })
+        return
+    publish_map_build_event(map_request.id, payload)
+
+
+def _record_error_event(map_request, run, message, step):
+    if not run:
+        return
+    event = record_trace_event(
+        run=run,
+        event_type='error',
+        phase=step or 'error',
+        status='error',
+        summary=str(message),
+        error={
+            'error_code': 'internal_error',
+            'retryable': False,
+            'next_action': 'inspect_trace',
+        },
+    )
+    publish_map_build_event(map_request.id, {
+        'type': 'trace_event',
+        'request_id': map_request.id,
+        'trace_event': trace_event_to_dict(event),
     })
+
+
+def _map_layer_role(name):
+    text = str(name or '').lower()
+    if '小学' in text:
+        return 'primary_school'
+    if '高校' in text or '大学' in text:
+        return 'university'
+    if '医院' in text:
+        return 'hospital'
+    if '公园' in text:
+        return 'park'
+    if any(term in text for term in ('道路', '公路', '高速', 'highway', 'road')):
+        return 'road'
+    if any(term in text for term in ('铁路', '高铁', 'railway')):
+        return 'railway'
+    if any(term in text for term in ('河流', '河道', '水系', 'river')):
+        return 'river'
+    return 'boundary'
+
+
+def _finalize_map_request(
+    map_request,
+    response,
+    *,
+    clarification_required=False,
+    intent_text=None,
+):
+    """Validate the persisted state and artifact before publishing completion."""
+    from gis_mapping_agent.data_sources.planner import parse_intent
+    from gis_mapping_agent.state import get_state_manager
+    from gis_mapping_agent.data_sources.metadata import source_metadata_from_path
+
+    response = response if isinstance(response, dict) else {}
+    intent = parse_intent(intent_text or map_request.request_text)
+    required_roles = {layer.role for layer in intent.layers if layer.required}
+    state = get_state_manager().load_state(f'web_session_{map_request.id}')
+    layers = []
+    if state:
+        for layer in state.layers:
+            data_source = getattr(layer, 'data_source', None)
+            data_source_meta = getattr(layer, 'data_source_meta', None) or {}
+            source_meta = source_metadata_from_path(data_source, data_source_meta)
+            source_type = data_source_meta.get('source_type') or (
+                source_meta.get('source_type') if data_source else None
+            )
+            extent = getattr(layer, 'extent', None)
+            spatial_valid = (
+                isinstance(extent, (list, tuple))
+                and len(extent) == 4
+                and all(isinstance(value, (int, float)) for value in extent)
+                and extent[0] < extent[2]
+                and extent[1] < extent[3]
+            )
+            layers.append(
+                LayerValidation(
+                    role=_map_layer_role(getattr(layer, 'name', '')),
+                    required=False,
+                    source_type=source_type,
+                    feature_count=int(getattr(layer, 'feature_count', 0) or 0),
+                    spatial_valid=spatial_valid,
+                    geometry_valid=True,
+                    source_valid=bool(
+                        data_source or getattr(layer, 'data', None)
+                    ) and source_type in {'local', 'remote', 'upload'},
+                )
+            )
+
+    latest_artifact = map_request.generated_maps.order_by('-version', '-created_at', '-id').first()
+    png_path = None
+    if latest_artifact:
+        png_path = Path(settings.GENERATED_MAPS_DIR) / latest_artifact.file_path
+    result = finalize_execution(
+        required_roles=required_roles,
+        layers=layers,
+        png_path=png_path,
+        trace_id=response.get('tool_trace_id') or f'web_session_{map_request.id}:create',
+        map_version=latest_artifact.version if latest_artifact else None,
+        clarification_required=clarification_required,
+    )
+    map_request.status = result.status
+    map_request.completion_report = result.completion_report
+    map_request.error_message = result.error_message or ''
+    if result.status == 'partial':
+        map_request.result_message = (
+            f"地图已生成部分结果，但缺少必需图层："
+            f"{', '.join(result.completion_report.get('missing_layers', []))}"
+        )
+    elif result.status == 'failed':
+        map_request.result_message = result.error_message or response.get('response', '地图制作失败')
+    elif result.status == 'needs_clarification':
+        map_request.result_message = response.get('response', '需要补充制图信息')
+    else:
+        map_request.result_message = response.get('response', '地图制作完成')
+    map_request.save(update_fields=[
+        'status', 'completion_report', 'error_message', 'result_message', 'updated_at'
+    ])
+    return result
 
 
 def _record_dispatch_failure(map_request, run, error):
@@ -62,12 +264,7 @@ def _record_dispatch_failure(map_request, run, error):
     if run and run.status in {MapRun.STATUS_PENDING, MapRun.STATUS_RUNNING}:
         run.transition_to(MapRun.STATUS_FAILED, error_message=message)
 
-    ProcessLog.objects.create(
-        request=map_request,
-        level='error',
-        message=message,
-        step='任务提交',
-    )
+    _record_error_event(map_request, run, message, '任务提交')
     ChatMessage.objects.create(
         request=map_request,
         message_type='assistant',
@@ -135,6 +332,33 @@ def _clear_realtime_previews(request_id):
     except Exception as e:
         logging.getLogger(__name__).warning("清理实时预览目录失败: %s", e)
 
+
+def _schedule_realtime_preview_cleanup(request_id, delay_seconds=60):
+    """Keep terminal previews readable before removing them on a later run."""
+    with _PREVIEW_CLEANUP_LOCK:
+        old_timer = _PREVIEW_CLEANUP_TIMERS.pop(request_id, None)
+        if old_timer:
+            old_timer.cancel()
+
+        def cleanup():
+            try:
+                _clear_realtime_previews(request_id)
+            finally:
+                with _PREVIEW_CLEANUP_LOCK:
+                    _PREVIEW_CLEANUP_TIMERS.pop(request_id, None)
+
+        timer = threading.Timer(delay_seconds, cleanup)
+        timer.daemon = True
+        _PREVIEW_CLEANUP_TIMERS[request_id] = timer
+        timer.start()
+
+
+def _cancel_realtime_preview_cleanup(request_id):
+    with _PREVIEW_CLEANUP_LOCK:
+        timer = _PREVIEW_CLEANUP_TIMERS.pop(request_id, None)
+        if timer:
+            timer.cancel()
+
 try:
     from gis_mapping_agent import ConversationalMappingAgent
     MAP_LLM_AVAILABLE = True
@@ -193,7 +417,8 @@ def create_map_request(request):
         map_request = MapRequest.objects.create(
             user=request.user,
             request_text=request_text,
-            status='pending'
+            status='pending',
+            completion_report={},
         )
         
         # 创建用户消息
@@ -241,6 +466,7 @@ def process_map_request(request):
         map_request.status = 'processing'
         map_request.clarification_data = {}
         map_request.save()
+        _cancel_realtime_preview_cleanup(map_request.id)
         _clear_realtime_previews(map_request.id)
         _publish_lifecycle_event(map_request, 'request_started', message='地图制作任务已启动')
         
@@ -294,7 +520,7 @@ def _process_map_request_in_background(map_request_id, run_id=None):
         if run:
             run.transition_to(MapRun.STATUS_RUNNING)
         with MAP_LLM_EXECUTION_LOCK:
-            response = _process_with_map_llm(map_request)
+            response = _process_with_map_llm(map_request, run)
         _record_run_trace(run, response)
         if run:
             run.refresh_from_db()
@@ -302,6 +528,8 @@ def _process_map_request_in_background(map_request_id, run_id=None):
                 terminal_status = (
                     MapRun.STATUS_COMPLETED
                     if map_request.status == 'completed'
+                    else MapRun.STATUS_PARTIAL
+                    if map_request.status == 'partial'
                     else MapRun.STATUS_AWAITING_INPUT
                     if map_request.status == 'needs_clarification'
                     else MapRun.STATUS_FAILED
@@ -309,6 +537,7 @@ def _process_map_request_in_background(map_request_id, run_id=None):
                 run.transition_to(
                     terminal_status,
                     error_message=map_request.error_message,
+                    completion_report=map_request.completion_report,
                 )
     except Exception as e:
         try:
@@ -321,12 +550,7 @@ def _process_map_request_in_background(map_request_id, run_id=None):
                 if run.status == MapRun.STATUS_PENDING:
                     run.transition_to(MapRun.STATUS_RUNNING)
                 run.transition_to(MapRun.STATUS_FAILED, error_message=map_request.error_message)
-            ProcessLog.objects.create(
-                request=map_request,
-                level='error',
-                message=map_request.error_message,
-                step='后台任务'
-            )
+            _record_error_event(map_request, run, map_request.error_message, '后台任务')
             ChatMessage.objects.create(
                 request=map_request,
                 message_type='assistant',
@@ -341,7 +565,7 @@ def _process_map_request_in_background(map_request_id, run_id=None):
         except Exception:
             pass
     finally:
-        _clear_realtime_previews(map_request_id)
+        _schedule_realtime_preview_cleanup(map_request_id)
         close_old_connections()
 
 
@@ -383,6 +607,7 @@ def continue_conversation(request):
         map_request.clarification_data = {}
         map_request.save()
 
+        _cancel_realtime_preview_cleanup(map_request.id)
         _clear_realtime_previews(map_request.id)
         stream_after_id = _publish_lifecycle_event(
             map_request, 'request_started', message='地图调整任务已启动'
@@ -465,9 +690,10 @@ def _continue_conversation_in_background(
                 os.chdir(MAP_LLM_DIR)
 
                 class StreamingOutputCapture:
-                    def __init__(self, original_stream, map_request, stream_type='stdout'):
+                    def __init__(self, original_stream, map_request, run, stream_type='stdout'):
                         self.original_stream = original_stream
                         self.map_request = map_request
+                        self.run = run
                         self.stream_type = stream_type
 
                     def write(self, text):
@@ -499,15 +725,8 @@ def _continue_conversation_in_background(
                                         if match:
                                             step = f'使用工具: {match.group(1)}'
 
-                                    ProcessLog.objects.create(
-                                        request=self.map_request,
-                                        level='info',
-                                        message=clean_text,
-                                        step=step,
-                                        progress=progress
-                                    )
                                     _publish_process_log_event(
-                                        self.map_request, clean_text, step=step, progress=progress
+                                        self.map_request, clean_text, step=step, progress=progress, run=self.run
                                     )
                             except Exception:
                                 pass
@@ -515,8 +734,8 @@ def _continue_conversation_in_background(
                     def flush(self):
                         _flush_stream_safely(self.original_stream)
 
-                sys.stdout = StreamingOutputCapture(original_stdout, map_request, 'stdout')
-                sys.stderr = StreamingOutputCapture(original_stderr, map_request, 'stderr')
+                sys.stdout = StreamingOutputCapture(original_stdout, map_request, run, 'stdout')
+                sys.stderr = StreamingOutputCapture(original_stderr, map_request, run, 'stderr')
 
                 try:
                     from gis_mapping_agent.utils.logger import setup_logger as mapllm_setup_logger
@@ -552,36 +771,41 @@ def _continue_conversation_in_background(
             clarification = {}
 
         if needs_clarification:
-            map_request.status = 'needs_clarification'
-            map_request.error_message = ''
-            map_request.result_message = response_text
             map_request.clarification_data = clarification
         elif success:
-            map_request.status = 'completed'
-            map_request.error_message = ''
-            map_request.result_message = response_text
             map_request.clarification_data = {}
             _save_generated_map_info(map_request, response if isinstance(response, dict) else {})
         else:
-            map_request.status = 'failed'
+            map_request.clarification_data = {}
+
+        final_result = _finalize_map_request(
+            map_request,
+            {
+                **(response if isinstance(response, dict) else {}),
+                'response': response_text,
+            },
+            clarification_required=needs_clarification,
+            intent_text=f"{map_request.request_text}\n{message_text}",
+        )
+        if not success and not needs_clarification:
             map_request.error_message = response_text
             map_request.result_message = response_text
-            map_request.clarification_data = {}
-        map_request.save()
+            map_request.save(update_fields=['error_message', 'result_message', 'updated_at'])
 
         if run:
             run.refresh_from_db()
             if run.status == MapRun.STATUS_RUNNING:
-                terminal_status = (
-                    MapRun.STATUS_AWAITING_INPUT
-                    if needs_clarification
-                    else MapRun.STATUS_COMPLETED
-                    if success
-                    else MapRun.STATUS_FAILED
-                )
+                terminal_status = {
+                    'needs_clarification': MapRun.STATUS_AWAITING_INPUT,
+                    'completed': MapRun.STATUS_COMPLETED,
+                    'partial': MapRun.STATUS_PARTIAL,
+                    'failed': MapRun.STATUS_FAILED,
+                }[final_result.status]
                 run.transition_to(
                     terminal_status,
-                    error_message=None if success else response_text,
+                    error_code=final_result.error_code,
+                    error_message=final_result.error_message,
+                    completion_report=final_result.completion_report,
                 )
 
         ChatMessage.objects.create(
@@ -595,17 +819,24 @@ def _continue_conversation_in_background(
             'assistant_message',
             content=response_text,
         )
-        terminal_event = (
-            'request_needs_clarification'
-            if needs_clarification
-            else 'request_completed' if success else 'request_failed'
+        terminal_event = {
+            'needs_clarification': 'request_needs_clarification',
+            'completed': 'request_completed',
+            'partial': 'request_partial',
+            'failed': 'request_failed',
+        }[final_result.status]
+        _publish_lifecycle_event(
+            map_request,
+            terminal_event,
+            message=map_request.result_message,
+            completion_report=final_result.completion_report,
         )
-        _publish_lifecycle_event(map_request, terminal_event, message=response_text)
         _publish_lifecycle_event(
             map_request,
             'done',
-            message=response_text,
+            message=map_request.result_message,
             status=map_request.status,
+            completion_report=final_result.completion_report,
             clarification=clarification if needs_clarification else None,
         )
 
@@ -622,12 +853,7 @@ def _continue_conversation_in_background(
                 if run.status == MapRun.STATUS_PENDING:
                     run.transition_to(MapRun.STATUS_RUNNING)
                 run.transition_to(MapRun.STATUS_FAILED, error_message=error_msg)
-            ProcessLog.objects.create(
-                request=map_request,
-                level='error',
-                message=error_msg,
-                step='后台对话任务'
-            )
+            _record_error_event(map_request, run, error_msg, '后台对话任务')
             _publish_lifecycle_event(map_request, 'request_failed', message=error_msg)
             _publish_lifecycle_event(map_request, 'done', message=error_msg)
             ChatMessage.objects.create(
@@ -639,7 +865,7 @@ def _continue_conversation_in_background(
             pass
     finally:
         try:
-            _clear_realtime_previews(map_request_id)
+            _schedule_realtime_preview_cleanup(map_request_id)
         except Exception:
             pass
         close_old_connections()
@@ -685,7 +911,7 @@ def _handle_map_llm_unavailable(map_request):
     }
 
 
-def _process_with_map_llm(map_request):
+def _process_with_map_llm(map_request, run=None):
     """使用 Map-LLM 处理地图制作请求"""
     try:
         # 保存当前工作目录
@@ -702,9 +928,10 @@ def _process_with_map_llm(map_request):
         # 日志捕获（每次请求独立实例）
 
         class StreamingOutputCapture:
-            def __init__(self, original_stream, map_request, stream_type='stdout'):
+            def __init__(self, original_stream, map_request, run, stream_type='stdout'):
                 self.original_stream = original_stream
                 self.map_request = map_request
+                self.run = run
                 self.stream_type = stream_type
 
             def write(self, text):
@@ -753,15 +980,8 @@ def _process_with_map_llm(map_request):
                                 else:
                                     step = '工具执行'
 
-                            ProcessLog.objects.create(
-                                request=self.map_request,
-                                level='info',
-                                message=clean_text,
-                                step=step,
-                                progress=progress
-                            )
                             _publish_process_log_event(
-                                self.map_request, clean_text, step=step, progress=progress
+                                self.map_request, clean_text, step=step, progress=progress, run=self.run
                             )
 
                     except Exception:
@@ -771,8 +991,8 @@ def _process_with_map_llm(map_request):
                 _flush_stream_safely(self.original_stream)
 
         # 替换标准输出
-        sys.stdout = StreamingOutputCapture(original_stdout, map_request, 'stdout')
-        sys.stderr = StreamingOutputCapture(original_stderr, map_request, 'stderr')
+        sys.stdout = StreamingOutputCapture(original_stdout, map_request, run, 'stdout')
+        sys.stderr = StreamingOutputCapture(original_stderr, map_request, run, 'stderr')
 
         # 关键：将 Map-LLM 的 loguru sink 重新绑定到当前的 sys.stdout（StreamingOutputCapture）
         try:
@@ -817,11 +1037,12 @@ def _process_with_map_llm(map_request):
             }
 
             if agent_status == 'needs_clarification':
-                map_request.status = 'needs_clarification'
-                map_request.result_message = agent_output
-                map_request.error_message = ''
                 map_request.clarification_data = clarification
-                map_request.save()
+                final_result = _finalize_map_request(
+                    map_request,
+                    {**result, 'response': agent_output, 'tool_trace_id': agent_trace_id},
+                    clarification_required=True,
+                )
                 ChatMessage.objects.create(
                     request=map_request,
                     message_type='assistant',
@@ -849,46 +1070,61 @@ def _process_with_map_llm(map_request):
                 )
                 return {
                     'success': True,
-                    'status': 'needs_clarification',
-                    'message': agent_output,
-                    'response': agent_output,
+                    'status': final_result.status,
+                    'message': map_request.result_message,
+                    'response': map_request.result_message,
                     'clarification': clarification,
                     'request_id': map_request.id,
                     'result': result,
                 }
 
             if result.get('success', False):
-                # 处理成功
-                map_request.status = 'completed'
-                map_request.result_message = result.get('agent_output', '地图制作完成')
+                # Agent success is only a candidate result. Persist the artifact
+                # first, then let the shared finalizer decide the terminal state.
                 map_request.clarification_data = {}
-                map_request.save()
+                _save_generated_map_info(map_request, result)
+                final_result = _finalize_map_request(map_request, {
+                    **result,
+                    'response': result.get('agent_output', '地图制作完成'),
+                    'tool_trace_id': result.get('tool_trace_id'),
+                })
+                final_message = map_request.result_message
 
-                # 创建助手回复消息
                 ChatMessage.objects.create(
                     request=map_request,
                     message_type='assistant',
-                    content=result.get('agent_output', '地图制作完成')
+                    content=final_message,
                 )
-
-                # 查找生成的地图文件
-                _save_generated_map_info(map_request, result)
                 _publish_lifecycle_event(
                     map_request,
                     'assistant_message',
-                    content=result.get('agent_output', '地图制作完成'),
+                    content=final_message,
+                )
+                terminal_event = (
+                    'request_completed' if final_result.status == 'completed'
+                    else 'request_partial' if final_result.status == 'partial'
+                    else 'request_failed'
                 )
                 _publish_lifecycle_event(
                     map_request,
-                    'request_completed',
-                    message=result.get('agent_output', '地图制作完成'),
+                    terminal_event,
+                    message=final_message,
+                    completion_report=final_result.completion_report,
                 )
-                _publish_lifecycle_event(map_request, 'done', message=result.get('agent_output', '地图制作完成'))
+                _publish_lifecycle_event(
+                    map_request,
+                    'done',
+                    message=final_message,
+                    status=final_result.status,
+                    completion_report=final_result.completion_report,
+                )
 
                 return {
-                    'success': True,
-                    'message': '地图制作完成',
-                    'response': result.get('agent_output', '地图制作完成'),  # ✅ 只返回 agent_output 内容
+                    'success': final_result.status == 'completed',
+                    'status': final_result.status,
+                    'message': final_message,
+                    'response': final_message,
+                    'completion_report': final_result.completion_report,
                     'request_id': map_request.id,
                     'result': result
                 }
@@ -940,12 +1176,7 @@ def _process_with_map_llm(map_request):
         map_request.result_message = error_msg
         map_request.save()
 
-        ProcessLog.objects.create(
-            request=map_request,
-            level='error',
-            message=error_msg,
-            step='错误处理'
-        )
+        _record_error_event(map_request, run, error_msg, '错误处理')
 
         ChatMessage.objects.create(
             request=map_request,
@@ -1393,29 +1624,65 @@ def get_process_logs(request, request_id):
     try:
         map_request = get_object_or_404(MapRequest, id=request_id, user=request.user)
 
-        # 获取最新的日志
+        # Historical views may contain several adjustment runs.  Scope the
+        # log stream when the caller has selected a particular run so the log
+        # count and Trace count describe the same execution.
         since = request.GET.get('since')
+        run_id = request.GET.get('run_id')
+        selected_run = None
+        if run_id not in (None, ''):
+            try:
+                selected_run = MapRun.objects.filter(
+                    id=int(run_id), request=map_request
+                ).first()
+            except (TypeError, ValueError):
+                return JsonResponse({
+                    'success': False,
+                    'message': 'run_id 必须是整数'
+                }, status=400)
+            if selected_run is None:
+                return JsonResponse({
+                    'success': False,
+                    'message': '指定的执行记录不存在'
+                }, status=404)
+
         if since:
             try:
                 since_time = timezone.datetime.fromisoformat(since.replace('Z', '+00:00'))
-                logs = ProcessLog.objects.filter(
-                    request=map_request,
-                    created_at__gte=since_time
-                ).order_by('created_at')
+                logs = ProcessLog.objects.filter(request=map_request, created_at__gte=since_time)
             except ValueError:
-                logs = ProcessLog.objects.filter(request=map_request).order_by('created_at')
+                logs = ProcessLog.objects.filter(request=map_request)
         else:
-            logs = ProcessLog.objects.filter(request=map_request).order_by('created_at')
+            logs = ProcessLog.objects.filter(request=map_request)
+        if selected_run is not None:
+            logs = logs.filter(run=selected_run)
+        logs = logs.order_by('created_at', 'id')
 
+        run_context = _current_run_context(map_request)
         log_data = []
-        for log in logs:
+        for log in logs.select_related('run'):
+            log_context = (
+                {'run_id': log.run_id, 'trace_id': log.run.trace_id or None}
+                if log.run_id and log.run
+                else run_context
+            )
             log_data.append({
                 'id': log.id,
+                'event_id': log.event_id,
+                'event_seq': log.event_seq,
+                'event_type': log.event_type,
+                'phase': log.phase or log.step,
+                'parent_event_id': log.parent_event_id or None,
+                'status': 'error' if log.level == 'error' else log.status,
+                'duration_ms': log.duration_ms,
+                'has_details': bool(log.input_data or log.output_data or log.attributes or log.error is not None),
                 'level': log.level,
                 'message': log.message,
                 'step': log.step,
                 'progress': log.progress,
-                'created_at': log.created_at.isoformat()
+                'created_at': log.created_at.isoformat(),
+                'run_id': log_context['run_id'],
+                'trace_id': log_context['trace_id'],
             })
 
         return JsonResponse({
@@ -1435,9 +1702,10 @@ def get_process_logs(request, request_id):
 class DatabaseLogHandler(logging.Handler):
     """将日志写入数据库的处理器"""
 
-    def __init__(self, map_request):
+    def __init__(self, map_request, run=None):
         super().__init__()
         self.map_request = map_request
+        self.run = run
 
     def emit(self, record):
         try:
@@ -1459,13 +1727,13 @@ class DatabaseLogHandler(logging.Handler):
             # 解析Map-LLM特有的输出格式
             step, progress = self._parse_map_llm_message(message)
 
-            # 保存到数据库
-            ProcessLog.objects.create(
-                request=self.map_request,
+            _publish_process_log_event(
+                self.map_request,
+                message,
                 level=level,
-                message=message,
                 step=step,
-                progress=progress
+                progress=progress,
+                run=self.run,
             )
 
         except Exception:

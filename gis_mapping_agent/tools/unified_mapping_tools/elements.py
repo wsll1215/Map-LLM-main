@@ -180,7 +180,9 @@ class ElementOperationsMixin:
             text = params.get('text', '')
             fontsize = params.get('fontsize', 14)
 
-            position = params.get("position") or [0.5, 0.03]
+            position = params.get("position")
+            if position is None:
+                position = self._get_bottom_position()
             if not isinstance(position, (list, tuple)) or len(position) != 2:
                 position = [0.5, 0.03]
             position = [max(0.02, min(0.98, float(position[0]))), max(0.02, min(0.98, float(position[1])))]

@@ -1,4 +1,5 @@
 import { Circle, Fill, Stroke, Style, Text } from "ol/style";
+import type { FeatureLike } from "ol/Feature";
 import type { LayerPayload } from "../types/api";
 
 export function styleForLayer(layer: LayerPayload) {
@@ -17,6 +18,40 @@ export function styleForLayer(layer: LayerPayload) {
     stroke: new Stroke({ color: edgeColor, width: lineWidth }),
     image: new Circle({ radius: 5, fill: new Fill({ color: withAlpha(color, alpha) }), stroke: new Stroke({ color: edgeColor, width: 1 }) }),
     text: labelField ? new Text({ text: labelField, fill: new Fill({ color: "#172033" }), stroke: new Stroke({ color: "#fff", width: 3 }) }) : undefined,
+  });
+}
+
+export function styleColorForValue(
+  layer: Pick<LayerPayload, "style" | "render_spec">,
+  value: unknown,
+): string {
+  const spec = layer.render_spec;
+  if (!spec?.enabled) return stringValue(layer.style?.color) || "#2563eb";
+  if (value === null || value === undefined || value === "") return spec.no_data_color;
+  if (spec.kind === "categorical") {
+    return spec.value_colors?.[String(value)] || spec.no_data_color;
+  }
+  const breaks = spec.breaks || [];
+  const colors = spec.colors || [];
+  const number = Number(value);
+  if (!Number.isFinite(number) || breaks.length < 2 || colors.length === 0) return spec.no_data_color;
+  let index = 0;
+  while (index < breaks.length - 2 && number > breaks[index + 1]) index += 1;
+  return colors[Math.min(index, colors.length - 1)] || spec.no_data_color;
+}
+
+export function styleForFeature(layer: LayerPayload, feature: FeatureLike) {
+  const attribute = layer.render_spec?.attribute;
+  const value = attribute ? feature.get(attribute) : undefined;
+  const color = styleColorForValue(layer, value);
+  const style = layer.style || {};
+  const isPolygon = layer.geometry_type === "Polygon" || layer.geometry_type === "MultiPolygon";
+  const alpha = numberValue(style.alpha, 1);
+  const edgeColor = stringValue(style.edgecolor) || (isPolygon ? "#334155" : color);
+  return new Style({
+    fill: new Fill({ color: withAlpha(color, alpha) }),
+    stroke: new Stroke({ color: edgeColor, width: isPolygon ? Math.max(numberValue(style.linewidth, 1), 1.1) : Math.max(numberValue(style.linewidth, 1), 0.8) }),
+    image: new Circle({ radius: 5, fill: new Fill({ color: withAlpha(color, alpha) }), stroke: new Stroke({ color: edgeColor, width: 1 }) }),
   });
 }
 

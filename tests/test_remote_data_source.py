@@ -5,7 +5,12 @@ import requests
 import gis_mapping_agent.data_sources.remote as remote
 from gis_mapping_agent.data_sources.remote import (
     extract_location_query,
+    extract_remote_poi_request,
+    extract_remote_poi_query,
     fetch_remote_boundary,
+    fetch_remote_pois,
+    fetch_remote_roads,
+    fetch_remote_named_poi,
     fetch_remote_waterways,
     geocode_place,
     normalize_point_to_extent,
@@ -17,6 +22,41 @@ def test_extract_location_query_from_natural_language() -> None:
     assert extract_location_query("绘制燕山大学西校区的地图") == "燕山大学西校区"
     assert extract_location_query("绘制广东省的地图，要标定出广东省下的所有城市以及道路河流") == "广东省"
     assert extract_location_query("请绘制石家庄地图，显示行政区边界") == "石家庄"
+    assert extract_location_query("绘制北京的主要道路") == "北京"
+    assert extract_location_query("请显示秦皇岛铁路") == "秦皇岛"
+
+
+def test_extract_remote_poi_query_only_matches_batch_place_requests() -> None:
+    assert extract_remote_poi_query("标注出秦皇岛各大高校的位置") == "秦皇岛"
+    assert extract_remote_poi_query("显示石家庄高校分布") == "石家庄"
+    assert extract_remote_poi_query("标注清华大学的位置") is None
+
+
+def test_extract_remote_poi_request_supports_categories_without_hardcoding_places() -> None:
+    assert extract_remote_poi_request("标注出秦皇岛各大高校的位置") == {
+        "place": "秦皇岛",
+        "category": "universities",
+        "label": "高校",
+    }
+    assert extract_remote_poi_request("把小学画出来") == {
+        "place": None,
+        "category": "primary_schools",
+        "label": "小学",
+    }
+
+
+def test_extract_remote_poi_request_removes_generic_scope_words_for_every_category():
+    assert extract_remote_poi_request("标注秦皇岛所有小学的位置")["place"] == "秦皇岛"
+    assert extract_remote_poi_request("显示石家庄各个医院")["place"] == "石家庄"
+    assert extract_remote_poi_request("画北京所有公园")["place"] == "北京"
+
+
+def test_extract_remote_poi_request_preserves_named_institution():
+    assert extract_remote_poi_request("标注清华大学的位置") == {
+        "place": "清华大学",
+        "category": "universities",
+        "label": "高校",
+    }
 
 
 def test_fetch_remote_boundary_caches_geojson(tmp_path, monkeypatch) -> None:
@@ -102,6 +142,235 @@ def test_fetch_remote_waterways_caches_lines(tmp_path, monkeypatch) -> None:
     assert "waterway='river'][name]" in captured["data"]["data"]
 
 
+def test_fetch_remote_roads_caches_named_line_features(tmp_path, monkeypatch) -> None:
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "type": "way",
+                        "id": 99,
+                        "tags": {"highway": "primary", "name": "北京路"},
+                        "geometry": [
+                            {"lon": 116.3, "lat": 39.9},
+                            {"lon": 116.4, "lat": 39.95},
+                        ],
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.data_sources.remote.requests.post",
+        lambda *args, **kwargs: (captured.update(kwargs) or Response()),
+    )
+
+    path = fetch_remote_roads("北京", [115.4, 39.4, 117.4, 41.1], cache_dir=tmp_path)
+
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["features"][0]["geometry"]["type"] == "LineString"
+    assert payload["features"][0]["properties"]["name"] == "北京路"
+    assert "highway" in captured["data"]["data"]
+
+
+def test_fetch_remote_named_poi_uses_geocoded_name_instead_of_batch_query(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "gis_mapping_agent.data_sources.remote.geocode_place",
+        lambda query: (116.326, 40.003, query),
+    )
+
+    path = fetch_remote_named_poi("清华大学", category="universities", cache_dir=tmp_path)
+
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["features"][0]["geometry"]["coordinates"] == [116.326, 40.003]
+    assert payload["features"][0]["properties"]["name"] == "清华大学"
+
+
+def test_corrupt_remote_cache_is_not_reused(tmp_path, monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "type": "way",
+                        "id": 7,
+                        "tags": {"highway": "primary", "name": "新路"},
+                        "geometry": [
+                            {"lon": 120.1, "lat": 30.1},
+                            {"lon": 120.2, "lat": 30.2},
+                        ],
+                    }
+                ]
+            }
+
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return Response()
+
+    monkeypatch.setattr("gis_mapping_agent.data_sources.remote.requests.post", post)
+    first = fetch_remote_roads("甲市", [120, 30, 121, 31], cache_dir=tmp_path)
+    assert first is not None
+    first.write_text("not geojson", encoding="utf-8")
+
+    second = fetch_remote_roads("甲市", [120, 30, 121, 31], cache_dir=tmp_path)
+
+    assert second is not None
+    assert len(calls) >= 2
+    assert json.loads(second.read_text(encoding="utf-8"))["features"][0]["properties"]["name"] == "新路"
+
+
+def test_remote_request_timeout_is_capped_and_failure_is_typed(monkeypatch) -> None:
+    timeouts = []
+
+    def post(url, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        raise requests.Timeout("upstream timeout")
+
+    monkeypatch.setattr(remote.requests, "post", post)
+    monkeypatch.setattr(remote.time, "sleep", lambda _: None)
+
+    try:
+        remote._request_with_retries(
+            "POST", "https://overpass.example", timeout=60
+        )
+    except remote.RemoteDataSourceError as exc:
+        assert exc.error_code == "network_error"
+        assert exc.retryable is True
+    else:
+        raise AssertionError("expected typed network failure")
+
+    assert timeouts
+    assert max(timeouts) <= remote.REMOTE_HTTP_TIMEOUT_SECONDS
+
+
+def test_fetch_remote_pois_caches_named_point_features(tmp_path, monkeypatch) -> None:
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "type": "node",
+                        "id": 11,
+                        "lat": 39.9,
+                        "lon": 119.5,
+                        "tags": {"amenity": "university", "name": "燕山大学"},
+                    },
+                    {
+                        "type": "way",
+                        "id": 12,
+                        "center": {"lat": 39.95, "lon": 119.55},
+                        "tags": {"amenity": "college", "name": "示例学院"},
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.data_sources.remote.requests.post",
+        lambda *args, **kwargs: (captured.update(kwargs) or Response()),
+    )
+
+    path = fetch_remote_pois("秦皇岛", [119.2, 39.7, 119.8, 40.1], cache_dir=tmp_path)
+
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert [feature["properties"]["name"] for feature in payload["features"]] == [
+        "燕山大学",
+        "示例学院",
+    ]
+    assert payload["features"][0]["geometry"] == {"type": "Point", "coordinates": [119.5, 39.9]}
+    assert "amenity" in captured["data"]["data"]
+
+
+def test_fetch_remote_pois_retries_transient_network_failure(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "type": "node",
+                        "id": 11,
+                        "lat": 39.9,
+                        "lon": 119.5,
+                        "tags": {"amenity": "university", "name": "燕山大学"},
+                    }
+                ]
+            }
+
+    def post(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.RequestException("temporary network failure")
+        return Response()
+
+    monkeypatch.setattr(remote, "OVERPASS_ENDPOINTS", ("https://overpass.example",))
+    monkeypatch.setattr(remote.requests, "post", post)
+    monkeypatch.setattr(remote.time, "sleep", lambda _: None)
+
+    path = fetch_remote_pois("秦皇岛", [119.2, 39.7, 119.8, 40.1], cache_dir=tmp_path)
+
+    assert path is not None
+    assert calls == ["https://overpass.example", "https://overpass.example"]
+
+
+def test_fetch_remote_pois_filters_primary_school_category(tmp_path, monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "type": "node",
+                        "id": 1,
+                        "lat": 39.9,
+                        "lon": 119.5,
+                        "tags": {"amenity": "school", "school": "primary", "name": "第一小学"},
+                    },
+                    {
+                        "type": "node",
+                        "id": 2,
+                        "lat": 39.91,
+                        "lon": 119.51,
+                        "tags": {"amenity": "school", "school": "secondary", "name": "第二中学"},
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(remote.requests, "post", lambda *args, **kwargs: Response())
+
+    path = fetch_remote_pois(
+        "秦皇岛",
+        [119.2, 39.7, 119.8, 40.1],
+        cache_dir=tmp_path,
+        category="primary_schools",
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert [feature["properties"]["name"] for feature in payload["features"]] == ["第一小学"]
+
+
 def test_fetch_remote_waterways_retries_configured_overpass_endpoints(tmp_path, monkeypatch) -> None:
     calls = []
 
@@ -125,17 +394,43 @@ def test_fetch_remote_waterways_retries_configured_overpass_endpoints(tmp_path, 
 
     def post(url, **kwargs):
         calls.append(url)
-        if len(calls) == 1:
+        if len(calls) <= remote.REMOTE_MAX_ATTEMPTS:
             raise requests.RequestException("first endpoint unavailable")
         return Response()
 
     monkeypatch.setattr(remote, "OVERPASS_ENDPOINTS", ("https://first.example", "https://second.example"))
     monkeypatch.setattr(remote.requests, "post", post)
+    monkeypatch.setattr(remote.time, "sleep", lambda _: None)
 
     path = fetch_remote_waterways("广东省", [109.6, 20.2, 117.4, 25.6], cache_dir=tmp_path)
 
     assert path is not None
-    assert calls == ["https://first.example", "https://second.example"]
+    assert calls == [
+        "https://first.example",
+        "https://first.example",
+        "https://first.example",
+        "https://second.example",
+    ]
+
+
+def test_fetch_remote_waterways_reports_network_failure_as_typed_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(remote, "OVERPASS_ENDPOINTS", ("https://overpass.example",))
+    monkeypatch.setattr(
+        remote.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(requests.Timeout("offline")),
+    )
+    monkeypatch.setattr(remote.time, "sleep", lambda _: None)
+
+    try:
+        fetch_remote_waterways(
+            "北京", [115.4, 39.4, 117.4, 41.1], cache_dir=tmp_path, timeout=1
+        )
+    except remote.RemoteDataSourceError as exc:
+        assert exc.error_code == "network_error"
+        assert exc.retryable is True
+    else:
+        raise AssertionError("expected typed network failure")
 
 
 def test_normalize_point_to_extent_preserves_real_location() -> None:

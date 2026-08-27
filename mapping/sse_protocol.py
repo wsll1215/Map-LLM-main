@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, DefaultDict, Dict, List, Optional, Tuple
 
 
-TERMINAL_EVENTS = {"done", "request_completed", "request_failed", "request_needs_clarification"}
+TERMINAL_EVENTS = {
+    "done",
+    "request_completed",
+    "request_partial",
+    "request_failed",
+    "request_needs_clarification",
+}
 
 
 def format_sse_event(*, event_id: str, event_name: str, payload: Dict[str, Any]) -> str:
@@ -121,8 +127,12 @@ class RedisStreamBroker:
             client.expire(stream_key, self.ttl_seconds)
             return str(event_id)
         except Exception:
-            # Publishing is best-effort and must never break map generation.
-            return ""
+            # Keep the task observable when Redis is unavailable. The fallback
+            # uses the same event contract and is consumed by the SSE view.
+            fallback = dict(payload)
+            fallback.setdefault("transport_status", "degraded")
+            fallback.setdefault("transport_error", "Redis 实时通道不可用，已降级为本地事件队列")
+            return get_default_broker().publish_sync(request_key, event_name, fallback)
 
     async def subscribe(
         self, request_key: str, after_id: Optional[str] = None
@@ -151,7 +161,10 @@ class RedisStreamBroker:
             finally:
                 await client.aclose()
         except Exception:
-            return
+            async for event in get_default_broker().subscribe(
+                request_key, after_id=after_id
+            ):
+                yield event
 
 
 _default_broker = InMemoryEventBroker()

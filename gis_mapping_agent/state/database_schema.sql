@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS layers (
     extent TEXT,
     render_mode TEXT DEFAULT 'geojson',
     data_url TEXT,
+    render_spec TEXT,
+    data_source_meta TEXT,
     
     -- 时间戳
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

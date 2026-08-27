@@ -1,23 +1,53 @@
 """Dataset discovery and acquisition integrations."""
 
-from .catalog import DatasetDescriptor, LocalDatasetCatalog
-from .planner import SemanticLayerPlan, plan_local_sources
+from .catalog import DatasetDescriptor, DjangoDatasetCatalog, LocalDatasetCatalog
+from .planner import (
+    Intent,
+    LayerIntent,
+    LocationResolution,
+    PlannedSource,
+    SemanticLayerPlan,
+    SourcePlan,
+    parse_intent,
+    plan_local_sources,
+    plan_sources,
+    resolve_local_location,
+)
 from .remote import (
     extract_location_query,
+    extract_remote_poi_request,
+    extract_remote_poi_query,
     fetch_remote_boundary,
+    fetch_remote_pois,
+    fetch_remote_roads,
     fetch_remote_waterways,
     geocode_place,
     normalize_point_to_extent,
+    RemoteDataSourceError,
 )
 
 __all__ = [
     "DatasetDescriptor",
+    "DjangoDatasetCatalog",
     "LocalDatasetCatalog",
+    "Intent",
+    "LayerIntent",
+    "LocationResolution",
+    "PlannedSource",
     "SemanticLayerPlan",
+    "SourcePlan",
+    "parse_intent",
     "plan_local_sources",
+    "plan_sources",
+    "resolve_local_location",
     "extract_location_query",
+    "extract_remote_poi_request",
+    "extract_remote_poi_query",
     "fetch_remote_boundary",
+    "fetch_remote_pois",
+    "fetch_remote_roads",
     "fetch_remote_waterways",
     "geocode_place",
     "normalize_point_to_extent",
+    "RemoteDataSourceError",
 ]

@@ -3,6 +3,16 @@ from pathlib import Path
 from gis_mapping_agent.tools.unified_mapping_tools import UnifiedMappingTools
 
 
+def test_init_map_without_verified_extent_does_not_use_global_default() -> None:
+    tools = UnifiedMappingTools()
+
+    result = tools.init_map({"title": "未指定地点"})
+
+    assert result["success"] is False
+    assert result["error_code"] == "clarification_required"
+    assert result["next_action"] == "provide_location"
+
+
 def test_layer_data_replaces_global_init_extent(tmp_path) -> None:
     tools = UnifiedMappingTools()
     initialized = tools.init_map({"title": "北京地图", "extent": [-180, -90, 180, 90]})

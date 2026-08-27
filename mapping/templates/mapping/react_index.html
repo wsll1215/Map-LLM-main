@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,">
   <title>智能制图工作台 - Map-LLM</title>
-  {% if not debug %}<link rel="stylesheet" href="{% static 'frontend/assets/app.css' %}">{% endif %}
+  {% if not debug %}<link rel="stylesheet" href="{% static 'frontend/assets/app.css' %}?v=20260826-02">{% endif %}
 </head>
 <body><div id="root"></div>
 {% if debug %}
@@ -17,6 +17,6 @@
 </script>
 <script type="module" src="{{ vite_dev_server_url }}/static/frontend/@vite/client"></script>
 <script type="module" src="{{ vite_dev_server_url }}/static/frontend/src/main.tsx"></script>
-{% else %}<script type="module" src="{% static 'frontend/assets/app.js' %}"></script>{% endif %}
+{% else %}<script type="module" src="{% static 'frontend/assets/app.js' %}?v=20260826-02"></script>{% endif %}
 </body>
 </html>

@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from langchain_core.callbacks import CallbackManagerForToolRun
 
-from .base import BaseGISTool, GISToolOutput
+from .base import BaseGISTool, GISToolOutput, tool_failure
 from ..models.schemas import MapState, ModificationRecord
 from ..state import get_state_manager
 from ..adjustment import get_modification_engine
@@ -39,7 +39,10 @@ class LoadMapStateTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message=f"未找到会话 {input_data.session_id} 的状态",
-                    data={}
+                    data={},
+                    error_code="resource_not_found",
+                    recoverable=True,
+                    next_action="select_valid_resource",
                 )
             
             # 更新当前地图状态
@@ -57,11 +60,7 @@ class LoadMapStateTool(BaseGISTool):
             )
             
         except Exception as e:
-            return GISToolOutput(
-                success=False,
-                message=f"加载地图状态失败: {str(e)}",
-                data={}
-            )
+            return tool_failure(f"加载地图状态失败: {str(e)}", e)
 
 
 class SaveMapStateInput(BaseModel):
@@ -87,7 +86,10 @@ class SaveMapStateTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message="没有可保存的地图状态",
-                    data={}
+                    data={},
+                    error_code="state_error",
+                    recoverable=True,
+                    next_action="load_or_create_map_state",
                 )
             
             # 更新会话名称
@@ -114,11 +116,7 @@ class SaveMapStateTool(BaseGISTool):
                 )
                 
         except Exception as e:
-            return GISToolOutput(
-                success=False,
-                message=f"保存地图状态失败: {str(e)}",
-                data={}
-            )
+            return tool_failure(f"保存地图状态失败: {str(e)}", e)
 
 
 class ApplyModificationInput(BaseModel):
@@ -146,7 +144,10 @@ class ApplyModificationTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message="没有可修改的地图状态，请先创建或加载地图",
-                    data={}
+                    data={},
+                    error_code="state_error",
+                    recoverable=True,
+                    next_action="load_or_create_map_state",
                 )
             
             modification_engine = get_modification_engine()
@@ -165,7 +166,10 @@ class ApplyModificationTool(BaseGISTool):
                     data={
                         "requires_confirmation": True,
                         "analysis": analysis.model_dump()
-                    }
+                    },
+                    error_code="confirmation_required",
+                    recoverable=True,
+                    next_action="ask_user",
                 )
             
             # 检查是否需要澄清
@@ -176,7 +180,10 @@ class ApplyModificationTool(BaseGISTool):
                     data={
                         "requires_clarification": True,
                         "analysis": analysis.model_dump()
-                    }
+                    },
+                    error_code="clarification_required",
+                    recoverable=True,
+                    next_action="ask_user",
                 )
             
             # 生成标准修改补丁
@@ -186,7 +193,10 @@ class ApplyModificationTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message="无法理解修改请求，请提供更具体的描述",
-                    data={"analysis": analysis.model_dump()}
+                    data={"analysis": analysis.model_dump()},
+                    error_code="intent_unclear",
+                    recoverable=True,
+                    next_action="reclassify_request",
                 )
 
             state_manager = get_state_manager() if input_data.auto_save else None
@@ -229,6 +239,18 @@ class ApplyModificationTool(BaseGISTool):
                 result_data["diff"] = result.diff
                 if state_manager:
                     state_manager.save_state(new_state)
+
+                if not render_result.get("success", False):
+                    return GISToolOutput(
+                        success=False,
+                        message="修改已保存，但地图渲染失败",
+                        data=result_data,
+                        map_state=new_state,
+                        error_code="render_error",
+                        recoverable=True,
+                        retryable=True,
+                        next_action="retry_render",
+                    )
             
             return GISToolOutput(
                 success=True,
@@ -237,11 +259,7 @@ class ApplyModificationTool(BaseGISTool):
             )
             
         except Exception as e:
-            return GISToolOutput(
-                success=False,
-                message=f"应用修改失败: {str(e)}",
-                data={}
-            )
+            return tool_failure(f"应用修改失败: {str(e)}", e)
 
 
 class UndoModificationInput(BaseModel):
@@ -267,7 +285,10 @@ class UndoModificationTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message="没有可撤销的地图状态",
-                    data={}
+                    data={},
+                    error_code="state_error",
+                    recoverable=True,
+                    next_action="load_or_create_map_state",
                 )
             
             state_manager = get_state_manager()
@@ -282,7 +303,10 @@ class UndoModificationTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message="已经是最早版本，无法撤销",
-                    data={}
+                    data={},
+                    error_code="state_error",
+                    recoverable=True,
+                    next_action="load_or_create_map_state",
                 )
             
             # 更新当前状态
@@ -301,11 +325,7 @@ class UndoModificationTool(BaseGISTool):
             )
             
         except Exception as e:
-            return GISToolOutput(
-                success=False,
-                message=f"撤销修改失败: {str(e)}",
-                data={}
-            )
+            return tool_failure(f"撤销修改失败: {str(e)}", e)
 
 
 class RenderMapInput(BaseModel):
@@ -332,7 +352,10 @@ class RenderMapTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message="没有可渲染的地图状态",
-                    data={}
+                    data={},
+                    error_code="state_error",
+                    recoverable=True,
+                    next_action="load_or_create_map_state",
                 )
             
             renderer = get_map_renderer()
@@ -356,15 +379,15 @@ class RenderMapTool(BaseGISTool):
                 return GISToolOutput(
                     success=False,
                     message=result.get("message", "渲染失败"),
-                    data={}
+                    data={},
+                    error_code="render_error",
+                    recoverable=True,
+                    retryable=True,
+                    next_action="retry_render",
                 )
                 
         except Exception as e:
-            return GISToolOutput(
-                success=False,
-                message=f"渲染地图失败: {str(e)}",
-                data={}
-            )
+            return tool_failure(f"渲染地图失败: {str(e)}", e)
 
 
 # 对话工具列表

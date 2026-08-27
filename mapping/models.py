@@ -6,9 +6,14 @@ from django.utils import timezone
 import json
 import os
 import shutil
+import uuid
 from pathlib import Path
 
 User = get_user_model()
+
+
+def _new_trace_event_id():
+    return f"evt_{uuid.uuid4().hex}"
 
 
 class MapRequest(models.Model):
@@ -19,6 +24,7 @@ class MapRequest(models.Model):
         ('processing', '处理中'),
         ('needs_clarification', '等待补充信息'),
         ('completed', '已完成'),
+        ('partial', '部分完成'),
         ('failed', '失败'),
     ]
     
@@ -34,6 +40,7 @@ class MapRequest(models.Model):
     result_message = models.TextField(verbose_name='处理结果消息', blank=True)
     error_message = models.TextField(verbose_name='错误信息', blank=True)
     clarification_data = models.JSONField(default=dict, verbose_name='澄清信息', blank=True)
+    completion_report = models.JSONField(default=dict, verbose_name='完成报告', blank=True)
     
     # 时间戳
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
@@ -55,6 +62,14 @@ class MapRequest(models.Model):
     def get_config(self):
         """获取地图配置"""
         return self.map_config
+
+    def save(self, *args, **kwargs):
+        """Keep the persisted completion report compatible with its NOT NULL contract."""
+        if self.completion_report is None:
+            self.completion_report = {}
+            if kwargs.get('update_fields') is not None:
+                kwargs['update_fields'] = set(kwargs['update_fields']) | {'completion_report'}
+        return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         """删除模型时同时删除会话文件和生成的地图"""
@@ -94,6 +109,7 @@ class MapRun(models.Model):
     STATUS_RUNNING = 'running'
     STATUS_AWAITING_INPUT = 'awaiting_input'
     STATUS_COMPLETED = 'completed'
+    STATUS_PARTIAL = 'partial'
     STATUS_FAILED = 'failed'
     STATUS_CANCEL_REQUESTED = 'cancel_requested'
     STATUS_CANCELLED = 'cancelled'
@@ -103,6 +119,7 @@ class MapRun(models.Model):
         (STATUS_RUNNING, '处理中'),
         (STATUS_AWAITING_INPUT, '等待补充信息'),
         (STATUS_COMPLETED, '已完成'),
+        (STATUS_PARTIAL, '部分完成'),
         (STATUS_FAILED, '失败'),
         (STATUS_CANCEL_REQUESTED, '取消中'),
         (STATUS_CANCELLED, '已取消'),
@@ -113,12 +130,14 @@ class MapRun(models.Model):
         STATUS_RUNNING: {
             STATUS_AWAITING_INPUT,
             STATUS_COMPLETED,
+            STATUS_PARTIAL,
             STATUS_FAILED,
             STATUS_CANCEL_REQUESTED,
         },
         STATUS_AWAITING_INPUT: set(),
         STATUS_CANCEL_REQUESTED: {STATUS_CANCELLED, STATUS_FAILED},
         STATUS_COMPLETED: set(),
+        STATUS_PARTIAL: set(),
         STATUS_FAILED: set(),
         STATUS_CANCELLED: set(),
     }
@@ -153,6 +172,7 @@ class MapRun(models.Model):
     finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
     error_code = models.CharField(max_length=100, blank=True, verbose_name='错误代码')
     error_message = models.TextField(blank=True, verbose_name='错误信息')
+    completion_report = models.JSONField(default=dict, blank=True, verbose_name='完成报告')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -170,7 +190,7 @@ class MapRun(models.Model):
     def __str__(self):
         return f'Run {self.pk} for request {self.request_id} ({self.status})'
 
-    def transition_to(self, status, *, error_code=None, error_message=None):
+    def transition_to(self, status, *, error_code=None, error_message=None, completion_report=None):
         """执行受约束的状态变更，并记录运行时间。"""
         if self.pk is None:
             raise ValueError('MapRun must be saved before changing status')
@@ -190,6 +210,7 @@ class MapRun(models.Model):
             update_fields.update({'started_at', 'heartbeat_at'})
         elif status in {
             self.STATUS_COMPLETED,
+            self.STATUS_PARTIAL,
             self.STATUS_AWAITING_INPUT,
             self.STATUS_FAILED,
             self.STATUS_CANCELLED,
@@ -203,6 +224,9 @@ class MapRun(models.Model):
         if error_message is not None:
             self.error_message = error_message
             update_fields.add('error_message')
+        if completion_report is not None:
+            self.completion_report = completion_report
+            update_fields.add('completion_report')
         self.save(update_fields=update_fields)
 
 
@@ -377,17 +401,47 @@ class ProcessLog(models.Model):
     ]
 
     request = models.ForeignKey(MapRequest, on_delete=models.CASCADE, related_name='process_logs', verbose_name='关联请求')
+    run = models.ForeignKey(
+        MapRun,
+        on_delete=models.SET_NULL,
+        related_name='process_logs',
+        null=True,
+        blank=True,
+        verbose_name='关联运行',
+    )
     level = models.CharField(max_length=20, choices=LOG_LEVELS, default='info', verbose_name='日志级别')
     message = models.TextField(verbose_name='日志消息')
     step = models.CharField(max_length=100, verbose_name='处理步骤', blank=True)
     progress = models.PositiveIntegerField(verbose_name='进度百分比', null=True, blank=True)
+
+    # Structured trace fields. The legacy message/step fields remain the
+    # compatibility projection used by the existing log endpoint.
+    event_id = models.CharField(max_length=80, unique=True, default=_new_trace_event_id)
+    event_seq = models.PositiveIntegerField(default=0, verbose_name='Trace序号')
+    trace_id = models.CharField(max_length=255, blank=True, verbose_name='Trace ID')
+    parent_event_id = models.CharField(max_length=80, blank=True, verbose_name='父事件ID')
+    event_type = models.CharField(max_length=40, default='process_log', verbose_name='事件类型')
+    phase = models.CharField(max_length=60, blank=True, verbose_name='业务阶段')
+    actor = models.CharField(max_length=40, default='system', verbose_name='执行者')
+    status = models.CharField(max_length=30, default='success', verbose_name='事件状态')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+    duration_ms = models.PositiveIntegerField(null=True, blank=True, verbose_name='耗时毫秒')
+    input_data = models.JSONField(default=dict, blank=True, verbose_name='结构化输入')
+    output_data = models.JSONField(default=dict, blank=True, verbose_name='结构化输出')
+    attributes = models.JSONField(default=dict, blank=True, verbose_name='事件属性')
+    error = models.JSONField(null=True, blank=True, default=None, verbose_name='结构化错误')
 
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
 
     class Meta:
         verbose_name = '处理日志'
         verbose_name_plural = '处理日志'
-        ordering = ['created_at']
+        ordering = ['created_at', 'id']
+        indexes = [
+            models.Index(fields=['run', 'event_seq']),
+            models.Index(fields=['run', 'event_type', 'status']),
+        ]
 
     def __str__(self):
         return f"{self.get_level_display()}: {self.message[:50]}..."

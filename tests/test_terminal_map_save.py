@@ -44,7 +44,7 @@ def test_map_save_records_output_path(tmp_path):
     assert Path(tools.current_map_state.output_path).exists()
 
 
-def test_terminal_tool_result_does_not_log_create_complete(monkeypatch):
+def test_underspecified_request_does_not_log_create_complete(monkeypatch):
     agent = ThinkingGISMappingAgent.__new__(ThinkingGISMappingAgent)
     agent.logger = _FakeLogger()
     agent.save_tool = None
@@ -65,6 +65,7 @@ def test_terminal_tool_result_does_not_log_create_complete(monkeypatch):
     monkeypatch.setattr(agent, "_get_final_map_state", lambda: None)
 
     result = agent.create_map("保存地图")
-
-    assert result["success"]
+    assert result["success"] is False
+    assert result["status"] == "needs_clarification"
+    assert result["error_code"] == "clarification_required"
     assert "地图创建完成" not in agent.logger.info_messages

@@ -35,3 +35,14 @@ def test_guangdong_request_does_not_use_wuhan_river_dataset():
 
     assert plan.river_path is None
     assert "未找到可用的河流数据" in plan.issues
+
+
+def test_remote_boundary_can_be_used_as_the_base_for_fallback_layers():
+    plan = plan_local_sources(
+        "绘制石家庄的地图，要显示道路",
+        boundary_path="data_cache/remote_boundaries/shijiazhuang.geojson",
+    )
+
+    assert plan.boundary_path == "data_cache/remote_boundaries/shijiazhuang.geojson"
+    assert "boundary" in plan.requested_roles
+    assert "road" in plan.requested_roles

@@ -2,7 +2,11 @@ import { useEffect, useRef } from "react";
 import { mappingApi } from "../api/mappingApi";
 import type { MapRequestSummary } from "../types/api";
 
-const TERMINAL = new Set<MapRequestSummary["status"]>(["completed", "needs_clarification", "failed"]);
+const TERMINAL = new Set<MapRequestSummary["status"]>(["completed", "partial", "needs_clarification", "failed"]);
+
+export function isTerminalTaskStatus(status: MapRequestSummary["status"]): boolean {
+  return TERMINAL.has(status);
+}
 
 export function useTaskStatus(
   requestId: number | null,
@@ -29,7 +33,7 @@ export function useTaskStatus(
           clarification: task.clarification,
           traceId: task.latest_run?.trace_id || null,
         });
-        if (!TERMINAL.has(task.status)) timer = window.setTimeout(() => void poll(), 2000);
+        if (!isTerminalTaskStatus(task.status)) timer = window.setTimeout(() => void poll(), 2000);
       } catch (error) {
         if (cancelled) return;
         dispatchRef.current({ type: "task_status_error", message: error instanceof Error ? error.message : "任务状态同步失败" });

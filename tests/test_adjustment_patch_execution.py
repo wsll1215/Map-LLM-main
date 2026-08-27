@@ -147,3 +147,108 @@ def test_chinese_layer_alias_style_request_generates_patch():
     assert patch.operations[0].action == "style_layer"
     assert patch.operations[0].target == "Railway"
     assert patch.operations[0].parameters["color"] == "#FF0000"
+
+
+def test_batch_poi_request_routes_to_remote_point_layer(monkeypatch):
+    state = make_state()
+    mocked_analysis = IntentAnalysisV2(
+        request="标注出秦皇岛各大高校的位置",
+        intent="add_annotation",
+        target="秦皇岛各大高校",
+        confidence=0.9,
+    )
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.adjustment.engine.get_intent_classifier_v2",
+        lambda: type(
+            "Classifier",
+            (),
+            {
+                "classify_intent": lambda self, request, current_state: mocked_analysis,
+                "validate_intent_with_state": lambda self, analysis, current_state: analysis,
+            },
+        )(),
+    )
+
+    analysis = ModificationEngine().analyze_modification_request(
+        "标注出秦皇岛各大高校的位置", state
+    )
+    patch = ModificationEngine().generate_modification_plan(analysis)
+
+    assert analysis.intent == "add_layer"
+    assert analysis.layer_name == "秦皇岛高校"
+    assert analysis.source == "remote_poi://universities/秦皇岛"
+    assert patch.operations[0].action == "add_layer"
+    assert patch.operations[0].parameters["source"] == "remote_poi://universities/秦皇岛"
+
+
+def test_remote_poi_patch_loads_cached_geojson_as_point_layer(tmp_path, monkeypatch):
+    source_path = tmp_path / "universities.geojson"
+    source_path.write_text(
+        '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"燕山大学"},"geometry":{"type":"Point","coordinates":[119.5,39.9]}}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "gis_mapping_agent.adjustment.engine.fetch_remote_pois",
+        lambda place, bbox, category="universities": source_path,
+    )
+
+    patch = AdjustmentPatch(
+        operations=[
+            PatchOperation(
+                action="add_layer",
+                target="秦皇岛高校",
+                parameters={"source": "remote_poi://universities/秦皇岛"},
+            )
+        ]
+    )
+
+    new_state, records = ModificationEngine().apply_modifications(make_state(), patch, "标注高校")
+
+    assert len(records) == 1
+    assert new_state.layers[-1].name == "秦皇岛高校"
+    assert new_state.layers[-1].geometry_type.value == "point"
+    assert new_state.layers[-1].data_source == str(source_path)
+
+
+def test_batch_poi_request_uses_deterministic_route_when_llm_fails(monkeypatch):
+    state = make_state()
+    monkeypatch.setattr(
+        "gis_mapping_agent.adjustment.engine.get_intent_classifier_v2",
+        lambda: (_ for _ in ()).throw(RuntimeError("LLM unavailable")),
+    )
+
+    analysis = ModificationEngine().analyze_modification_request(
+        "标注出秦皇岛各大高校的位置", state
+    )
+
+    assert analysis.intent == "add_layer"
+    assert analysis.source == "remote_poi://universities/秦皇岛"
+
+
+def test_generic_poi_request_uses_current_map_place_when_request_omits_place(monkeypatch):
+    state = make_state()
+    state.config.title = "秦皇岛市地图"
+    mocked_analysis = IntentAnalysisV2(
+        request="把小学画出来",
+        intent="add_annotation",
+        target="小学",
+        confidence=0.9,
+    )
+    monkeypatch.setattr(
+        "gis_mapping_agent.adjustment.engine.get_intent_classifier_v2",
+        lambda: type(
+            "Classifier",
+            (),
+            {
+                "classify_intent": lambda self, request, current_state: mocked_analysis,
+                "validate_intent_with_state": lambda self, analysis, current_state: analysis,
+            },
+        )(),
+    )
+
+    analysis = ModificationEngine().analyze_modification_request("把小学画出来", state)
+
+    assert analysis.intent == "add_layer"
+    assert analysis.layer_name == "秦皇岛市小学"
+    assert analysis.source == "remote_poi://primary_schools/秦皇岛市"

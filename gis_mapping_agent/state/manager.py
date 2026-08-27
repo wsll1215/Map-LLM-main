@@ -77,7 +77,21 @@ class MapStateManager:
         cursor.execute("PRAGMA table_info(map_states)")
         existing_map_state_columns = {row[1] for row in cursor.fetchall()}
         map_state_columns = {
+            "title": "TEXT",
+            "extent": "TEXT",
+            "crs": "TEXT DEFAULT 'EPSG:4326'",
+            "background_color": "TEXT DEFAULT 'white'",
+            "figsize": "TEXT",
+            "dpi": "INTEGER DEFAULT 300",
+            "maintain_data_aspect": "INTEGER DEFAULT 0",
+            "fit_figsize_to_extent": "INTEGER DEFAULT 0",
+            "auto_legend": "INTEGER DEFAULT 1",
+            "auto_scalebar": "INTEGER DEFAULT 1",
+            "auto_compass": "INTEGER DEFAULT 1",
+            "scalebar": "TEXT",
+            "compass": "TEXT",
             "output_path": "TEXT",
+            "is_generalization_task": "INTEGER DEFAULT 0",
             "generalization_algorithm": "TEXT",
             "generalization_params": "TEXT",
             "generalization_input_path": "TEXT",
@@ -89,19 +103,45 @@ class MapStateManager:
             "spec_hash": "TEXT",
             "source_fingerprints": "TEXT",
             "latest_event_seq": "INTEGER DEFAULT 0",
+            "generalization_result": "TEXT",
+            "parent_version": "INTEGER",
+            "description": "TEXT DEFAULT ''",
+            "is_current": "INTEGER DEFAULT 1",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
         }
         for column, column_type in map_state_columns.items():
             if column not in existing_map_state_columns:
                 cursor.execute(f"ALTER TABLE map_states ADD COLUMN {column} {column_type}")
 
+        cursor.execute("PRAGMA table_info(sessions)")
+        existing_session_columns = {row[1] for row in cursor.fetchall()}
+        session_columns = {
+            "session_name": "TEXT",
+            "created_at": "TEXT",
+            "last_accessed": "TEXT",
+            "current_version": "INTEGER DEFAULT 1",
+        }
+        for column, column_type in session_columns.items():
+            if column not in existing_session_columns:
+                cursor.execute(f"ALTER TABLE sessions ADD COLUMN {column} {column_type}")
+
         cursor.execute("PRAGMA table_info(layers)")
         existing_layer_columns = {row[1] for row in cursor.fetchall()}
         layer_columns = {
+            "data_source": "TEXT",
+            "geometry_type": "TEXT",
+            "style": "TEXT",
+            "label_column": "TEXT",
+            "label_style": "TEXT",
+            "visible": "INTEGER DEFAULT 1",
             "data_hash": "TEXT",
             "feature_count": "INTEGER DEFAULT 0",
             "extent": "TEXT",
             "render_mode": "TEXT DEFAULT 'geojson'",
             "data_url": "TEXT",
+            "render_spec": "TEXT",
+            "data_source_meta": "TEXT",
         }
         for column, column_type in layer_columns.items():
             if column not in existing_layer_columns:
@@ -183,6 +223,8 @@ class MapStateManager:
                 extent TEXT,
                 render_mode TEXT DEFAULT 'geojson',
                 data_url TEXT,
+                render_spec TEXT,
+                data_source_meta TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (state_id) REFERENCES map_states(id) ON DELETE CASCADE
             )
@@ -373,6 +415,9 @@ class MapStateManager:
                 'hatch': layer.style.hatch if layer.style else None,
                 'attribute_column': layer.style.attribute_column if layer.style else None,
                 'label_column': layer.style.label_column if layer.style else None,
+                'classification_method': layer.style.classification_method if layer.style else 'quantile',
+                'classification_classes': layer.style.classification_classes if layer.style else 5,
+                'no_data_color': layer.style.no_data_color if layer.style else '#CBD5E1',
             }) if layer.style else None
 
             # label_column 直接从 layer 获取（不是从 label_style）
@@ -399,7 +444,8 @@ class MapStateManager:
                     state_id, layer_id, name, data_source, geometry_type,
                     style, label_column, label_style, visible, z_order,
                     data_hash, feature_count, extent, render_mode, data_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    , render_spec, data_source_meta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 state_id,
                 layer.layer_id,
@@ -416,6 +462,8 @@ class MapStateManager:
                 json.dumps(layer.extent) if layer.extent else None,
                 layer.render_mode,
                 layer.data_url,
+                json.dumps(layer.render_spec, ensure_ascii=False) if layer.render_spec else None,
+                json.dumps(layer.data_source_meta, ensure_ascii=False) if layer.data_source_meta else None,
             ))
 
     def _insert_annotations(self, cursor, state_id: int, annotations: List):
@@ -560,7 +608,10 @@ class MapStateManager:
             layer = LayerConfig(
                 layer_id=layer_row['layer_id'],
                 name=layer_row['name'],
-                data_source=layer_row['data_source'],
+                # Very old states did not persist a source path. Keep the
+                # snapshot loadable and let the data endpoint report the
+                # missing source explicitly instead of dropping the whole map.
+                data_source=layer_row['data_source'] or f"legacy://{layer_row['layer_id']}",
                 geometry_type=GeometryType(layer_row['geometry_type']) if layer_row['geometry_type'] else GeometryType.POLYGON,
                 style=LayerStyle(**style_dict) if style_dict else LayerStyle(),
                 visible=bool(layer_row['visible']),
@@ -569,6 +620,16 @@ class MapStateManager:
                 extent=json.loads(self._row_get(layer_row, 'extent')) if self._row_get(layer_row, 'extent') else None,
                 render_mode=self._row_get(layer_row, 'render_mode', 'geojson') or 'geojson',
                 data_url=self._row_get(layer_row, 'data_url'),
+                data_source_meta=(
+                    json.loads(self._row_get(layer_row, 'data_source_meta'))
+                    if self._row_get(layer_row, 'data_source_meta')
+                    else None
+                ),
+                render_spec=(
+                    json.loads(self._row_get(layer_row, 'render_spec'))
+                    if self._row_get(layer_row, 'render_spec')
+                    else None
+                ),
                 gdf=None  # GeoDataFrame 不存储在数据库中
             )
             layers.append(layer)

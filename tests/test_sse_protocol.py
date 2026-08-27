@@ -71,6 +71,12 @@ def test_clarification_is_a_terminal_event():
     ]
 
 
+def test_partial_is_a_terminal_request_status():
+    from mapping.sse import TERMINAL_REQUEST_STATUSES
+
+    assert "partial" in TERMINAL_REQUEST_STATUSES
+
+
 def test_sse_stops_when_client_disconnects_before_next_event(monkeypatch):
     # Keep this transport test independent from GeoDjango's native libraries.
     monkeypatch.setitem(

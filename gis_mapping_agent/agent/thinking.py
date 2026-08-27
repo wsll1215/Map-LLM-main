@@ -1,6 +1,7 @@
 """思考型GIS制图智能体 - 实现显式的思考-行动-观察循环"""
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
@@ -14,13 +15,30 @@ from ..utils.logger import setup_logger, get_logger
 from ..utils.data_path_resolver import data_path_resolver, extract_data_info_from_request, resolve_data_path
 from ..data_sources.remote import (
     extract_location_query,
+    extract_remote_poi_query,
+    extract_remote_poi_request,
     fetch_remote_boundary,
+    fetch_remote_named_poi,
+    fetch_remote_pois,
+    fetch_remote_roads,
     fetch_remote_waterways,
+    resolve_location,
+    RemoteDataSourceError,
 )
-from ..data_sources.planner import plan_local_sources
+from ..data_sources.catalog import DjangoDatasetCatalog
+from ..data_sources.planner import parse_intent, plan_local_sources, resolve_local_location
 from ..gis import calculate_extent_from_files, format_extent_for_request
 from ..state import get_generalization_context
 from ..tools.registry import ALL_UNIFIED_TOOLS
+from ..tools.base import format_tool_result, tool_failure
+
+
+def _boundary_extent_inputs(boundary_path: Optional[str]) -> Tuple[Optional[str], Optional[List[str]]]:
+    """Turn the verified boundary file into the inputs used by extent calculation."""
+    if not boundary_path:
+        return None, None
+    path = Path(boundary_path).resolve()
+    return str(path.parent), [path.name]
 
 
 class ThinkingGISMappingAgent:
@@ -50,6 +68,7 @@ class ThinkingGISMappingAgent:
         self._default_data_file_path = None
         self._explicit_data_files = False
         self._semantic_data_plan = None
+        self._source_errors = []
 
         # 验证配置
         self._validate_config()
@@ -98,26 +117,92 @@ class ThinkingGISMappingAgent:
             # 从用户请求中提取数据目录和文件信息
             explicit_data_files = data_path_resolver.find_data_files_in_request(user_request)
             data_dir_from_request, data_files_from_request = extract_data_info_from_request(user_request)
-            self._explicit_data_files = bool(explicit_data_files)
+            intent = parse_intent(user_request)
+            self._explicit_data_files = bool(explicit_data_files or intent.explicit_sources)
+            if not self._explicit_data_files:
+                data_dir_from_request, data_files_from_request = None, []
             self._default_data_file_path = None
             self._semantic_data_plan = None
+            self._source_errors = []
+            location = None
             if not self._explicit_data_files and data_dir_from_request and data_files_from_request:
                 self._default_data_file_path = resolve_data_path(data_dir_from_request) / data_files_from_request[0]
 
-            # Prefer a real remote boundary when the local catalog has no match.
-            # The LLM must never invent a local shapefile path for a place request.
             if not self._explicit_data_files and not data_files_from_request:
-                location_query = extract_location_query(user_request)
+                location_query = intent.location.text
+                if intent.layers and not location_query:
+                    return {
+                        "success": False,
+                        "status": "needs_clarification",
+                        "message": "缺少地图地点，无法确定空间范围。请补充城市、区域或具体地点。",
+                        "error_code": "clarification_required",
+                        "clarification": {
+                            "missing_fields": ["location"],
+                            "next_action": "provide_location",
+                        },
+                    }
                 if location_query:
-                    remote_path = fetch_remote_boundary(location_query)
+                    runtime_catalog = DjangoDatasetCatalog()
+                    location = resolve_local_location(location_query, runtime_catalog)
+                    if location is None:
+                        location = resolve_location(location_query)
+                    if location.error_code:
+                        return {
+                            "success": False,
+                            "status": "failed",
+                            "message": f"地点解析失败：{location_query}",
+                            "error_code": location.error_code,
+                            "error": location.error_code,
+                        }
+
+            if not self._explicit_data_files:
+                self._semantic_data_plan = plan_local_sources(
+                    user_request,
+                    catalog=DjangoDatasetCatalog(),
+                    boundary_path=(
+                        str(self._default_data_file_path)
+                        if self._default_data_file_path
+                        and not str(self._default_data_file_path).lower().endswith(
+                            ".shp"
+                        )
+                        else None
+                    ),
+                    location_bbox=location.bbox if location else None,
+                )
+                # Only acquire a remote boundary after the runtime catalog has
+                # failed to provide a verified local boundary.
+                if not self._semantic_data_plan.boundary_path and intent.location.text:
+                    try:
+                        remote_path = fetch_remote_boundary(intent.location.text)
+                    except Exception as exc:
+                        self._record_source_error("boundary", exc)
+                        remote_path = None
                     if remote_path:
                         data_dir_from_request = str(remote_path.parent)
                         data_files_from_request = [remote_path.name]
                         self._default_data_file_path = remote_path
-
-            if not self._explicit_data_files:
-                self._semantic_data_plan = plan_local_sources(user_request)
+                        self._semantic_data_plan = plan_local_sources(
+                            user_request,
+                            catalog=DjangoDatasetCatalog(),
+                            boundary_path=str(remote_path),
+                            location_bbox=location.bbox if location else None,
+                        )
+                    else:
+                        self._semantic_data_plan = replace(
+                            self._semantic_data_plan,
+                            issues=tuple(
+                                dict.fromkeys(
+                                    (*self._semantic_data_plan.issues, "未找到可用的边界数据")
+                                )
+                            ),
+                        )
+                self._semantic_data_plan = self._add_remote_road_source(
+                    user_request, self._semantic_data_plan
+                )
                 self._semantic_data_plan = self._add_remote_river_source(
+                    user_request, self._semantic_data_plan
+                )
+                self._semantic_data_plan = self._add_remote_poi_source(
                     user_request, self._semantic_data_plan
                 )
                 if self._semantic_data_plan.issues:
@@ -127,10 +212,16 @@ class ThinkingGISMappingAgent:
                         "success": False,
                         "message": message,
                         "error": message,
+                        "error_code": (self._source_errors[0].get("error_code")
+                                       if self._source_errors else "resource_not_found"),
+                        "source_errors": list(self._source_errors),
                     }
                 if self._semantic_data_plan.boundary_path:
                     self._default_data_file_path = resolve_data_path(
                         self._semantic_data_plan.boundary_path.removeprefix("data/")
+                    )
+                    data_dir_from_request, data_files_from_request = _boundary_extent_inputs(
+                        str(self._default_data_file_path)
                     )
 
             # 自动计算范围
@@ -167,6 +258,7 @@ class ThinkingGISMappingAgent:
                 "agent_output": result["output"],
                 "map_state": final_map_state.model_dump() if final_map_state else None,
                 "thinking_steps": result.get("thinking_steps", []),
+                "source_errors": list(self._source_errors),
             }
 
             if not result.get("terminal_tool"):
@@ -180,7 +272,9 @@ class ThinkingGISMappingAgent:
             return {
                 "success": False,
                 "message": error_msg,
-                "error": str(e)
+                "error": str(e),
+                "error_code": getattr(e, "error_code", "internal_error"),
+                "source_errors": list(getattr(self, "_source_errors", [])),
             }
 
     def _execute_thinking_loop(self, user_request: str) -> Dict[str, Any]:
@@ -199,7 +293,17 @@ class ThinkingGISMappingAgent:
             if self.verbose:
                 print(f"\n🔄 步骤 {iteration}")
 
-            response = self.llm.invoke(messages)
+            try:
+                from mapping.trace import invoke_llm_with_trace
+            except Exception:
+                response = self.llm.invoke(messages)
+            else:
+                response = invoke_llm_with_trace(
+                    session_id=getattr(self, "session_id", None),
+                    invoke=self.llm.invoke,
+                    messages=messages,
+                    attributes={"model": getattr(self.llm, "model_name", None), "phase": "tool_selection"},
+                )
             messages.append(response)
 
             if not response.tool_calls:
@@ -329,6 +433,7 @@ class ThinkingGISMappingAgent:
                     *   不要为同一个图层的不同样式多次调用 `style_layer`。
                 4.  **添加地图元素**: **严格按照用户的明确要求**添加比例尺、指北针或文字说明。**不要**自行添加任何用户未请求的地图元素。图例是自动生成的，**不要**使用 `add_annotation` 手动创建图例说明。
                 5.  **保存地图**: 当所有制图步骤完成后，**必须**调用 `map_save` 工具保存地图。用户可以指定保存参数（文件名、输出目录、分辨率、格式等），如果用户没有指定，使用默认参数。
+                6.  **处理工具失败**: 工具返回的是 JSON `tool_result`。先读取 `error_code` 和 `next_action`：`validation_error` 调整参数后重试，`network_error` 仅在 `retryable=true` 时重试，`resource_not_found` 更换已验证资源，`render_error` 重试渲染，只有 `clarification_required` 或确实缺少用户决策时才询问用户。不要把工具错误原样当作最终答案，也不要要求用户提供内部参数。
 
                 **路网综合任务特殊规则:**
                 对于路网综合可视化任务，流程完全不同：
@@ -357,7 +462,12 @@ class ThinkingGISMappingAgent:
                 planned_path = plan.path_for_layer(tool_input.get("name", "")) if plan else None
                 if plan and plan.requires_layer(tool_input.get("name", "")) and not planned_path:
                     role = plan.role_for_layer(tool_input.get("name", "")) or "请求的"
-                    return f"错误：{role}图层没有经过校验的数据源，已阻止使用默认文件。"
+                    return format_tool_result(
+                        tool_failure(
+                            f"{role}图层没有经过校验的数据源，已阻止使用默认文件。",
+                            ValueError("数据源未经过校验"),
+                        )
+                    )
                 if planned_path:
                     tool_input["data_path"] = planned_path
                 elif self._default_data_file_path:
@@ -382,6 +492,14 @@ class ThinkingGISMappingAgent:
                             "color": "#0284C7",
                             "alpha": 0.9,
                             "linewidth": 1.5,
+                        },
+                        "poi": {
+                            "color": "#C2410C",
+                            "alpha": 0.95,
+                            "size": 90.0,
+                            "marker": "o",
+                            "edgecolor": "white",
+                            "linewidth": 1.2,
                         },
                     }
                     for key, value in semantic_defaults.get(role, {}).items():
@@ -415,23 +533,58 @@ class ThinkingGISMappingAgent:
                         self.logger.warning(f"⚠️ extent解析失败，使用自动计算范围: {parse_error}")
 
             if tool_name not in self.tool_dict:
-                return f"错误：工具 '{tool_name}' 不存在。可用工具：{list(self.tool_dict.keys())}"
+                return format_tool_result(
+                    tool_failure(
+                        f"工具 '{tool_name}' 不存在。可用工具：{list(self.tool_dict.keys())}",
+                        ValueError("工具不存在"),
+                    )
+                )
 
             tool = self.tool_dict[tool_name]
             tool_input = self._with_session_id(tool, tool_input)
             result = tool.invoke(tool_input)
-            return str(result)
+            observation = str(result)
+            if observation.startswith("❌") or observation.startswith("错误"):
+                return format_tool_result(tool_failure(observation, ValueError(observation)))
+            return observation
 
         except Exception as e:
-            import traceback
-            return f"工具 '{tool_name}' 执行失败: {e}\n{traceback.format_exc()}"
+            return format_tool_result(tool_failure(f"工具 '{tool_name}' 执行失败: {e}", e))
 
     def _add_remote_river_source(self, user_request: str, plan):
         """Fill a missing river role from a place-scoped remote source."""
         if "river" not in plan.requested_roles or plan.river_path:
             return plan
         boundary_path = plan.boundary_path
-        location_query = extract_location_query(user_request)
+        location_query = parse_intent(user_request).location.text
+        if not boundary_path or not location_query:
+            return plan
+        try:
+            import geopandas as gpd
+
+            boundary_file = resolve_data_path(boundary_path.removeprefix("data/"))
+            bounds = gpd.read_file(boundary_file).total_bounds
+            bbox = bounds.tolist() if hasattr(bounds, "tolist") else list(bounds)
+            remote_path = fetch_remote_waterways(location_query, bbox)
+        except Exception as exc:
+            self._record_source_error("river", exc)
+            self.logger.warning(f"远程河流数据准备失败: {exc}")
+            return plan
+        if not remote_path:
+            self._record_source_error(
+                "river",
+                RemoteDataSourceError("远程河流没有返回数据", code="resource_not_found"),
+            )
+            return plan
+        issues = tuple(issue for issue in plan.issues if "河流" not in issue)
+        return replace(plan, river_path=str(remote_path), issues=issues)
+
+    def _add_remote_road_source(self, user_request: str, plan):
+        """Use OSM roads when the verified local catalog has no road layer."""
+        if "road" not in plan.requested_roles or plan.road_path:
+            return plan
+        boundary_path = plan.boundary_path
+        location_query = parse_intent(user_request).location.text
         if not boundary_path or not location_query:
             return plan
         try:
@@ -439,14 +592,92 @@ class ThinkingGISMappingAgent:
 
             boundary_file = resolve_data_path(boundary_path.removeprefix("data/"))
             bbox = gpd.read_file(boundary_file).total_bounds.tolist()
-            remote_path = fetch_remote_waterways(location_query, bbox)
+            remote_path = fetch_remote_roads(location_query, bbox)
         except Exception as exc:
-            self.logger.warning(f"远程河流数据准备失败: {exc}")
+            self._record_source_error("road", exc)
+            self.logger.warning(f"远程道路数据准备失败: {exc}")
             return plan
         if not remote_path:
+            self._record_source_error(
+                "road",
+                RemoteDataSourceError("远程道路没有返回数据", code="resource_not_found"),
+            )
             return plan
-        issues = tuple(issue for issue in plan.issues if "河流" not in issue)
-        return replace(plan, river_path=str(remote_path), issues=issues)
+        issues = tuple(issue for issue in plan.issues if "道路" not in issue)
+        return replace(plan, road_path=str(remote_path), issues=issues)
+
+    def _add_remote_poi_source(self, user_request: str, plan):
+        """Plan the first POI layer from OSM using the place boundary as bbox."""
+        request = extract_remote_poi_request(user_request)
+        if not request or not request.get("place") or plan.poi_path:
+            return plan
+        batch_place = extract_remote_poi_query(user_request)
+        place = parse_intent(user_request).location.text or request["place"]
+        boundary_path = plan.boundary_path
+        if not boundary_path:
+            return replace(
+                plan,
+                issues=tuple(dict.fromkeys((*plan.issues, "未找到可用的POI边界范围"))),
+            )
+        try:
+            import geopandas as gpd
+
+            boundary_file = resolve_data_path(boundary_path.removeprefix("data/"))
+            bounds = gpd.read_file(boundary_file).total_bounds
+            bbox = bounds.tolist() if hasattr(bounds, "tolist") else list(bounds)
+            remote_path = (
+                fetch_remote_named_poi(request["place"], category=request["category"])
+                if batch_place is None
+                else fetch_remote_pois(place, bbox, category=request["category"])
+            )
+        except Exception as exc:
+            self._record_source_error("poi", exc)
+            logger = getattr(self, "logger", None)
+            if logger:
+                logger.warning(f"远程{request['label']}数据准备失败: {exc}")
+            return replace(
+                plan,
+                issues=tuple(dict.fromkeys((*plan.issues, f"未找到可用的{request['label']}数据"))),
+            )
+        if not remote_path:
+            self._record_source_error(
+                "poi",
+                RemoteDataSourceError("远程POI没有返回数据", code="resource_not_found"),
+            )
+            return replace(
+                plan,
+                issues=tuple(dict.fromkeys((*plan.issues, f"未找到可用的{request['label']}数据"))),
+            )
+        return replace(
+            plan,
+            poi_path=str(remote_path).replace("\\", "/"),
+            poi_category=request["category"],
+            poi_label=request["label"],
+            requested_roles=tuple(dict.fromkeys((*plan.requested_roles, "poi"))),
+        )
+
+    def _record_source_error(self, role: str, error: Exception) -> None:
+        """Keep source failures structured instead of hiding them in logs."""
+        errors = getattr(self, "_source_errors", None)
+        if errors is None:
+            self._source_errors = []
+            errors = self._source_errors
+        error_code = getattr(error, "error_code", None)
+        if not error_code:
+            error_code = "resource_not_found" if "没有返回" in str(error) else "internal_error"
+        errors.append(
+            {
+                "role": role,
+                "error_code": error_code,
+                "retryable": bool(getattr(error, "retryable", False)),
+                "next_action": (
+                    "retry_remote_source"
+                    if bool(getattr(error, "retryable", False))
+                    else "inspect_source_plan"
+                ),
+                "message": str(error),
+            }
+        )
 
     def _publish_realtime_tool_event(
         self,

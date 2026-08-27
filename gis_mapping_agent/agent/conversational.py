@@ -401,7 +401,17 @@ class ConversationalMappingAgent:
                 HumanMessage(content=f"用户输入：{user_input}\n\n请判断意图类型（只返回：create、modify或query）：")
             ]
 
-            response = self.llm.invoke(messages)
+            try:
+                from mapping.trace import invoke_llm_with_trace
+            except Exception:
+                response = self.llm.invoke(messages)
+            else:
+                response = invoke_llm_with_trace(
+                    session_id=getattr(self, "session_id", None),
+                    invoke=self.llm.invoke,
+                    messages=messages,
+                    attributes={"model": getattr(self.llm, "model_name", None), "phase": "intent"},
+                )
             intent = response.content.strip().lower()
 
             # 验证返回的意图

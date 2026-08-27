@@ -72,12 +72,29 @@ def test_legacy_state_database_gets_snapshot_columns(tmp_path):
             name TEXT NOT NULL,
             z_order INTEGER DEFAULT 0
         );
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            session_name TEXT,
+            created_at TEXT,
+            last_accessed TEXT,
+            current_version INTEGER DEFAULT 1
+        );
         """
     )
     connection.commit()
     connection.close()
 
     MapStateManager(str(db_path))
+
+    connection = sqlite3.connect(db_path)
+    connection.execute("INSERT INTO sessions (session_id, current_version) VALUES (?, ?)", ("legacy-session", 1))
+    connection.execute("INSERT INTO map_states (session_id, version, map_id) VALUES (?, ?, ?)", ("legacy-session", 1, "legacy-map"))
+    state_id = connection.execute("SELECT id FROM map_states WHERE session_id = ?", ("legacy-session",)).fetchone()[0]
+    connection.execute("INSERT INTO layers (state_id, layer_id, name) VALUES (?, ?, ?)", (state_id, "legacy-layer", "旧图层"))
+    connection.commit()
+    connection.close()
+
+    loaded = MapStateManager(str(db_path)).load_state("legacy-session")
 
     connection = sqlite3.connect(db_path)
     map_state_columns = {
@@ -101,4 +118,8 @@ def test_legacy_state_database_gets_snapshot_columns(tmp_path):
         "extent",
         "render_mode",
         "data_url",
+        "data_source_meta",
     } <= layer_columns
+    assert loaded is not None
+    assert loaded.config.map_id == "legacy-map"
+    assert loaded.layers[0].name == "旧图层"

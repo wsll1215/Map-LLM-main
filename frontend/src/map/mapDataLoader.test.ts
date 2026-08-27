@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getLayerDataUrl, getLayerCacheKey, shouldRetryLayerFetch } from "./mapDataLoader";
+import { getLayerDataUrl, getLayerCacheKey, getLayerTileUrl, shouldRetryLayerFetch } from "./mapDataLoader";
 
 describe("mapDataLoader helpers", () => {
   it("builds a versioned data URL from a layer manifest", () => {
@@ -29,5 +29,14 @@ describe("mapDataLoader helpers", () => {
     expect(shouldRetryLayerFetch(202, 0)).toBe(true);
     expect(shouldRetryLayerFetch(404, 2)).toBe(false);
     expect(shouldRetryLayerFetch(500, 0)).toBe(false);
+  });
+
+  it("adds a viewport bbox to worker requests and exposes an MVT template", () => {
+    const bbox: [number, number, number, number] = [115, 39, 117, 41];
+    expect(getLayerDataUrl(7, { id: "roads", version: 3 }, bbox)).toContain("bbox=115,39,117,41");
+    expect(getLayerCacheKey(7, "roads", 3, "same", bbox)).not.toBe(
+      getLayerCacheKey(7, "roads", 3, "same", [115, 39, 117, 42]),
+    );
+    expect(getLayerTileUrl(7, { id: "roads", version: 3 })).toContain("tiles/{z}/{x}/{y}.pbf");
   });
 });

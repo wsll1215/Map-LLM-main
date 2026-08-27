@@ -29,6 +29,34 @@ export interface LayerPayload {
   extent?: [number, number, number, number] | null;
   render_mode?: "geojson" | "geojson-worker" | "mvt" | "pmtiles";
   data_url?: string | null;
+  data_source_meta?: DataSourceMeta | null;
+  render_spec?: RenderSpec | null;
+}
+
+export interface DataSourceMeta {
+  source_type: "local" | "remote" | "upload" | string;
+  provider?: string | null;
+  source_url?: string | null;
+  attribution?: string | null;
+  cache_path?: string | null;
+  status?: "available" | "pending" | "failed" | string;
+  error?: string | null;
+}
+
+export interface RenderSpec {
+  enabled: boolean;
+  attribute?: string | null;
+  kind?: "numeric" | "categorical";
+  method?: "quantile" | "equal_interval" | "natural_breaks" | "categorical";
+  classes?: number;
+  breaks?: number[];
+  labels?: string[];
+  values?: string[];
+  colors: string[];
+  value_colors?: Record<string, string>;
+  no_data_color: string;
+  warning_code?: string;
+  warning?: string;
 }
 
 export interface ViewStatePayload {
@@ -45,12 +73,50 @@ export interface ViewStatePayload {
   output_path?: string | null;
 }
 
-export type MapStreamEventName = "request_started" | "tool_finished" | "map_initialized" | "layer_upserted" | "map_element_updated" | "process_log" | "assistant_message" | "request_completed" | "request_failed" | "request_needs_clarification" | "done";
+export type MapStreamEventName = "request_started" | "trace_event" | "tool_started" | "tool_finished" | "llm_started" | "llm_finished" | "data_fetch_started" | "data_fetch_finished" | "render_started" | "render_finished" | "map_initialized" | "layer_upserted" | "map_element_updated" | "process_log" | "assistant_message" | "request_completed" | "request_partial" | "request_failed" | "request_needs_clarification" | "done";
 
 export interface MapStreamEvent {
   id: string;
   event: MapStreamEventName | string;
   data: Record<string, unknown>;
+}
+
+export type TraceEventType = "run" | "intent_parse" | "validation" | "llm_generation" | "tool_call" | "source_plan" | "data_fetch" | "layer_process" | "render" | "preview_update" | "warning" | "retry" | "error" | "run_finished" | "process_log";
+
+export interface TraceError {
+  error_code?: string;
+  user_message?: string;
+  retryable?: boolean;
+  next_action?: string;
+  [key: string]: unknown;
+}
+
+export interface TraceEvent {
+  event_id: string;
+  event_seq: number;
+  trace_id?: string | null;
+  request_id?: number | null;
+  run_id?: number | null;
+  parent_event_id?: string | null;
+  event_type: TraceEventType | string;
+  phase?: string;
+  actor?: string;
+  status: "running" | "success" | "warning" | "error" | "cancelled" | string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  summary: string;
+  has_details?: boolean;
+  input?: unknown;
+  output?: unknown;
+  attributes?: Record<string, unknown>;
+  error?: TraceError | null;
+}
+
+export interface TraceEventPage {
+  items: TraceEvent[];
+  next_cursor: number | null;
+  total_count?: number;
 }
 
 export interface ChatMessage {
@@ -65,7 +131,7 @@ export interface MapRequestSummary {
   request_id: number;
   title: string;
   request_text?: string;
-  status: "pending" | "processing" | "needs_clarification" | "completed" | "failed";
+  status: "pending" | "processing" | "needs_clarification" | "completed" | "partial" | "failed";
   created_at?: string;
   updated_at?: string;
   maps?: GeneratedMap[];
@@ -84,6 +150,7 @@ export interface MapRequestSummary {
   has_available_result?: boolean;
   latest_map_version?: number | null;
   clarification?: ClarificationData | null;
+  completion_report?: Record<string, unknown>;
 }
 
 export interface ClarificationData {

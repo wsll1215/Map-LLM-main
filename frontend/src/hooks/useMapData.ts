@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { LayerPayload } from "../types/api";
-import { getLayerCacheKey, getLayerDataUrl, shouldRetryLayerFetch } from "../map/mapDataLoader";
+import { getLayerCacheKey, getLayerDataUrl, shouldRetryLayerFetch, type Bbox } from "../map/mapDataLoader";
 import { getRenderStrategy } from "../map/renderPolicy";
 import type { GeoJsonFeature, GeoJsonFeatureCollection } from "../map/geojsonParser";
 import type { GeoJsonWorkerResponse } from "../map/workerProtocol";
@@ -13,7 +13,7 @@ type PendingWorkerJob = {
   reject: (reason: Error) => void;
 };
 
-export function useMapData(requestId: number | null, layers: LayerPayload[]) {
+export function useMapData(requestId: number | null, layers: LayerPayload[], viewportBbox?: Bbox | null, retryToken = 0) {
   const workerRef = useRef<Worker | null>(null);
   const jobIdRef = useRef(0);
   const pendingJobsRef = useRef(new Map<number, PendingWorkerJob>());
@@ -71,10 +71,14 @@ export function useMapData(requestId: number | null, layers: LayerPayload[]) {
     const loadLayer = async (layer: LayerPayload, layerId: string) => {
       const strategy = getRenderStrategy(layer);
       if (strategy === "mvt" || strategy === "pmtiles") {
-        setError(`${layer.name || layerId} 需要 ${strategy.toUpperCase()} 渲染器，当前版本尚未启用`);
+        setLoading((current) => ({ ...current, [layerId]: false }));
+        if (strategy === "pmtiles") {
+          setError(String(layer.name || layerId) + ": PMTiles 尚未配置可用数据源，已保留 PNG 预览");
+        }
         return;
       }
-      const cacheKey = getLayerCacheKey(requestId, layerId, layer.version, layer.data_hash);
+      const requestBbox = strategy === "worker" ? viewportBbox || normalizeBbox(layer.extent) : undefined;
+      const cacheKey = getLayerCacheKey(requestId, layerId, layer.version, layer.data_hash, requestBbox);
       const cached = cacheRef.current.get(cacheKey);
       if (cached) {
         loadedKeysRef.current.set(layerId, cacheKey);
@@ -88,7 +92,7 @@ export function useMapData(requestId: number | null, layers: LayerPayload[]) {
       try {
         let response: Response;
         for (let attempt = 0; ; attempt += 1) {
-          response = await fetch(getLayerDataUrl(requestId, { ...layer, id: layerId }), {
+          response = await fetch(getLayerDataUrl(requestId, { ...layer, id: layerId }, requestBbox), {
             credentials: "same-origin",
             signal: controller.signal,
             headers: { Accept: "application/geo+json, application/json" },
@@ -131,17 +135,24 @@ export function useMapData(requestId: number | null, layers: LayerPayload[]) {
         job.reject(new Error("GeoJSON Worker 任务已取消"));
       }
     };
-  }, [layers, requestId]);
+  }, [layers, requestId, viewportBbox, retryToken]);
 
   const resolvedLayers = layers.map((layer, index) => {
     const layerId = layer.id || layer.name || `layer-${index}`;
     if (requestId === null) return layer;
-    const cacheKey = getLayerCacheKey(requestId, layerId, layer.version, layer.data_hash);
+    const strategy = getRenderStrategy(layer);
+    const requestBbox = strategy === "worker" ? viewportBbox || normalizeBbox(layer.extent) : undefined;
+    const cacheKey = getLayerCacheKey(requestId, layerId, layer.version, layer.data_hash, requestBbox);
     return loadedKeysRef.current.get(layerId) === cacheKey && loadedData[layerId]
       ? { ...layer, geojson: loadedData[layerId] }
       : layer;
   });
   return { layers: resolvedLayers, loading: Object.values(loading).some(Boolean), error };
+}
+
+function normalizeBbox(value: LayerPayload["extent"]): Bbox | undefined {
+  if (!value || value.length !== 4 || value[0] >= value[2] || value[1] >= value[3]) return undefined;
+  return value;
 }
 
 function parseWithWorker(

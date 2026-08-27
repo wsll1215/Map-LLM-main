@@ -16,6 +16,6 @@ export default defineConfig({
     outDir: "../static/frontend",
     emptyOutDir: true,
     manifest: false,
-    rollupOptions: { output: { entryFileNames: "assets/app.js", chunkFileNames: "assets/[name].js", assetFileNames: (assetInfo) => assetInfo.name?.endsWith(".css") ? "assets/app.css" : "assets/[name][extname]" } },
+    rollupOptions: { output: { entryFileNames: "assets/app.js", chunkFileNames: "assets/[name]-[hash].js", manualChunks: { "antd-vendor": ["antd", "@ant-design/icons"], "react-runtime": ["react/jsx-runtime", "react/jsx-dev-runtime"], "map-shared": ["./src/map/mapDataLoader.ts", "./src/map/layerRegistry.ts", "./src/map/styles.ts", "./src/map/renderPolicy.ts"] }, assetFileNames: (assetInfo) => assetInfo.name?.endsWith(".css") ? "assets/app.css" : "assets/[name][extname]" } },
   },
 });

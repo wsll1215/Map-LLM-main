@@ -1,7 +1,59 @@
 import { describe, expect, it } from "vitest";
 import { initialWorkbenchState, workbenchReducer } from "./workbenchReducer";
 
+import { isTerminalStreamEvent } from "../hooks/useMapBuildStream";
+import { isTerminalTaskStatus } from "../hooks/useTaskStatus";
+
 describe("workbenchReducer", () => {
+  it("treats partial as a terminal task and stream state", () => {
+    expect(isTerminalTaskStatus("partial")).toBe(true);
+    expect(isTerminalStreamEvent("request_partial")).toBe(true);
+  });
+  it("keeps the latest PNG preview after layer events and busts image cache", () => {
+    const created = workbenchReducer(initialWorkbenchState, { type: "request_created", requestId: 8 });
+    const withLayer = workbenchReducer(created, {
+      type: "stream_event",
+      event: {
+        id: "1",
+        event: "layer_upserted",
+        data: { layer: { id: "roads", name: "道路" } },
+      },
+    });
+    const next = workbenchReducer(withLayer, {
+      type: "stream_event",
+      event: {
+        id: "2",
+        event: "tool_finished",
+        data: { preview: { image_url: "/generated_maps/preview.png", created_at_ms: 1234 } },
+      },
+    });
+
+    expect(next.layers).toHaveLength(1);
+    expect(next.previewUrl).toBe("/generated_maps/preview.png?preview_ts=1234");
+  });
+
+  it("shows Redis degradation without turning the map task into a failure", () => {
+    const state = workbenchReducer(
+      { ...initialWorkbenchState, requestId: 8, status: "processing" },
+      {
+        type: "stream_event",
+        event: {
+          id: "preview-1",
+          event: "tool_finished",
+          data: {
+            transport_status: "degraded",
+            transport_error: "Redis 不可用",
+            preview: { image_url: "/preview.png", created_at_ms: 22 },
+          },
+        },
+      },
+    );
+
+    expect(state.status).toBe("processing");
+    expect(state.transportStatus).toBe("reconnecting");
+    expect(state.transportError).toBe("Redis 不可用");
+    expect(state.previewUrl).toBe("/preview.png?preview_ts=22");
+  });
   it("keeps the create form locked until request submission finishes", () => {
     const started = workbenchReducer(initialWorkbenchState, {
       type: "submission_started",
@@ -201,6 +253,34 @@ describe("workbenchReducer", () => {
     expect(processing.error).toBeNull();
   });
 
+  it("starts a new execution trace for a later adjustment", () => {
+    const completed = {
+      ...initialWorkbenchState,
+      requestId: 3,
+      status: "completed" as const,
+      logs: [{ message: "旧日志" }],
+      traceId: "trace-old",
+      runId: 12,
+      traceEvents: [{
+        event_id: "old-event",
+        event_seq: 1,
+        event_type: "run",
+        status: "success",
+        summary: "旧执行",
+      }],
+      traceTotalCount: 1,
+    };
+
+    const processing = workbenchReducer(completed, { type: "conversation_started" });
+
+    expect(processing.status).toBe("processing");
+    expect(processing.logs).toEqual([]);
+    expect(processing.traceEvents).toEqual([]);
+    expect(processing.traceTotalCount).toBeNull();
+    expect(processing.traceId).toBeNull();
+    expect(processing.runId).toBeNull();
+  });
+
   it("preserves roles when loading a historical conversation", () => {
     const state = workbenchReducer(initialWorkbenchState, {
       type: "message_loaded",
@@ -226,6 +306,48 @@ describe("workbenchReducer", () => {
     });
 
     expect(state.logs).toEqual([{ step: "数据源校验", message: "未找到可用的河流数据" }]);
+  });
+
+  it("keeps one trace event when legacy and unified SSE events carry the same event", () => {
+    const traceEvent = {
+      event_id: "evt-1",
+      event_seq: 1,
+      event_type: "tool_call",
+      status: "success",
+      summary: "执行工具",
+      trace_id: "trace-1",
+      run_id: 7,
+    };
+    const legacy = workbenchReducer(initialWorkbenchState, {
+      type: "stream_event",
+      event: { id: "1", event: "process_log", data: { trace_event: traceEvent, message: "执行工具" } },
+    });
+    const unified = workbenchReducer(legacy, {
+      type: "stream_event",
+      event: { id: "2", event: "trace_event", data: { trace_event: traceEvent } },
+    });
+
+    expect(unified.traceEvents).toHaveLength(1);
+    expect(unified.traceEvents[0].event_type).toBe("tool_call");
+    expect(unified.runId).toBe(7);
+  });
+
+  it("keeps every process log available for the trace viewer", () => {
+    const logs = Array.from({ length: 34 }, (_, index) => ({
+      id: index + 1,
+      step: `步骤 ${index + 1}`,
+      message: `日志 ${index + 1}`,
+      trace_id: "trace-34",
+    }));
+
+    const state = workbenchReducer(initialWorkbenchState, {
+      type: "logs_loaded",
+      logs,
+    });
+
+    expect(state.logs).toHaveLength(34);
+    expect(state.logs[0]).toEqual(logs[0]);
+    expect(state.logs[33]).toEqual(logs[33]);
   });
 
   it("restores historical map context for the final PNG view", () => {

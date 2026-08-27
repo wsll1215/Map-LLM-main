@@ -131,6 +131,9 @@ class StyleLayerInput(BaseModel):
     linestyle: Optional[str] = Field(default="-", description="线型")
     attribute_column: Optional[str] = Field(default=None, description="用于分级设色的属性列名")
     label_column: Optional[str] = Field(default=None, description="用于标注的属性列名")
+    classification_method: Optional[str] = Field(default="quantile", description="分级方法")
+    classification_classes: Optional[int] = Field(default=5, description="分级数量")
+    no_data_color: Optional[str] = Field(default="#CBD5E1", description="缺失值颜色")
 
 
 class StyleLayerTool(BaseTool):
@@ -147,7 +150,10 @@ class StyleLayerTool(BaseTool):
         alpha: Optional[float] = 0.7,
         linestyle: Optional[str] = "-",
         attribute_column: Optional[str] = None,
-        label_column: Optional[str] = None
+        label_column: Optional[str] = None,
+        classification_method: Optional[str] = "quantile",
+        classification_classes: Optional[int] = 5,
+        no_data_color: Optional[str] = "#CBD5E1",
     ) -> str:
         """执行样式设置"""
         tools = get_unified_tools()
@@ -159,7 +165,10 @@ class StyleLayerTool(BaseTool):
             "alpha": alpha,
             "linestyle": linestyle,
             "attribute_column": attribute_column,
-            "label_column": label_column
+            "label_column": label_column,
+            "classification_method": classification_method,
+            "classification_classes": classification_classes,
+            "no_data_color": no_data_color,
         }
         
         result = tools.style_layer(params)

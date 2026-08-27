@@ -3,6 +3,7 @@
 import json
 import base64
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,9 +20,21 @@ from django.views.decorators.http import require_http_methods
 
 from gis_mapping_agent.state import get_state_manager
 from gis_mapping_agent.utils.data_loader import DataLoader
+from gis_mapping_agent.data_sources.metadata import source_metadata_from_path
+from gis_mapping_agent.rendering.mvt import encode_tile, parse_tile_coordinates
 
-from .models import ChatMessage, Dataset, DatasetFeature, MapRequest, MapRun
+from .models import ChatMessage, Dataset, DatasetFeature, MapRequest, MapRun, ProcessLog
 from .task_dispatch import dispatch_map_request
+from .trace import repair_legacy_trace_events, trace_event_to_dict
+
+
+@lru_cache(maxsize=8)
+def _load_projected_mvt_data(data_source, data_hash):
+    """Cache immutable tile input after one disk read and reprojection."""
+    data = DataLoader().load_shapefile(data_source)
+    if data is None:
+        raise FileNotFoundError(f"图层数据读取失败: {data_source}")
+    return data.to_crs("EPSG:3857")
 
 
 def _json_body(request):
@@ -41,6 +54,12 @@ def _request_resource(request, map_request):
         .order_by("-created_at", "-id")
         .first()
     )
+    latest_available_run = (
+        map_request.runs
+        .filter(status__in=[MapRun.STATUS_COMPLETED, MapRun.STATUS_PARTIAL])
+        .order_by("-created_at", "-id")
+        .first()
+    )
     latest_artifact = map_request.generated_maps.order_by("-version", "-created_at", "-id").first()
     return {
         "id": map_request.id,
@@ -52,6 +71,8 @@ def _request_resource(request, map_request):
         "clarification": map_request.clarification_data or None,
         "latest_run": _run_resource(latest_run) if latest_run else None,
         "latest_successful_run": _run_resource(latest_successful_run) if latest_successful_run else None,
+        "latest_available_run": _run_resource(latest_available_run) if latest_available_run else None,
+        "completion_report": map_request.completion_report or {},
         "has_available_result": latest_artifact is not None,
         "latest_map_version": latest_artifact.version if latest_artifact else None,
         "created_at": map_request.created_at.isoformat(),
@@ -80,9 +101,86 @@ def _run_resource(run):
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         "error_code": run.error_code,
         "error_message": run.error_message,
+        "completion_report": run.completion_report or {},
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
     }
+
+
+def _trace_event_resource(event, *, include_payload=False):
+    """Expose one ProcessLog as the stable TraceEvent wire shape."""
+    return trace_event_to_dict(event, include_payload=include_payload)
+
+
+def _trace_cursor(value):
+    if value in (None, ""):
+        return 0
+    try:
+        cursor = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cursor if cursor >= 0 else None
+
+
+@login_required
+@require_http_methods(["GET"])
+def map_trace_event_collection(request, request_id, run_id):
+    """List trace summaries; full payloads are available from the detail resource."""
+    map_request = get_object_or_404(MapRequest, id=request_id, user=request.user)
+    run = get_object_or_404(MapRun, id=run_id, request=map_request)
+    repair_legacy_trace_events(run)
+    try:
+        limit = min(max(int(request.GET.get("limit", 50)), 1), 100)
+    except (TypeError, ValueError):
+        return _bad_request("limit 必须是 1 到 100 之间的整数")
+    cursor = _trace_cursor(request.GET.get("cursor"))
+    if cursor is None:
+        return _bad_request("cursor 必须是非负整数")
+
+    events = ProcessLog.objects.filter(run=run)
+    event_type = request.GET.get("event_type", "").strip()
+    status = request.GET.get("status", "").strip()
+    phase = request.GET.get("phase", "").strip()
+    query = request.GET.get("q", "").strip()
+    errors_only = request.GET.get("errors_only", "").lower() in {"1", "true", "yes"}
+    if cursor:
+        events = events.filter(event_seq__gt=cursor)
+    if event_type:
+        events = events.filter(event_type=event_type)
+    if status:
+        events = events.filter(status=status)
+    if phase:
+        events = events.filter(phase=phase)
+    if query:
+        events = events.filter(Q(message__icontains=query) | Q(step__icontains=query))
+    if errors_only:
+        events = events.filter(Q(status="error") | Q(level="error") | Q(error__isnull=False))
+
+    total_count = events.count()
+    rows = list(events.select_related("run").order_by("event_seq", "id")[: limit + 1])
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = rows[-1].event_seq if has_more else None
+    return JsonResponse(
+        {
+            "items": [_trace_event_resource(event) for event in rows],
+            "limit": limit,
+            "next_cursor": next_cursor,
+            "total_count": total_count,
+            "trace_id": run.trace_id or None,
+            "run_id": run.id,
+        }
+    )
+
+
+@login_required
+@require_http_methods(["GET"])
+def map_trace_event_detail(request, request_id, run_id, event_id):
+    map_request = get_object_or_404(MapRequest, id=request_id, user=request.user)
+    run = get_object_or_404(MapRun, id=run_id, request=map_request)
+    repair_legacy_trace_events(run)
+    event = get_object_or_404(ProcessLog.objects.select_related("run"), run=run, event_id=event_id)
+    return JsonResponse(_trace_event_resource(event, include_payload=True))
 
 
 def _dataset_resource(dataset):
@@ -254,6 +352,10 @@ def _layer_manifest(layer, version):
         "data_hash": layer.data_hash,
         "render_mode": _effective_render_mode(layer),
         "data_url": layer.data_url,
+        "data_source_meta": source_metadata_from_path(
+            layer.data_source, layer.data_source_meta
+        ),
+        "render_spec": layer.render_spec,
         "visible": layer.visible,
         "z_order": layer.z_order,
     }
@@ -363,6 +465,7 @@ def map_request_collection(request):
         user=request.user,
         title=title.strip(),
         request_text=request_text.strip(),
+        completion_report={},
     )
     return JsonResponse(_request_resource(request, map_request), status=201)
 
@@ -515,7 +618,7 @@ def _effective_render_mode(layer):
     if layer.render_mode in {"mvt", "pmtiles"}:
         return layer.render_mode
     if layer.feature_count > getattr(settings, "MAP_WORKER_LIMIT", 30000):
-        return "mvt" if getattr(settings, "MAP_MVT_ENABLED", False) else "geojson-worker"
+        return "mvt" if getattr(settings, "MAP_MVT_ENABLED", True) else "geojson-worker"
     if layer.feature_count > getattr(settings, "MAP_GEOJSON_LIMIT", 5000):
         return "geojson-worker"
     return "geojson"
@@ -665,13 +768,29 @@ def map_layer_data(request, request_id, version, layer_id):
         return JsonResponse({"error": "图层数据读取失败"}, status=422)
     if bbox is not None:
         data = loader.filter_data(data, spatial_filter=tuple(bbox))
-        fallback_limit = getattr(settings, "MAP_GEOJSON_FALLBACK_LIMIT", 1000)
-        if len(data) > fallback_limit:
-            data = data.head(fallback_limit).copy()
+        worker_limit = getattr(settings, "MAP_WORKER_LIMIT", 30000)
+        if len(data) > worker_limit:
+            return JsonResponse(
+                {
+                    "error_code": "data_too_large",
+                    "error": "当前视口内要素仍超过 Worker 上限，请使用 MVT 瓦片",
+                    "feature_count": len(data),
+                    "limit": worker_limit,
+                    "render_mode": "mvt",
+                    "retryable": False,
+                    "next_action": "use_mvt",
+                },
+                status=413,
+            )
         if hasattr(data, "geometry"):
             data = data.copy()
             data["geometry"] = data.geometry.simplify(0.0001, preserve_topology=True)
     geojson = loader.create_geojson_from_gdf(data)
+    if isinstance(geojson, dict):
+        returned_count = len(geojson.get("features") or [])
+        geojson["truncated"] = False
+        geojson["feature_count"] = layer.feature_count
+        geojson["returned_count"] = returned_count
     return _cached_json(
         request,
         geojson,
@@ -697,3 +816,88 @@ def map_layer_data_current(request, request_id, layer_id):
             )
         return JsonResponse({"error": "快照不存在"}, status=404)
     return map_layer_data(request, request_id, state.get_current_version(), layer_id)
+
+
+@login_required
+@require_http_methods(["GET"])
+def map_layer_tile(request, request_id, version, layer_id, z, x, y):
+    """Return one versioned MVT tile for a user's snapshot layer."""
+    map_request = get_object_or_404(MapRequest, id=request_id, user=request.user)
+    try:
+        zoom, tile_x, tile_y = parse_tile_coordinates(z, x, y)
+    except ValueError as exc:
+        return JsonResponse({"error_code": "validation_error", "error": str(exc)}, status=400)
+
+    state = _snapshot_for_request(map_request, version)
+    if state is None:
+        if map_request.status in {"pending", "processing"}:
+            return JsonResponse(
+                {
+                    "status": "pending",
+                    "message": "图层快照正在生成",
+                    "retryable": True,
+                    "next_action": "retry",
+                },
+                status=202,
+                headers={"Retry-After": "1"},
+            )
+        return JsonResponse({"error_code": "resource_not_found", "error": "快照不存在"}, status=404)
+    layer = next((item for item in state.layers if item.layer_id == layer_id), None)
+    if layer is None:
+        if map_request.status in {"pending", "processing"}:
+            return JsonResponse(
+                {
+                    "status": "pending",
+                    "message": "图层快照正在生成",
+                    "retryable": True,
+                    "next_action": "retry",
+                },
+                status=202,
+                headers={"Retry-After": "1"},
+            )
+        return JsonResponse({"error_code": "resource_not_found", "error": "图层不存在"}, status=404)
+    if not layer.data_source:
+        return JsonResponse({"error_code": "resource_not_found", "error": "图层没有可读取的数据源"}, status=404)
+
+    try:
+        data = _load_projected_mvt_data(layer.data_source, layer.data_hash)
+    except FileNotFoundError:
+        return JsonResponse(
+            {"error_code": "resource_not_found", "error": "图层数据读取失败", "retryable": False},
+            status=422,
+        )
+    try:
+        payload = encode_tile(
+            data,
+            layer.name or layer.layer_id,
+            zoom,
+            tile_x,
+            tile_y,
+            projected=True,
+        )
+    except ImportError as exc:
+        return JsonResponse(
+            {
+                "error_code": "render_error",
+                "error": f"MVT 渲染依赖不可用: {exc}",
+                "retryable": False,
+                "next_action": "use_png_fallback",
+            },
+            status=503,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        return JsonResponse(
+            {"error_code": "render_error", "error": str(exc), "retryable": False},
+            status=422,
+        )
+
+    etag = '"' + hashlib.sha256(
+        f"{map_request.id}:{version}:{layer.layer_id}:{layer.data_hash}:{zoom}:{tile_x}:{tile_y}".encode()
+    ).hexdigest() + '"'
+    if request.headers.get("If-None-Match") == etag:
+        response = HttpResponse(status=304)
+    else:
+        response = HttpResponse(payload, content_type="application/vnd.mapbox-vector-tile")
+    response["ETag"] = etag
+    response["Cache-Control"] = "private, max-age=3600, must-revalidate"
+    return response

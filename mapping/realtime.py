@@ -37,6 +37,26 @@ def publish_agent_map_event(
         tool_name=tool_name,
     )
 
+    try:
+        from .trace import publish_trace_event, record_trace_event, run_for_session
+
+        run = run_for_session(session_id)
+        if run:
+            preview_event = record_trace_event(
+                run=run,
+                event_type="preview_update",
+                phase="render",
+                actor="system",
+                status="success" if preview and preview.get("image_url") else "warning",
+                summary="更新实时预览",
+                output_data=preview or {},
+                attributes={"iteration": iteration, "tool_name": tool_name},
+            )
+            publish_trace_event(preview_event)
+    except Exception:
+        # A preview is best-effort and must not affect the tool result.
+        pass
+
     payload = _build_payload(
         request_id=request_id,
         session_id=session_id,
@@ -61,9 +81,25 @@ def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> str:
 
         broker = get_event_broker()
         event_name = str(payload.get("type") or "message")
-        return str(broker.publish_sync(str(request_id), event_name, payload) or "")
+        event_id = broker.publish_sync(str(request_id), event_name, payload)
+        return str(event_id or "")
     except Exception:
-        return ""
+        # The in-memory broker is also the explicit last-resort transport.
+        # Generation must still produce a visible event when Redis is down.
+        try:
+            from .sse_protocol import get_default_broker
+
+            fallback = dict(payload)
+            fallback.setdefault("transport_status", "degraded")
+            fallback.setdefault("transport_error", "Redis 实时通道不可用，已降级为本地事件队列")
+            return str(
+                get_default_broker().publish_sync(
+                    str(request_id), str(payload.get("type") or "message"), fallback
+                )
+                or ""
+            )
+        except Exception:
+            return ""
 
 
 def _request_id_from_session(session_id: Optional[str]) -> Optional[int]:
@@ -292,8 +328,13 @@ def _target_layer_for_tool(map_state: Any, tool_name: str, tool_input: Dict[str,
 
 
 def _layer_payload(layer: Any, version: Optional[int] = None) -> Dict[str, Any]:
+    from gis_mapping_agent.data_sources.metadata import source_metadata_from_path
+
     style = getattr(layer, "style", None)
     style_payload = style.model_dump() if hasattr(style, "model_dump") else dict(style or {})
+    source_meta = source_metadata_from_path(
+        getattr(layer, "data_source", None), getattr(layer, "data_source_meta", None)
+    )
     return {
         "id": getattr(layer, "layer_id", None),
         "name": getattr(layer, "name", None),
@@ -307,6 +348,8 @@ def _layer_payload(layer: Any, version: Optional[int] = None) -> Dict[str, Any]:
         "extent": getattr(layer, "extent", None),
         "render_mode": _effective_render_mode(layer),
         "data_url": getattr(layer, "data_url", None),
+        "data_source_meta": source_meta,
+        "render_spec": getattr(layer, "render_spec", None),
         "style": style_payload,
     }
 
@@ -323,7 +366,7 @@ def _effective_render_mode(layer: Any) -> str:
         worker_limit = getattr(settings, "MAP_WORKER_LIMIT", 30000)
         mvt_enabled = getattr(settings, "MAP_MVT_ENABLED", False)
     except Exception:
-        geojson_limit, worker_limit, mvt_enabled = 5000, 30000, False
+        geojson_limit, worker_limit, mvt_enabled = 5000, 30000, True
     if feature_count > worker_limit:
         return "mvt" if mvt_enabled else "geojson-worker"
     return "geojson-worker" if feature_count > geojson_limit else "geojson"

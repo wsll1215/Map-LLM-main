@@ -8,6 +8,10 @@ export function isCurrentStreamGeneration(current: number, expected: number) {
   return current === expected;
 }
 
+export function isTerminalStreamEvent(eventName: string): boolean {
+  return ["done", "request_completed", "request_partial", "request_failed", "request_needs_clarification"].includes(eventName);
+}
+
 export function useMapBuildStream(dispatch: Dispatch) {
   const controllerRef = useRef<AbortController | null>(null);
   const lastIdRef = useRef("");
@@ -82,6 +86,6 @@ function handleFrame(
   try {
     const data = parseJsonEvent<Record<string, unknown>>(frame);
     dispatch({ type: "stream_event", event: { id: frame.id, event: frame.event, data } as MapStreamEvent });
-    if (["done", "request_completed", "request_failed", "request_needs_clarification"].includes(frame.event)) terminalRef.current = true;
+    if (isTerminalStreamEvent(frame.event)) terminalRef.current = true;
   } catch { dispatch({ type: "stream_error", message: "收到无法解析的 SSE 事件" }); }
 }

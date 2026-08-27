@@ -5,6 +5,7 @@ from datetime import datetime
 import copy
 import json
 import time
+from urllib.parse import unquote
 
 from ..models.schemas import (
     MapState, ModificationAction, ModificationRecord,
@@ -12,6 +13,12 @@ from ..models.schemas import (
 )
 from ..utils.logger import get_logger
 from ..utils.intent_classifier_v2 import get_intent_classifier_v2, IntentAnalysisV2
+from ..data_sources.remote import (
+    REMOTE_POI_CATEGORIES,
+    RemoteDataSourceError,
+    extract_remote_poi_request,
+    fetch_remote_pois,
+)
 from ..utils.singleton import singleton
 from ..state import get_session_context
 from ..state import record_tool_trace
@@ -80,6 +87,11 @@ class ModificationEngine:
             intent_classifier = get_intent_classifier_v2()
             analysis_result = intent_classifier.classify_intent(request, current_state)
 
+            # Batch POI requests need a real point layer, not a single text annotation.
+            analysis_result = self._route_remote_poi_analysis(
+                analysis_result, request, current_state
+            )
+
             # 验证意图与状态的兼容性
             validated_result = intent_classifier.validate_intent_with_state(analysis_result, current_state)
 
@@ -90,7 +102,40 @@ class ModificationEngine:
         except Exception as e:
             self.logger.error(f"AI意图识别失败，使用备用方法: {e}")
             # 如果AI识别失败，使用备用的规则方法
-            return self._fallback_analyze_request(request, current_state)
+            return self._route_remote_poi_analysis(
+                self._fallback_analyze_request(request, current_state),
+                request,
+                current_state,
+            )
+
+    @staticmethod
+    def _route_remote_poi_analysis(
+        analysis: IntentAnalysisV2, request: str, current_state: Optional[MapState] = None
+    ) -> IntentAnalysisV2:
+        """Normalize generic POI language before any patch can be executed."""
+        poi_request = extract_remote_poi_request(request)
+        if not poi_request:
+            return analysis
+        poi_place = poi_request.get("place")
+        if not poi_place and current_state:
+            title = str(current_state.config.title or "")
+            poi_place = title.removesuffix("地图").strip() or None
+        if not poi_place:
+            analysis.clarification_questions = [
+                f"请说明要查询哪个区域的{poi_request['label']}，例如“秦皇岛市{poi_request['label']}”。"
+            ]
+            return analysis
+        category = str(poi_request["category"])
+        label = str(poi_request["label"])
+        analysis.intent = "add_layer"
+        analysis.target = f"{poi_place}{label}"
+        analysis.layer_name = f"{poi_place}{label}"
+        analysis.source = f"remote_poi://{category}/{poi_place}"
+        analysis.text = None
+        analysis.position = None
+        analysis.clarification_questions = []
+        analysis.reasoning = f"检测到{label}需求，路由到远程 POI 点图层"
+        return analysis
     
     def generate_modification_plan(self, analysis: IntentAnalysisV2) -> AdjustmentPatch:
         """Generate the standard dynamic adjustment patch from IntentAnalysisV2."""
@@ -817,36 +862,47 @@ class ModificationEngine:
         if not source:
             raise ValueError(f"添加图层需要指定数据源")
 
-        # 处理数据源路径
-        from ..utils.data_path_resolver import extract_data_info_from_request, resolve_data_path
-
-        # 尝试从source中提取数据目录和文件
-        data_dir, data_files = extract_data_info_from_request(source)
-
-        # 如果没有提取到，尝试直接使用layer_name作为文件名
-        if not data_files:
-            data_files = [f"{layer_name}.shp"]
-
-        # 解析完整路径
-        if data_dir:
-            data_path = resolve_data_path(data_dir) / data_files[0]
+        if source.startswith("remote_poi://"):
+            source_payload = source.removeprefix("remote_poi://")
+            source_kind, separator, encoded_place = source_payload.partition("/")
+            place = unquote(encoded_place) if separator else ""
+            poi_label = REMOTE_POI_CATEGORIES.get(source_kind, {}).get("label", "POI")
+            if source_kind not in REMOTE_POI_CATEGORIES or not place:
+                raise ValueError(f"远程{poi_label}数据源格式无效: {source}")
+            data_path = fetch_remote_pois(
+                place, map_state.config.extent, category=source_kind
+            )
+            if data_path is None:
+                raise RemoteDataSourceError(
+                    f"未检索到“{place}”范围内的{poi_label}点位",
+                    code="remote_data_empty",
+                    retryable=False,
+                )
         else:
-            # 尝试在各个data目录中查找
-            from ..utils.config import Config
-            base_path = Config.DATA_DIRECTORY_BASE
-            if not base_path.is_absolute():
-                base_path = Config.PROJECT_ROOT / base_path
+            # 处理本地数据源路径
+            from ..utils.data_path_resolver import extract_data_info_from_request, resolve_data_path
 
-            # 尝试在data1-data5中查找
-            data_path = None
-            for i in range(1, 6):
-                test_path = base_path / f"data{i}" / data_files[0]
-                if test_path.exists():
-                    data_path = test_path
-                    break
+            data_dir, data_files = extract_data_info_from_request(source)
+            if not data_files:
+                data_files = [f"{layer_name}.shp"]
 
-            if not data_path:
-                raise FileNotFoundError(f"找不到数据文件: {data_files[0]}")
+            if data_dir:
+                data_path = resolve_data_path(data_dir) / data_files[0]
+            else:
+                from ..utils.config import Config
+                base_path = Config.DATA_DIRECTORY_BASE
+                if not base_path.is_absolute():
+                    base_path = Config.PROJECT_ROOT / base_path
+
+                data_path = None
+                for i in range(1, 6):
+                    test_path = base_path / f"data{i}" / data_files[0]
+                    if test_path.exists():
+                        data_path = test_path
+                        break
+
+                if not data_path:
+                    raise FileNotFoundError(f"找不到数据文件: {data_files[0]}")
 
         if not data_path.exists():
             raise FileNotFoundError(f"数据文件不存在: {data_path}")
@@ -869,6 +925,7 @@ class ModificationEngine:
         # 创建图层配置
         from ..utils.helpers import generate_unique_id, parse_color
         from ..utils.config import Config
+        from ..data_sources.metadata import source_metadata_from_path
 
         # 将绝对路径转换为相对于PROJECT_ROOT的相对路径
         try:
@@ -906,7 +963,8 @@ class ModificationEngine:
             data_source=data_source_str,
             geometry_type=geometry_type,
             style=processed_style if processed_style else style,
-            visible=True
+            visible=True,
+            data_source_meta=source_metadata_from_path(data_source_str),
         )
 
         # 添加到地图状态

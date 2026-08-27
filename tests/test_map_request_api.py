@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "xy_neo4j.settings")
 
@@ -12,7 +13,7 @@ django.setup()
 
 from gis_mapping_agent.models.schemas import GeometryType, LayerConfig, MapConfig, MapState, SessionInfo
 from gis_mapping_agent.state import MapStateManager
-from mapping.models import ChatMessage, GeneratedMap, MapRequest, MapRun
+from mapping.models import ChatMessage, GeneratedMap, MapRequest, MapRun, ProcessLog
 from mapping import rest_api
 from mapping.views import _build_clarification_context
 
@@ -45,6 +46,34 @@ def test_map_request_collection_creates_request_without_running_agent():
     assert created.user_id == user.id
     assert created.request_text == "绘制北京道路图"
     assert created.status == MapRequest.STATUS_CHOICES[0][0]
+    assert created.completion_report == {}
+
+
+def test_map_request_creation_normalizes_null_completion_report():
+    user = make_user("null-completion-report-owner")
+
+    created = MapRequest.objects.create(
+        user=user,
+        request_text="绘制定州道路和小学",
+        completion_report=None,
+    )
+
+    created.refresh_from_db()
+    assert created.completion_report == {}
+
+
+def test_legacy_create_request_initializes_completion_report():
+    user = make_user("legacy-create-owner")
+
+    response = login_client(user).post(
+        "/mapping/api/create-request/",
+        data=json.dumps({"request_text": "绘制定州市地图"}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 200
+    created = MapRequest.objects.get(pk=response.json()["request_id"])
+    assert created.completion_report == {}
 
 
 def test_request_detail_exposes_needs_clarification_payload():
@@ -65,6 +94,115 @@ def test_request_detail_exposes_needs_clarification_payload():
     assert response.status_code == 200
     assert response.json()["status"] == "needs_clarification"
     assert response.json()["clarification"]["missing_fields"] == ["map_scope", "layer_type"]
+
+
+def test_process_logs_include_the_current_run_trace_id():
+    user = make_user("process-log-trace-owner")
+    request = MapRequest.objects.create(user=user, request_text="绘制北京道路图", status="processing")
+    run = MapRun.objects.create(
+        request=request,
+        idempotency_key="process-log-trace",
+        trace_id="trace-process-log-1",
+    )
+    ProcessLog.objects.create(request=request, run=run, step="数据源规划", message="开始规划")
+
+    response = login_client(user).get(f"/mapping/api/process-logs/{request.id}/")
+
+    assert response.status_code == 200
+    assert response.json()["logs"][0]["trace_id"] == run.trace_id
+
+
+def test_process_logs_keep_trace_ids_for_multiple_runs():
+    user = make_user("process-log-multi-run-owner")
+    request = MapRequest.objects.create(user=user, request_text="连续调整地图", status="completed")
+    first_run = MapRun.objects.create(request=request, idempotency_key="process-log-run-1", trace_id="trace-1")
+    second_run = MapRun.objects.create(request=request, idempotency_key="process-log-run-2", trace_id="trace-2")
+    ProcessLog.objects.create(request=request, run=first_run, step="第一次", message="旧日志")
+    ProcessLog.objects.create(request=request, run=second_run, step="第二次", message="新日志")
+
+    response = login_client(user).get(f"/mapping/api/process-logs/{request.id}/")
+
+    assert response.status_code == 200
+    assert [item["trace_id"] for item in response.json()["logs"]] == ["trace-1", "trace-2"]
+
+
+def test_process_logs_can_be_scoped_to_one_run():
+    user = make_user("process-log-scoped-owner")
+    request = MapRequest.objects.create(user=user, request_text="查看当前执行")
+    first_run = MapRun.objects.create(request=request, idempotency_key="scoped-run-1", trace_id="trace-old")
+    second_run = MapRun.objects.create(request=request, idempotency_key="scoped-run-2", trace_id="trace-current")
+    ProcessLog.objects.create(request=request, run=first_run, step="旧步骤", message="旧日志")
+    ProcessLog.objects.create(request=request, run=second_run, step="当前步骤", message="当前日志")
+
+    response = login_client(user).get(
+        f"/mapping/api/process-logs/{request.id}/?run_id={second_run.id}"
+    )
+
+    assert response.status_code == 200
+    assert [item["message"] for item in response.json()["logs"]] == ["当前日志"]
+    assert response.json()["logs"][0]["run_id"] == second_run.id
+
+
+def test_process_logs_rejects_a_run_from_another_request():
+    owner = make_user("process-log-scoped-private-owner")
+    other = make_user("process-log-scoped-private-other")
+    request = MapRequest.objects.create(user=owner, request_text="私有执行")
+    foreign_request = MapRequest.objects.create(user=other, request_text="另一条执行")
+    foreign_run = MapRun.objects.create(request=foreign_request, idempotency_key="foreign-run")
+
+    response = login_client(owner).get(
+        f"/mapping/api/process-logs/{request.id}/?run_id={foreign_run.id}"
+    )
+
+    assert response.status_code == 404
+
+
+def test_realtime_process_log_event_contains_the_bound_run_context(monkeypatch):
+    user = make_user("realtime-process-log-trace-owner")
+    request = MapRequest.objects.create(user=user, request_text="绘制北京道路图", status="processing")
+    run = MapRun.objects.create(
+        request=request,
+        idempotency_key="realtime-process-log-trace",
+        trace_id="trace-realtime-1",
+    )
+    published = []
+    monkeypatch.setattr(
+        "mapping.views.publish_map_build_event",
+        lambda request_id, payload: published.append((request_id, payload)),
+    )
+
+    from mapping.views import _publish_process_log_event
+
+    _publish_process_log_event(request, "开始规划", step="数据源规划", run=run)
+
+    assert published[0][0] == request.id
+    assert published[0][1]["run_id"] == run.id
+    assert published[0][1]["trace_id"] == run.trace_id
+
+
+def test_lifecycle_done_does_not_duplicate_terminal_trace_event(monkeypatch):
+    user = make_user("terminal-trace-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制北京道路图",
+        status="completed",
+    )
+    run = MapRun.objects.create(
+        request=request,
+        idempotency_key="terminal-trace",
+        trace_id="trace-terminal",
+    )
+    monkeypatch.setattr("mapping.views.publish_map_build_event", lambda *_args: "1")
+
+    from mapping.views import _publish_lifecycle_event
+
+    _publish_lifecycle_event(request, "request_completed", message="地图已完成")
+    _publish_lifecycle_event(request, "done", status="completed", message="地图已完成")
+
+    events = list(run.process_logs.order_by("event_seq"))
+    assert len(events) == 1
+    assert events[0].event_type == "run_finished"
+    assert events[0].status == "success"
 
 
 def test_continue_conversation_returns_new_stream_cursor(monkeypatch):
@@ -194,6 +332,78 @@ def test_background_conversation_failure_persists_current_result_message(monkeyp
     assert request.status == "failed"
     assert request.result_message == "本轮调整失败：数据源不可用"
     assert request.error_message == "本轮调整失败：数据源不可用"
+
+
+def test_background_conversation_uses_finalizer_for_partial_result(monkeypatch, tmp_path):
+    user = make_user("conversation-finalizer-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制北京道路图",
+        status="completed",
+        result_message="上一轮地图已生成",
+    )
+    run = MapRun.objects.create(request=request, idempotency_key="partial-adjustment")
+    events = []
+
+    class SuccessfulAgent:
+        def chat(self, *_args, **_kwargs):
+            return {
+                "success": True,
+                "response": "已添加道路图层",
+                "agent_output": "已添加道路图层",
+            }
+
+    class FinalResult:
+        status = "partial"
+        completion_report = {
+            "missing_layers": ["road"],
+            "available_layers": ["boundary"],
+        }
+        error_message = "缺少必需图层：road"
+        error_code = None
+        map_version = 2
+
+    monkeypatch.setattr(
+        "mapping.views.get_or_create_conversation_agent",
+        lambda *_args, **_kwargs: SuccessfulAgent(),
+    )
+    monkeypatch.setattr("mapping.views._save_generated_map_info", lambda *_args: None)
+    def fake_finalize(map_request, _response, **_kwargs):
+        final_result = FinalResult()
+        map_request.status = final_result.status
+        map_request.completion_report = final_result.completion_report
+        map_request.error_message = ""
+        map_request.result_message = final_result.error_message
+        map_request.save(
+            update_fields=[
+                "status",
+                "completion_report",
+                "error_message",
+                "result_message",
+                "updated_at",
+            ]
+        )
+        return final_result
+
+    monkeypatch.setattr("mapping.views._finalize_map_request", fake_finalize)
+    monkeypatch.setattr(
+        "mapping.views._publish_lifecycle_event",
+        lambda _request, event, **payload: events.append((event, payload)),
+    )
+    monkeypatch.setattr("mapping.views._schedule_realtime_preview_cleanup", lambda *_args: None)
+
+    from mapping.views import _continue_conversation_in_background
+
+    _continue_conversation_in_background(request.id, "把道路画出来", run.id)
+
+    request.refresh_from_db()
+    run.refresh_from_db()
+    assert request.status == "partial"
+    assert request.completion_report["missing_layers"] == ["road"]
+    assert run.status == MapRun.STATUS_PARTIAL
+    assert run.completion_report["missing_layers"] == ["road"]
+    assert any(event == "request_partial" for event, _payload in events)
+    assert not any(event == "request_completed" for event, _payload in events)
 
 
 def test_clarification_continuation_passes_all_user_turns_to_agent(monkeypatch):
@@ -582,6 +792,76 @@ def test_layer_data_reports_pending_until_processing_snapshot_is_ready():
 
     assert response.status_code == 202
     assert response.json()["status"] == "pending"
+
+
+def test_mvt_tile_endpoint_returns_cached_pbf_and_enforces_snapshot_ownership(tmp_path, monkeypatch):
+    owner = make_user("mvt-owner")
+    other = make_user("mvt-other")
+    map_request = MapRequest.objects.create(user=owner, request_text="mvt")
+    source = Path(tmp_path) / "roads.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "id": "road-1",
+            "properties": {"name": "中央路"},
+            "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+        }],
+    }), encoding="utf-8")
+    manager = MapStateManager(str(Path(tmp_path) / "mvt.db"))
+    state = MapState(
+        config=MapConfig(map_id="mvt-map", title="MVT", extent=[-1, -1, 2, 2]),
+        session_info=SessionInfo(session_id=f"web_session_{map_request.id}"),
+        layers=[LayerConfig(
+            layer_id="roads",
+            name="Roads",
+            geometry_type=GeometryType.LINE,
+            data_source=str(source),
+            feature_count=30001,
+            render_mode="mvt",
+            data_hash="roads-v1",
+        )],
+    )
+    assert manager.save_state(state)
+    monkeypatch.setattr(rest_api, "get_state_manager", lambda: manager)
+
+    response = login_client(owner).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/2/1.pbf"
+    )
+    assert response.status_code == 200
+    assert response["Content-Type"].startswith("application/vnd.mapbox-vector-tile")
+    assert response["ETag"]
+    assert response.content
+
+    cached = login_client(owner).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/2/1.pbf",
+        HTTP_IF_NONE_MATCH=response["ETag"],
+    )
+    assert cached.status_code == 304
+
+    assert login_client(other).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/2/1.pbf"
+    ).status_code == 404
+    assert login_client(owner).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/99/1.pbf"
+    ).status_code == 400
+
+
+def test_mvt_tile_endpoint_reports_pending_before_snapshot_is_saved():
+    user = make_user("mvt-pending-owner")
+    map_request = MapRequest.objects.create(
+        user=user,
+        request_text="mvt pending",
+        status="processing",
+    )
+
+    response = login_client(user).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/2/1.pbf"
+    )
+
+    assert response.status_code == 202
+    assert response["Retry-After"] == "1"
+    assert response.json()["retryable"] is True
 
 
 def test_current_layer_data_route_resolves_latest_snapshot(tmp_path, monkeypatch):

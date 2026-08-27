@@ -77,7 +77,9 @@ class DataLoader:
 
             for enc in encodings:
                 try:
-                    gdf = gpd.read_file(file_path, encoding=enc)
+                    # Fiona is the declared baseline reader and avoids GeoPandas
+                    # selecting an incompatible optional pyogrio/pyarrow stack.
+                    gdf = gpd.read_file(file_path, encoding=enc, engine='fiona')
                     self.logger.debug(f"成功使用编码 {enc} 加载文件")
                     break
                 except (UnicodeDecodeError, UnicodeError):

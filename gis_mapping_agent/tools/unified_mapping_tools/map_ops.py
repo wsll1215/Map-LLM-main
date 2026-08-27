@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from ...models.schemas import GeometryType, LayerConfig, LayerStyle, LegendItem, MapConfig, MapState
 from ...utils.config import Config
 from ...utils.helpers import generate_unique_id, parse_color
+from ...rendering.classification import build_render_spec
+from ...data_sources.metadata import source_metadata_from_path
 
 
 def _geometry_type_label(geometry_type: GeometryType) -> str:
@@ -55,12 +57,17 @@ class MapOperationsMixin:
 
             # 解析参数
             title = params.get('title')
-            # extent参数处理：如果没有提供extent，使用默认的全球范围
-            # 注意：在智能体模式下，extent会通过_execute_tool自动注入
+            # 智能体必须先完成地点/数据源解析，再注入经过验证的范围。
             extent = params.get('extent')
             if extent is None:
-                extent = [-180, -90, 180, 90]
-                self.logger.info("未提供extent参数，使用默认全球范围")
+                return {
+                    "success": False,
+                    "message": "缺少经过验证的地图范围，无法初始化地图",
+                    "error_code": "clarification_required",
+                    "recoverable": True,
+                    "retryable": False,
+                    "next_action": "provide_location",
+                }
         
             crs = params.get('crs', 'EPSG:4326')
             background_color = params.get('background_color', 'white')
@@ -336,6 +343,7 @@ class MapOperationsMixin:
                 z_order=z_order,
                 feature_count=len(gdf),
                 extent=[float(value) for value in gdf.total_bounds],
+                data_source_meta=source_metadata_from_path(data_source_to_save),
             )
 
             # 处理样式：如果提供了样式参数，使用它；否则自动分配颜色
@@ -372,6 +380,15 @@ class MapOperationsMixin:
                 )
                 # ✅ 调试：验证样式是否正确设置
                 self.logger.debug(f"点图层样式详情: {layer_config.style.model_dump()}")
+
+            if layer_config.style.attribute_column:
+                layer_config.render_spec = build_render_spec(
+                    gdf,
+                    layer_config.style.attribute_column,
+                    layer_config.style.classification_method,
+                    layer_config.style.classification_classes,
+                    no_data_color=layer_config.style.no_data_color,
+                )
 
             # 添加到地图状态
             # self.logger.info(f"添加图层前，地图状态ID: {id(self.current_map_state)}, 图层数: {len(self.current_map_state.layers)}")
@@ -442,11 +459,11 @@ class MapOperationsMixin:
             valid_params = {k: v for k, v in params.items() if v is not None and k != 'layer_name'}
 
             if target_layer.geometry_type == GeometryType.POINT:
-                allowed_keys = {'color', 'alpha', 'marker', 'size', 'attribute_column', 'label_column', 'edgecolor'}
+                allowed_keys = {'color', 'alpha', 'marker', 'size', 'attribute_column', 'label_column', 'edgecolor', 'classification_method', 'classification_classes', 'no_data_color'}
             elif target_layer.geometry_type == GeometryType.LINE:
-                allowed_keys = {'color', 'alpha', 'linewidth', 'linestyle', 'attribute_column', 'label_column'}
+                allowed_keys = {'color', 'alpha', 'linewidth', 'linestyle', 'attribute_column', 'label_column', 'classification_method', 'classification_classes', 'no_data_color'}
             else: # Polygon
-                allowed_keys = {'color', 'alpha', 'edgecolor', 'facecolor', 'hatch', 'linewidth', 'attribute_column', 'label_column'}
+                allowed_keys = {'color', 'alpha', 'edgecolor', 'facecolor', 'hatch', 'linewidth', 'attribute_column', 'label_column', 'classification_method', 'classification_classes', 'no_data_color'}
 
             filtered_params = {k: v for k, v in valid_params.items() if k in allowed_keys}
 
@@ -458,6 +475,17 @@ class MapOperationsMixin:
             style_params.update(filtered_params)
             new_style = LayerStyle(**style_params)
             target_layer.style = new_style
+            if new_style.attribute_column:
+                layer_data = target_layer.gdf
+                target_layer.render_spec = build_render_spec(
+                    layer_data,
+                    new_style.attribute_column,
+                    new_style.classification_method,
+                    new_style.classification_classes,
+                    no_data_color=new_style.no_data_color,
+                )
+            else:
+                target_layer.render_spec = None
 
             # 自动更新图例项
             chinese_name = self.LAYER_NAME_MAPPING.get(layer_name, layer_name)

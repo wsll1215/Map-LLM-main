@@ -9,7 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import pandas as pd
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 
@@ -102,15 +102,24 @@ class RenderingMixin:
                 if layer.style.attribute_column and layer.style.attribute_column in layer.gdf.columns:
                     plot_params['column'] = layer.style.attribute_column
                     plot_params['legend'] = False  # 我们自己管理图例，不让geopandas自动创建
-                    if pd.api.types.is_numeric_dtype(layer.gdf[layer.style.attribute_column]):
+                    render_spec = layer.render_spec or {}
+                    if render_spec.get('enabled'):
+                        colors = render_spec.get('colors') or self.COLOR_PALETTE
+                        plot_params['cmap'] = ListedColormap(colors)
+                        if render_spec.get('kind') == 'numeric' and len(render_spec.get('breaks', [])) >= 2:
+                            plot_params['norm'] = BoundaryNorm(render_spec['breaks'], len(colors), clip=True)
+                        elif render_spec.get('kind') == 'categorical':
+                            plot_params['categorical'] = True
+                        plot_params['missing_kwds'] = {
+                            'color': render_spec.get('no_data_color', '#CBD5E1'),
+                            'label': '无数据',
+                        }
+                    elif pd.api.types.is_numeric_dtype(layer.gdf[layer.style.attribute_column]):
                         plot_params['cmap'] = 'viridis'
                     else:
-                        # 为分类数据使用我们的高对比度颜色调色板
-                        unique_values = sorted(layer.gdf[layer.style.attribute_column].unique())
-                        # 创建自定义颜色映射，使用我们优化的颜色调色板
+                        unique_values = sorted(layer.gdf[layer.style.attribute_column].dropna().unique())
                         colors = [self.COLOR_PALETTE[i % len(self.COLOR_PALETTE)] for i in range(len(unique_values))]
-                        cmap = ListedColormap(colors)
-                        plot_params['cmap'] = cmap
+                        plot_params['cmap'] = ListedColormap(colors)
                 else:
                     plot_params['legend'] = False # 对于非分类图层，不自动创建图例
                     plot_params['color'] = layer.style.color
@@ -181,73 +190,27 @@ class RenderingMixin:
                 attribute_column = style.get('attribute_column')
 
                 if attribute_column and attribute_column in layer_config.gdf.columns:
-                    # 为分类图例生成图例项
                     gdf = layer_config.gdf
-                    unique_values = sorted(gdf[attribute_column].unique())
-
-                    if pd.api.types.is_numeric_dtype(gdf[attribute_column]):
-                        # 数值型数据使用连续色彩映射
-                        cmap = plt.get_cmap('viridis')
-                        norm = plt.Normalize(vmin=gdf[attribute_column].min(), vmax=gdf[attribute_column].max())
-                        for value in unique_values:
-                            color = cmap(norm(value))
-                            if str(value) not in labels:
-                                # ✅ 根据图层类型选择合适的图例符号
-                                if layer_config.geometry_type == GeometryType.POINT:
-                                    # 点图层使用点标记
-                                    actual_marker = layer_config.style.marker
-                                    actual_size = layer_config.style.size
-                                    actual_edgecolor = layer_config.style.edgecolor or 'white'
-                                    actual_linewidth = layer_config.style.linewidth
-
-                                    import math
-                                    legend_markersize = math.sqrt(actual_size / math.pi) * 2 / 2.5
-
-                                    handles.append(Line2D([0], [0],
-                                                        marker=actual_marker,
-                                                        color='w',
-                                                        markerfacecolor=color,
-                                                        markeredgecolor=actual_edgecolor,
-                                                        markeredgewidth=actual_linewidth,
-                                                        markersize=legend_markersize,
-                                                        label=str(value)))
-                                else:
-                                    # 其他图层使用色块
-                                    handles.append(patches.Patch(color=color, label=str(value)))
-                                labels.append(str(value))
+                    render_spec = layer_config.render_spec or {}
+                    if render_spec.get('enabled'):
+                        if render_spec.get('kind') == 'numeric':
+                            entries = zip(render_spec.get('labels', []), render_spec.get('colors', []))
+                        else:
+                            entries = zip(render_spec.get('values', []), render_spec.get('colors', []))
+                        for label, color in entries:
+                            label = str(label)
+                            if label in labels:
+                                continue
+                            handles.append(patches.Patch(color=color, label=label))
+                            labels.append(label)
                     else:
-                        # 分类型数据使用我们的高对比度颜色调色板
-                        for i, value in enumerate(unique_values):
-                            color = self.COLOR_PALETTE[i % len(self.COLOR_PALETTE)]
-                            if str(value) not in labels:
-                                # 根据图层类型选择合适的图例符号
-                                if layer_config.geometry_type == GeometryType.POINT:
-                                    # ✅ 点图层使用与地图上完全一致的符号
-                                    actual_marker = layer_config.style.marker
-                                    actual_size = layer_config.style.size
-                                    actual_edgecolor = layer_config.style.edgecolor or 'white'
-                                    actual_linewidth = layer_config.style.linewidth
-
-                                    # ✅ 关键修复：geopandas 的 markersize 对应 scatter 的 s 参数（面积，points²）
-                                    # Line2D 的 markersize 是点的直径（points）
-                                    # 转换公式：Line2D_markersize = sqrt(scatter_s / pi) * 2
-                                    # 为了在图例中显示得更小，再除以一个缩放因子
-                                    import math
-                                    # 直接使用相同的面积，但缩小显示
-                                    legend_markersize = math.sqrt(actual_size / math.pi) * 2 / 2.5
-
-                                    handles.append(Line2D([0], [0],
-                                                        marker=actual_marker,
-                                                        color='w',
-                                                        markerfacecolor=color,
-                                                        markeredgecolor=actual_edgecolor,
-                                                        markeredgewidth=actual_linewidth,
-                                                        markersize=legend_markersize,
-                                                        label=str(value)))
-                                else:
-                                    # 其他图层使用色块
-                                    handles.append(patches.Patch(color=color, label=str(value)))
-                                labels.append(str(value))
+                        unique_values = sorted(gdf[attribute_column].dropna().unique())
+                        colors = [self.COLOR_PALETTE[i % len(self.COLOR_PALETTE)] for i in range(len(unique_values))]
+                        for value, color in zip(unique_values, colors):
+                            label = str(value)
+                            if label not in labels:
+                                handles.append(patches.Patch(color=color, label=label))
+                                labels.append(label)
                 else:
                     # 为单一图例项生成图例
                     if item.label not in labels:

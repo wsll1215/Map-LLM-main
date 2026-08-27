@@ -84,6 +84,11 @@ class LayerStyle(BaseModel):
     hatch: Optional[str] = Field(default=None, description="填充图案")
     attribute_column: Optional[str] = Field(default=None, description="用于分级设色的属性列名")
     label_column: Optional[str] = Field(default=None, description="用于标注的属性列名")
+    classification_method: Literal["quantile", "equal_interval", "natural_breaks"] = Field(
+        default="quantile", description="数值字段分级方法"
+    )
+    classification_classes: int = Field(default=5, ge=2, le=9, description="分级数量")
+    no_data_color: str = Field(default="#CBD5E1", description="缺失值颜色")
 
 
 class LayerConfig(BaseModel):
@@ -104,6 +109,10 @@ class LayerConfig(BaseModel):
         default="geojson", description="前端渲染模式"
     )
     data_url: Optional[str] = Field(default=None, description="图层数据地址")
+    data_source_meta: Optional[Dict[str, Any]] = Field(
+        default=None, description="图层数据源元数据"
+    )
+    render_spec: Optional[Dict[str, Any]] = Field(default=None, description="共享渲染规范")
     gdf: Optional[gpd.GeoDataFrame] = None
 
     class Config:

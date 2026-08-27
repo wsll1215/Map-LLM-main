@@ -7,8 +7,33 @@ import mercantile
 from shapely.geometry import mapping
 
 
-def encode_tile(gdf: gpd.GeoDataFrame, layer_name: str, zoom: int, x: int, y: int) -> bytes:
-    """Encode one EPSG:3857 tile; callers must cache the returned bytes."""
+MAX_TILE_ZOOM = 22
+
+
+def parse_tile_coordinates(z: str, x: str, y: str):
+    """Validate public tile URL coordinates."""
+    try:
+        zoom, tile_x, tile_y = int(z), int(x), int(y)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("瓦片坐标必须是整数") from exc
+    if zoom < 0 or zoom > MAX_TILE_ZOOM:
+        raise ValueError(f"z 必须在 0 到 {MAX_TILE_ZOOM} 之间")
+    limit = 2**zoom
+    if tile_x < 0 or tile_x >= limit or tile_y < 0 or tile_y >= limit:
+        raise ValueError("x 或 y 超出当前缩放级别范围")
+    return zoom, tile_x, tile_y
+
+
+def encode_tile(
+    gdf: gpd.GeoDataFrame,
+    layer_name: str,
+    zoom: int,
+    x: int,
+    y: int,
+    *,
+    projected: bool = False,
+) -> bytes:
+    """Encode one EPSG:3857 tile; callers may pass preprojected data."""
     if not 0 <= zoom <= 30 or x < 0 or y < 0 or x >= 2**zoom or y >= 2**zoom:
         raise ValueError("invalid tile coordinates")
     if gdf.crs is None:
@@ -16,10 +41,10 @@ def encode_tile(gdf: gpd.GeoDataFrame, layer_name: str, zoom: int, x: int, y: in
 
     import mapbox_vector_tile
 
-    projected = gdf.to_crs("EPSG:3857")
+    projected_data = gdf if projected else gdf.to_crs("EPSG:3857")
     tile_bounds = mercantile.xy_bounds(x, y, zoom)
     bounds = (tile_bounds.left, tile_bounds.bottom, tile_bounds.right, tile_bounds.top)
-    clipped = projected.cx[bounds[0] : bounds[2], bounds[1] : bounds[3]]
+    clipped = projected_data.cx[bounds[0] : bounds[2], bounds[1] : bounds[3]]
     features = []
     for feature_id, row in clipped.iterrows():
         geometry = row.geometry
