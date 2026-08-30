@@ -1,8 +1,10 @@
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from mapping.sse import should_reauthenticate
 from mapping.sse_protocol import InMemoryEventBroker, format_sse_event
 
 
@@ -18,6 +20,13 @@ def test_format_sse_event_serializes_named_event_and_payload():
         "event: layer_upserted\n"
         f"data: {json.dumps({'request_id': 7, 'ok': True}, ensure_ascii=False)}\n\n"
     )
+
+
+def test_sse_reauth_lead_is_checked_even_when_events_are_continuous():
+    deadline = datetime.fromtimestamp(1_000, tz=timezone.utc)
+
+    assert should_reauthenticate(deadline, now=850, lead_seconds=120) is False
+    assert should_reauthenticate(deadline, now=881, lead_seconds=120) is True
 
 
 def test_in_memory_broker_reads_events_after_last_id():
@@ -49,7 +58,19 @@ def test_in_memory_broker_adds_monotonic_event_sequence():
     assert events[1][2]["event_seq"] == 2
 
 
-def test_clarification_is_a_terminal_event():
+def test_in_memory_broker_delivers_state_event_before_canonical_done():
+    async def scenario():
+        broker = InMemoryEventBroker()
+        await broker.publish("request-1", "request_completed", {"status": "completed"})
+        await broker.publish("request-1", "done", {"status": "completed"})
+        return [event async for event in broker.subscribe("request-1")]
+
+    events = asyncio.run(scenario())
+
+    assert [event[1] for event in events] == ["request_completed", "done"]
+
+
+def test_clarification_state_is_followed_by_the_canonical_done_event():
     async def scenario():
         broker = InMemoryEventBroker()
         event_id = await broker.publish(
@@ -57,17 +78,25 @@ def test_clarification_is_a_terminal_event():
             "request_needs_clarification",
             {"status": "needs_clarification"},
         )
+        done_id = await broker.publish(
+            "request-clarification", "done", {"status": "needs_clarification"}
+        )
         events = [event async for event in broker.subscribe("request-clarification")]
-        return event_id, events
+        return event_id, done_id, events
 
-    event_id, events = asyncio.run(scenario())
+    event_id, done_id, events = asyncio.run(scenario())
 
     assert events == [
         (
             event_id,
             "request_needs_clarification",
             {"status": "needs_clarification", "event_seq": 1},
-        )
+        ),
+        (
+            done_id,
+            "done",
+            {"status": "needs_clarification", "event_seq": 2},
+        ),
     ]
 
 

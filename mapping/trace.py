@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Mapping, Optional
+import json
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 from django.db import transaction
 from django.db.models import Max
@@ -26,6 +27,18 @@ SENSITIVE_KEY_PARTS = (
     "internal_path",
 )
 
+TRACE_LIFECYCLE_EVENTS = {
+    "tool_call": ("tool_started", "tool_finished"),
+    "llm_generation": ("llm_started", "llm_finished"),
+    "data_fetch": ("data_fetch_started", "data_fetch_finished"),
+    "render": ("render_started", "render_finished"),
+}
+
+
+def trace_lifecycle_names(event_type: str):
+    """Return the public SSE lifecycle names for a persisted span type."""
+    return TRACE_LIFECYCLE_EVENTS.get(event_type)
+
 
 def _is_sensitive_key(key: Any) -> bool:
     normalized = str(key).lower().replace("-", "_")
@@ -43,6 +56,14 @@ def sanitize_trace_value(value: Any, *, key: Any = None) -> Any:
         }
     if isinstance(value, (list, tuple, set)):
         return [sanitize_trace_value(item) for item in value]
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        if isinstance(decoded, (Mapping, list)):
+            return json.dumps(sanitize_trace_value(decoded), ensure_ascii=False)
+        return value
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
@@ -214,6 +235,25 @@ def publish_trace_event(event: ProcessLog) -> None:
         return
 
 
+def publish_trace_lifecycle(event: ProcessLog, lifecycle: str) -> None:
+    """Publish a started/finished envelope that points to one persisted span."""
+    try:
+        from .realtime import publish_map_build_event
+
+        publish_map_build_event(
+            event.request_id,
+            {
+                "type": lifecycle,
+                "request_id": event.request_id,
+                "run_id": event.run_id,
+                "span_id": event.event_id,
+                "trace_event": trace_event_to_dict(event),
+            },
+        )
+    except Exception:
+        return
+
+
 def invoke_llm_with_trace(*, session_id: Optional[str], invoke: Any, messages: Any, attributes: Any = None) -> Any:
     """Invoke an LLM while recording a single start/finish generation event."""
     run = run_for_session(session_id)
@@ -228,7 +268,7 @@ def invoke_llm_with_trace(*, session_id: Optional[str], invoke: Any, messages: A
             input_data=messages,
             attributes=attributes or {},
         )
-        publish_trace_event(event)
+        publish_trace_lifecycle(event, "llm_started")
     try:
         result = invoke(messages)
     except Exception as exc:
@@ -239,7 +279,7 @@ def invoke_llm_with_trace(*, session_id: Optional[str], invoke: Any, messages: A
                 output_data={},
                 error={"error_code": "llm_error", "retryable": True, "next_action": "retry_llm"},
             )
-            publish_trace_event(event)
+            publish_trace_lifecycle(event, "llm_finished")
         raise
     if event:
         output = result if isinstance(result, Mapping) else {
@@ -247,7 +287,117 @@ def invoke_llm_with_trace(*, session_id: Optional[str], invoke: Any, messages: A
             "tool_calls": getattr(result, "tool_calls", []),
         }
         event = finish_trace_event(event, status="success", output_data=output)
-        publish_trace_event(event)
+        publish_trace_lifecycle(event, "llm_finished")
+    return result
+
+
+def _chunk_content(chunk: Any) -> str:
+    """Extract displayable text from LangChain or mapping-style chunks."""
+    content = chunk.get("content", "") if isinstance(chunk, Mapping) else getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, Mapping):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return ""
+
+
+def _merge_mapping_chunks(current: Mapping[str, Any], chunk: Mapping[str, Any]) -> Dict[str, Any]:
+    """Merge simple provider chunks while preserving tool-call fragments."""
+    merged = dict(current)
+    current_content = current.get("content", "")
+    chunk_content = chunk.get("content", "")
+    if isinstance(current_content, str) and isinstance(chunk_content, str):
+        merged["content"] = current_content + chunk_content
+    for key, value in chunk.items():
+        if key == "content":
+            continue
+        if key == "tool_calls" and isinstance(value, list):
+            existing = merged.get(key)
+            merged[key] = (existing if isinstance(existing, list) else []) + value
+        elif value is not None:
+            merged[key] = value
+    return merged
+
+
+def _aggregate_llm_chunks(chunks: Iterable[Any], on_text: Optional[Callable[[str], None]] = None) -> Any:
+    """Aggregate provider chunks without assuming a concrete LLM message class."""
+    aggregate = None
+    for chunk in chunks:
+        content = _chunk_content(chunk)
+        if content and on_text:
+            on_text(content)
+        if aggregate is None:
+            aggregate = chunk
+            continue
+        if isinstance(aggregate, Mapping) and isinstance(chunk, Mapping):
+            aggregate = _merge_mapping_chunks(aggregate, chunk)
+            continue
+        try:
+            aggregate = aggregate + chunk
+        except (TypeError, ValueError):
+            # Some providers expose non-addable chunk objects. Keep the latest
+            # object rather than losing the stream or emitting a false success.
+            aggregate = chunk
+    return aggregate
+
+
+def stream_llm_with_trace(
+    *,
+    session_id: Optional[str],
+    stream: Any,
+    messages: Any,
+    attributes: Any = None,
+    on_text: Optional[Callable[[str], None]] = None,
+) -> Any:
+    """Stream an LLM call, emit text chunks, and close one generation span.
+
+    The returned value has the same provider-specific shape as a normal
+    invocation (for example ``AIMessageChunk`` or a mapping), so callers can
+    still inspect tool calls after all chunks have been received.
+    """
+    run = run_for_session(session_id)
+    event = None
+    phase = "intent" if not attributes or attributes.get("phase") is None else str(attributes.get("phase"))
+    if run:
+        event = start_trace_event(
+            run=run,
+            event_type="llm_generation",
+            phase=phase,
+            actor="agent",
+            summary="模型流式推理",
+            input_data=messages,
+            attributes=attributes or {},
+        )
+        publish_trace_lifecycle(event, "llm_started")
+    try:
+        result = _aggregate_llm_chunks(stream(messages), on_text=on_text)
+        if result is None:
+            raise ValueError("LLM 返回了空流")
+    except Exception:
+        if event:
+            event = finish_trace_event(
+                event,
+                status="error",
+                output_data={},
+                error={"error_code": "llm_error", "retryable": True, "next_action": "retry_llm"},
+            )
+            publish_trace_lifecycle(event, "llm_finished")
+        raise
+    if event:
+        output = result if isinstance(result, Mapping) else {
+            "content": getattr(result, "content", str(result)),
+            "tool_calls": getattr(result, "tool_calls", []),
+        }
+        event = finish_trace_event(event, status="success", output_data=output)
+        publish_trace_lifecycle(event, "llm_finished")
     return result
 
 

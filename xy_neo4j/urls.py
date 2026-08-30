@@ -34,4 +34,7 @@ if settings.DEBUG:
             'document_root': settings.GENERATED_MAPS_DIR,
         }),
     ]
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_DIRS)
+    # Serve the collected static tree in the local fallback server.  Passing
+    # STATIC_DIRS here passes a tuple to django.views.static.serve, which can
+    # leave CSS requests unresolved outside the containerized nginx setup.
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

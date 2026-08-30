@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
+from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
 from django.conf import settings
 from django.db import IntegrityError, connection
@@ -19,22 +20,13 @@ from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_http_methods
 
 from gis_mapping_agent.state import get_state_manager
-from gis_mapping_agent.utils.data_loader import DataLoader
-from gis_mapping_agent.data_sources.metadata import source_metadata_from_path
-from gis_mapping_agent.rendering.mvt import encode_tile, parse_tile_coordinates
+from gis_mapping_agent.rendering.mvt import parse_tile_coordinates
 
 from .models import ChatMessage, Dataset, DatasetFeature, MapRequest, MapRun, ProcessLog
 from .task_dispatch import dispatch_map_request
 from .trace import repair_legacy_trace_events, trace_event_to_dict
-
-
-@lru_cache(maxsize=8)
-def _load_projected_mvt_data(data_source, data_hash):
-    """Cache immutable tile input after one disk read and reprojection."""
-    data = DataLoader().load_shapefile(data_source)
-    if data is None:
-        raise FileNotFoundError(f"图层数据读取失败: {data_source}")
-    return data.to_crs("EPSG:3857")
+from .dataset_reader import DatasetReadError, read_dataset_features, read_dataset_tile
+from .run_limits import active_run_admission, active_run_capacity_error
 
 
 def _json_body(request):
@@ -61,6 +53,7 @@ def _request_resource(request, map_request):
         .first()
     )
     latest_artifact = map_request.generated_maps.order_by("-version", "-created_at", "-id").first()
+    latest_artifact_readable = bool(latest_artifact and _artifact_path_is_readable(latest_artifact))
     return {
         "id": map_request.id,
         "title": map_request.title,
@@ -73,8 +66,8 @@ def _request_resource(request, map_request):
         "latest_successful_run": _run_resource(latest_successful_run) if latest_successful_run else None,
         "latest_available_run": _run_resource(latest_available_run) if latest_available_run else None,
         "completion_report": map_request.completion_report or {},
-        "has_available_result": latest_artifact is not None,
-        "latest_map_version": latest_artifact.version if latest_artifact else None,
+        "has_available_result": bool(latest_available_run and latest_artifact_readable),
+        "latest_map_version": latest_artifact.version if latest_artifact_readable else None,
         "created_at": map_request.created_at.isoformat(),
         "updated_at": map_request.updated_at.isoformat(),
         "urls": {
@@ -85,6 +78,24 @@ def _request_resource(request, map_request):
             "artifacts": f"{detail_url}artifacts/",
         },
     }
+
+
+def _artifact_path_is_readable(artifact):
+    root = Path(settings.GENERATED_MAPS_DIR).resolve()
+    relative_path = Path(artifact.file_path or "")
+    if not artifact.file_path or relative_path.is_absolute() or ".." in relative_path.parts:
+        return False
+    full_path = (root / relative_path).resolve()
+    if not (full_path == root or root in full_path.parents) or not full_path.is_file():
+        return False
+    try:
+        from PIL import Image
+
+        with Image.open(full_path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _run_resource(run):
@@ -102,6 +113,7 @@ def _run_resource(run):
         "error_code": run.error_code,
         "error_message": run.error_message,
         "completion_report": run.completion_report or {},
+        "source_plan": run.source_plan or {},
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
     }
@@ -298,21 +310,13 @@ def dataset_feature_collection(request, dataset_id):
     except ValueError:
         return _bad_request("bbox 必须是 minx,miny,maxx,maxy")
 
-    from django.contrib.gis.geos import Polygon
-
-    query = DatasetFeature.objects.filter(
-        dataset=dataset,
-        geom__intersects=Polygon.from_bbox(bbox),
-    ).only("id", "source_fid", "geom", "properties")[:limit]
-    features = []
-    for item in query:
-        features.append(
-            {
-                "type": "Feature",
-                "id": item.source_fid,
-                "geometry": json.loads(item.geom.geojson),
-                "properties": item.properties or {},
-            }
+    try:
+        data = read_dataset_features(dataset_id, tuple(bbox), limit)
+        features = json.loads(data.to_json()).get("features", [])
+    except DatasetReadError as exc:
+        return JsonResponse(
+            {"error_code": exc.error_code, "error": str(exc), "retryable": False},
+            status=503 if exc.error_code == "local_catalog_unavailable" else 422,
         )
     return _cached_json(
         request,
@@ -340,6 +344,7 @@ def _state_session_id(request_id):
 
 
 def _layer_manifest(layer, version):
+    source_meta = _runtime_source_metadata(layer)
     return {
         "id": layer.layer_id,
         "version": version,
@@ -352,12 +357,46 @@ def _layer_manifest(layer, version):
         "data_hash": layer.data_hash,
         "render_mode": _effective_render_mode(layer),
         "data_url": layer.data_url,
-        "data_source_meta": source_metadata_from_path(
-            layer.data_source, layer.data_source_meta
-        ),
+        "data_source_meta": source_meta,
         "render_spec": layer.render_spec,
         "visible": layer.visible,
         "z_order": layer.z_order,
+    }
+
+
+def _runtime_source_metadata(layer):
+    """Expose source provenance from the registered Dataset, never its path."""
+    supplied = dict(getattr(layer, "data_source_meta", None) or {})
+    dataset_id = supplied.get("dataset_id")
+    base = {
+        **supplied,
+        "dataset_id": dataset_id,
+        "source_type": None,
+        "provider": supplied.get("provider") or "未注册运行时数据集",
+        "source_url": supplied.get("source_url"),
+        "cache_path": supplied.get("cache_path"),
+        "status": "unavailable",
+    }
+    if not dataset_id:
+        return base
+    try:
+        dataset = Dataset.objects.get(
+            dataset_id=str(dataset_id), status=Dataset.STATUS_AVAILABLE
+        )
+    except Dataset.DoesNotExist:
+        return base
+    except Exception:
+        return base
+    metadata = dict(dataset.metadata or {})
+    return {
+        **supplied,
+        "dataset_id": dataset.dataset_id,
+        "source_type": dataset.source_type,
+        "provider": metadata.get("provider") or dataset.source_type,
+        "source_url": dataset.source_url or None,
+        "attribution": metadata.get("attribution"),
+        "cache_path": metadata.get("cache_path") or dataset.local_path or None,
+        "status": dataset.status,
     }
 
 
@@ -461,12 +500,32 @@ def map_request_collection(request):
     if not isinstance(title, str):
         return _bad_request("title 必须是字符串")
 
-    map_request = MapRequest.objects.create(
-        user=request.user,
-        title=title.strip(),
-        request_text=request_text.strip(),
-        completion_report={},
-    )
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    if len(idempotency_key) > 255:
+        return _bad_request("Idempotency-Key 不能超过 255 个字符")
+    if idempotency_key:
+        existing = MapRequest.objects.filter(
+            user=request.user,
+            creation_idempotency_key=idempotency_key,
+        ).first()
+        if existing:
+            return JsonResponse(_request_resource(request, existing), status=200)
+
+    try:
+        map_request = MapRequest.objects.create(
+            user=request.user,
+            title=title.strip(),
+            request_text=request_text.strip(),
+            completion_report={},
+            creation_idempotency_key=idempotency_key or None,
+        )
+    except IntegrityError:
+        if not idempotency_key:
+            raise
+        map_request = MapRequest.objects.get(
+            user=request.user,
+            creation_idempotency_key=idempotency_key,
+        )
     return JsonResponse(_request_resource(request, map_request), status=201)
 
 
@@ -565,17 +624,32 @@ def map_run_collection(request, request_id):
     if len(idempotency_key) > 255:
         return _bad_request("Idempotency-Key 不能超过 255 个字符")
 
-    try:
-        run, created = MapRun.objects.get_or_create(
+    # Serialize run admission so concurrent tabs cannot all observe the same
+    # free capacity before creating their own active run.
+    with active_run_admission():
+        get_user_model().objects.select_for_update().get(pk=request.user.pk)
+        existing_run = MapRun.objects.filter(
             request=map_request,
             idempotency_key=idempotency_key,
-        )
-    except IntegrityError:
-        run = MapRun.objects.get(
-            request=map_request,
-            idempotency_key=idempotency_key,
-        )
-        created = False
+        ).first()
+        if existing_run:
+            return JsonResponse(_run_resource(existing_run), status=200)
+
+        limit_error = active_run_capacity_error(request.user.id)
+        if limit_error:
+            return JsonResponse(limit_error, status=429)
+
+        try:
+            run, created = MapRun.objects.get_or_create(
+                request=map_request,
+                idempotency_key=idempotency_key,
+            )
+        except IntegrityError:
+            run = MapRun.objects.get(
+                request=map_request,
+                idempotency_key=idempotency_key,
+            )
+            created = False
     if created:
         try:
             dispatch_map_request(map_request.id, run.id)
@@ -585,7 +659,18 @@ def map_run_collection(request, request_id):
                 error_code="WORKER_UNAVAILABLE",
                 error_message="任务提交失败，请稍后重试",
             )
-            return JsonResponse({"error": "任务提交失败，请稍后重试"}, status=503)
+            return JsonResponse(
+                {
+                    "success": False,
+                    "error_code": "worker_unavailable",
+                    "error": "任务提交失败，请稍后重试",
+                    "message": "任务提交失败，请稍后重试",
+                    "retryable": True,
+                    "next_action": "retry_later",
+                    "trace_id": run.trace_id or None,
+                },
+                status=503,
+            )
     return JsonResponse(_run_resource(run), status=201 if created else 200)
 
 
@@ -619,7 +704,7 @@ def _effective_render_mode(layer):
         return layer.render_mode
     if layer.feature_count > getattr(settings, "MAP_WORKER_LIMIT", 30000):
         return "mvt" if getattr(settings, "MAP_MVT_ENABLED", True) else "geojson-worker"
-    if layer.feature_count > getattr(settings, "MAP_GEOJSON_LIMIT", 5000):
+    if layer.feature_count > getattr(settings, "MAP_GEOJSON_LIMIT", 8000):
         return "geojson-worker"
     return "geojson"
 
@@ -748,7 +833,7 @@ def map_layer_data(request, request_id, version, layer_id):
             {"error": "该图层必须通过瓦片接口加载", "render_mode": render_mode},
             status=409,
         )
-    limit = getattr(settings, "MAP_GEOJSON_LIMIT", 5000)
+    limit = getattr(settings, "MAP_GEOJSON_LIMIT", 8000)
     if layer.feature_count > limit and bbox is None:
         return JsonResponse(
             {
@@ -761,36 +846,36 @@ def map_layer_data(request, request_id, version, layer_id):
         )
     if not layer.data_source:
         return JsonResponse({"error": "图层没有可读取的数据源"}, status=404)
-
-    loader = DataLoader()
-    data = loader.load_shapefile(layer.data_source)
-    if data is None:
-        return JsonResponse({"error": "图层数据读取失败"}, status=422)
-    if bbox is not None:
-        data = loader.filter_data(data, spatial_filter=tuple(bbox))
-        worker_limit = getattr(settings, "MAP_WORKER_LIMIT", 30000)
-        if len(data) > worker_limit:
-            return JsonResponse(
-                {
-                    "error_code": "data_too_large",
-                    "error": "当前视口内要素仍超过 Worker 上限，请使用 MVT 瓦片",
-                    "feature_count": len(data),
-                    "limit": worker_limit,
-                    "render_mode": "mvt",
-                    "retryable": False,
-                    "next_action": "use_mvt",
-                },
-                status=413,
-            )
-        if hasattr(data, "geometry"):
-            data = data.copy()
-            data["geometry"] = data.geometry.simplify(0.0001, preserve_topology=True)
-    geojson = loader.create_geojson_from_gdf(data)
-    if isinstance(geojson, dict):
+    dataset_id = (layer.data_source_meta or {}).get("dataset_id")
+    if not dataset_id:
+        return JsonResponse(
+            {
+                "error_code": "dataset_not_registered",
+                "error": "图层尚未注册为运行时数据集",
+                "retryable": False,
+                "next_action": "import_dataset_to_postgis",
+            },
+            status=422,
+        )
+    try:
+        limit = getattr(settings, "MAP_WORKER_LIMIT", 30000)
+        reader_kwargs = {}
+        scope_geometry = (layer.data_source_meta or {}).get("scope_geometry")
+        if scope_geometry is not None:
+            reader_kwargs["clip_geometry"] = scope_geometry
+        data = read_dataset_features(
+            dataset_id, tuple(bbox) if bbox else None, limit, **reader_kwargs
+        )
+        geojson = json.loads(data.to_json())
         returned_count = len(geojson.get("features") or [])
         geojson["truncated"] = False
         geojson["feature_count"] = layer.feature_count
         geojson["returned_count"] = returned_count
+    except DatasetReadError as exc:
+        return JsonResponse(
+            {"error_code": exc.error_code, "error": str(exc), "retryable": False},
+            status=503 if exc.error_code == "local_catalog_unavailable" else 422,
+        )
     return _cached_json(
         request,
         geojson,
@@ -856,38 +941,31 @@ def map_layer_tile(request, request_id, version, layer_id, z, x, y):
                 headers={"Retry-After": "1"},
             )
         return JsonResponse({"error_code": "resource_not_found", "error": "图层不存在"}, status=404)
-    if not layer.data_source:
-        return JsonResponse({"error_code": "resource_not_found", "error": "图层没有可读取的数据源"}, status=404)
-
-    try:
-        data = _load_projected_mvt_data(layer.data_source, layer.data_hash)
-    except FileNotFoundError:
+    dataset_id = (layer.data_source_meta or {}).get("dataset_id")
+    if not dataset_id:
         return JsonResponse(
-            {"error_code": "resource_not_found", "error": "图层数据读取失败", "retryable": False},
+            {"error_code": "dataset_not_registered", "error": "图层尚未注册为运行时数据集", "retryable": False},
             status=422,
         )
     try:
-        payload = encode_tile(
-            data,
-            layer.name or layer.layer_id,
-            zoom,
-            tile_x,
-            tile_y,
-            projected=True,
-        )
-    except ImportError as exc:
+        tile_kwargs = {}
+        scope_geometry = (layer.data_source_meta or {}).get("scope_geometry")
+        if scope_geometry is not None:
+            tile_kwargs["clip_geometry"] = scope_geometry
+        payload = read_dataset_tile(dataset_id, zoom, tile_x, tile_y, **tile_kwargs)
+    except DatasetReadError as exc:
         return JsonResponse(
             {
-                "error_code": "render_error",
-                "error": f"MVT 渲染依赖不可用: {exc}",
+                "error_code": exc.error_code,
+                "error": str(exc),
                 "retryable": False,
-                "next_action": "use_png_fallback",
+                "next_action": "use_png_fallback" if exc.error_code != "validation_error" else None,
             },
-            status=503,
+            status=503 if exc.error_code == "local_catalog_unavailable" else 422,
         )
-    except (RuntimeError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return JsonResponse(
-            {"error_code": "render_error", "error": str(exc), "retryable": False},
+            {"error_code": "render_error", "error": str(exc), "retryable": False, "next_action": "use_png_fallback"},
             status=422,
         )
 

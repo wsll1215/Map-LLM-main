@@ -208,7 +208,150 @@ def test_remote_poi_patch_loads_cached_geojson_as_point_layer(tmp_path, monkeypa
     assert len(records) == 1
     assert new_state.layers[-1].name == "秦皇岛高校"
     assert new_state.layers[-1].geometry_type.value == "point"
-    assert new_state.layers[-1].data_source == str(source_path)
+    assert new_state.layers[-1].data_source.startswith("dataset://remote-")
+    assert new_state.layers[-1].data_source_meta["source_type"] == "remote"
+
+
+def test_remote_poi_adjustment_registers_download_before_runtime_read(monkeypatch, tmp_path):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from gis_mapping_agent.adjustment import engine
+
+    source_path = tmp_path / "universities.geojson"
+    source_path.write_text("{}", encoding="utf-8")
+    frame = gpd.GeoDataFrame(
+        {"name": ["university"]},
+        geometry=[Point(119.5, 39.9)],
+        crs="EPSG:4326",
+    )
+    register_calls = []
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.adjustment.engine.fetch_remote_pois",
+        lambda place, bbox, category="universities": source_path,
+    )
+    monkeypatch.setattr(
+        "mapping.dataset_reader.register_geojson_dataset",
+        lambda path, **kwargs: register_calls.append((path, kwargs)) or "remote-university-1",
+    )
+    monkeypatch.setattr(
+        "mapping.dataset_reader.read_dataset_features",
+        lambda dataset_id, bbox=None, limit=None: frame,
+    )
+    monkeypatch.setattr(
+        "geopandas.read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("remote adjustment must read the normalized Dataset")
+        ),
+    )
+
+    patch = AdjustmentPatch(
+        operations=[
+            PatchOperation(
+                action="add_layer",
+                target="秦皇岛高校",
+                parameters={"source": "remote_poi://universities/秦皇岛"},
+            )
+        ]
+    )
+
+    new_state, _ = ModificationEngine().apply_modifications(make_state(), patch, "标注高校")
+
+    assert register_calls and register_calls[0][0] == source_path
+    assert new_state.layers[-1].data_source == "dataset://remote-university-1"
+
+
+def test_adjustment_runtime_layer_reads_registered_dataset(monkeypatch):
+    import geopandas as gpd
+    from shapely.geometry import Point
+    from gis_mapping_agent.adjustment import engine
+
+    state = make_state()
+    frame = gpd.GeoDataFrame(
+        {"name": ["road"]},
+        geometry=[Point(119.5, 39.5)],
+        crs="EPSG:4326",
+    )
+    monkeypatch.setattr(
+        "mapping.dataset_reader.read_dataset_features",
+        lambda dataset_id, bbox=None, limit=None: frame,
+    )
+    monkeypatch.setattr(
+        "geopandas.read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("adjustment runtime must not read the source file")
+        ),
+    )
+
+    patch = AdjustmentPatch(
+        operations=[
+            PatchOperation(
+                action="add_layer",
+                target="道路",
+                parameters={
+                    "source": "dataset://road-1",
+                    "data_source_meta": {
+                        "dataset_id": "road-1",
+                        "source_type": "local",
+                        "provider": "PostGIS",
+                    },
+                },
+            )
+        ]
+    )
+
+    new_state, records = ModificationEngine().apply_modifications(state, patch, "添加道路")
+
+    assert len(records) == 1
+    assert new_state.layers[-1].data_source == "dataset://road-1"
+    assert new_state.layers[-1].data_source_meta["dataset_id"] == "road-1"
+
+
+def test_adjustment_explicit_file_is_normalized_before_runtime_use(monkeypatch, tmp_path):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    from gis_mapping_agent.adjustment import engine
+
+    source_path = tmp_path / "roads.shp"
+    source_path.touch()
+    frame = gpd.GeoDataFrame(
+        {"name": ["road"]}, geometry=[Point(119.5, 39.9)], crs="EPSG:4326"
+    )
+    register_calls = []
+    monkeypatch.setattr(
+        "gis_mapping_agent.utils.data_path_resolver.extract_data_info_from_request",
+        lambda _source: (str(tmp_path), [source_path.name]),
+    )
+    monkeypatch.setattr(
+        "gis_mapping_agent.utils.data_path_resolver.resolve_data_path",
+        lambda _directory=None: tmp_path,
+    )
+    monkeypatch.setattr("geopandas.read_file", lambda _path: frame)
+    monkeypatch.setattr(
+        "mapping.dataset_reader.register_geodataframe_dataset",
+        lambda imported, **kwargs: register_calls.append((imported, kwargs)) or "imported-road-1",
+    )
+    monkeypatch.setattr(
+        "mapping.dataset_reader.read_dataset_features",
+        lambda dataset_id, bbox=None, limit=None: frame,
+    )
+
+    patch = AdjustmentPatch(
+        operations=[
+            PatchOperation(
+                action="add_layer",
+                target="roads",
+                parameters={"source": source_path.name},
+            )
+        ]
+    )
+
+    new_state, _ = ModificationEngine().apply_modifications(make_state(), patch, "添加道路")
+
+    assert register_calls and register_calls[0][0] is frame
+    assert new_state.layers[-1].data_source == "dataset://imported-road-1"
 
 
 def test_batch_poi_request_uses_deterministic_route_when_llm_fails(monkeypatch):

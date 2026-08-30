@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 import json
 import time
-from typing import Any, Dict, Optional, Type
+from typing import Any, ClassVar, Dict, Optional, Type
 from pydantic import BaseModel, Field, ValidationError
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import CallbackManagerForToolRun
@@ -95,6 +95,7 @@ class BaseGISTool(BaseTool):
     """
 
     # 内部状态
+    owns_trace_span: ClassVar[bool] = True
     _current_map_state: Optional[MapState] = None
     
     def __init__(self, **kwargs):
@@ -130,7 +131,12 @@ class BaseGISTool(BaseTool):
             logger.debug(f"输入参数: {kwargs}")
 
             try:
-                from mapping.trace import publish_trace_event, run_for_session, start_trace_event
+                from mapping.trace import (
+                    publish_trace_event,
+                    publish_trace_lifecycle,
+                    run_for_session,
+                    start_trace_event,
+                )
 
                 trace_run = run_for_session(kwargs.get("session_id"))
                 if trace_run:
@@ -143,7 +149,7 @@ class BaseGISTool(BaseTool):
                         input_data=kwargs,
                         attributes={"tool_name": self.name, "tool_description": self.description or ""},
                     )
-                    publish_trace_event(trace_event)
+                    publish_trace_lifecycle(trace_event, "tool_started")
             except Exception:
                 trace_event = None
 
@@ -183,20 +189,44 @@ class BaseGISTool(BaseTool):
             )
 
             if trace_event:
-                from mapping.trace import finish_trace_event, publish_trace_event
+                from mapping.trace import (
+                    finish_trace_event,
+                    publish_trace_event,
+                    publish_trace_lifecycle,
+                )
 
+                tool_result_payload = result.model_dump(
+                    exclude={"map_state"}
+                ) if hasattr(result, "model_dump") else {
+                    "success": result.success,
+                    "message": result.message,
+                    "data": result.data,
+                }
                 trace_event = finish_trace_event(
                     trace_event,
                     status="success" if result.success else "error",
-                    output_data={"message": result.message, "data": result.data},
-                    attributes={"validated_input": validated_payload, "map_state_changed": bool(result.map_state)},
+                    output_data={
+                        "message": result.message,
+                        "data": result.data,
+                        "tool_result": tool_result_payload,
+                    },
+                    attributes={
+                        "tool_name": self.name,
+                        "tool_description": self.description or "",
+                        "validated_input": validated_payload,
+                        "actual_input": validated_payload,
+                        "map_state_changed": bool(result.map_state),
+                        "retry_count": 0,
+                        "error_code": result.error_code,
+                        "next_action": result.next_action,
+                    },
                     error=None if result.success else {
                         "error_code": result.error_code or "tool_error",
                         "retryable": result.retryable,
                         "next_action": result.next_action or "inspect_trace",
                     },
                 )
-                publish_trace_event(trace_event)
+                publish_trace_lifecycle(trace_event, "tool_finished")
 
             return self._format_output(result)
 
@@ -220,16 +250,30 @@ class BaseGISTool(BaseTool):
             )
 
             if trace_event:
-                from mapping.trace import finish_trace_event, publish_trace_event
+                from mapping.trace import (
+                    finish_trace_event,
+                    publish_trace_event,
+                    publish_trace_lifecycle,
+                )
 
+                error_details = classify_tool_error(e)
                 trace_event = finish_trace_event(
                     trace_event,
                     status="error",
                     output_data={"message": error_msg},
-                    attributes={"validated_input": validated_payload},
-                    error={"error_code": getattr(e, "error_code", "internal_error"), "retryable": bool(getattr(e, "retryable", False)), "next_action": "inspect_trace"},
+                    attributes={
+                        "tool_name": self.name,
+                        "tool_description": self.description or "",
+                        "validated_input": validated_payload,
+                        "actual_input": validated_payload,
+                        "map_state_changed": False,
+                        "retry_count": 0,
+                        "error_code": error_details["error_code"],
+                        "next_action": error_details["next_action"],
+                    },
+                    error=error_details,
                 )
-                publish_trace_event(trace_event)
+                publish_trace_lifecycle(trace_event, "tool_finished")
             
             error_result = tool_failure(error_msg, e, data={"error": str(e)})
             return self._format_output(error_result)

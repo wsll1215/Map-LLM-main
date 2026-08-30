@@ -5,7 +5,7 @@ from pathlib import Path
 from django.core.management.base import BaseCommand, CommandError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection, transaction
-from django.contrib.gis.geos import WKBReader
+from django.contrib.gis.geos import GEOSGeometry
 
 from gis_mapping_agent.data_sources import LocalDatasetCatalog
 from gis_mapping_agent.utils.config import Config
@@ -45,7 +45,6 @@ class Command(BaseCommand):
     def _import_one(self, dataset, relative_path, batch_size, replace):
         import geopandas as gpd
 
-        wkb_reader = WKBReader()
         path = (Config.DATA_DIRECTORY_BASE / relative_path).resolve()
         if Config.DATA_DIRECTORY_BASE.resolve() not in path.parents:
             raise CommandError(f"数据路径越界: {relative_path}")
@@ -74,11 +73,10 @@ class Command(BaseCommand):
                     DatasetFeature(
                         dataset=dataset,
                         source_fid=str(index),
-                        geom=wkb_reader.read(memoryview(geometry.wkb)),
+                        geom=GEOSGeometry(geometry.wkt, srid=4326),
                         properties=properties,
                     )
                 )
-                rows[-1].geom.srid = 4326
                 if len(rows) >= batch_size:
                     DatasetFeature.objects.bulk_create(rows, batch_size=batch_size)
                     rows.clear()

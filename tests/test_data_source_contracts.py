@@ -8,7 +8,9 @@ from gis_mapping_agent.data_sources.planner import (
     parse_intent,
     plan_sources,
     resolve_local_location,
+    semantic_plan_from_source_plan,
 )
+from gis_mapping_agent.data_sources.coordinator import build_source_plan
 from gis_mapping_agent.data_sources.catalog import DjangoDatasetCatalog
 
 
@@ -123,6 +125,36 @@ def test_runtime_catalog_preserves_registered_poi_role():
     assert descriptors[0].role == "primary_school"
 
 
+def test_runtime_catalog_fails_closed_when_feature_count_query_is_unavailable():
+    class Features:
+        def count(self):
+            raise RuntimeError("database connection lost")
+
+    row = type(
+        "DatasetRow",
+        (),
+        {
+            "status": "available",
+            "dataset_id": "local-road-db-error",
+            "name": "Highway",
+            "aliases": [],
+            "source_type": "local",
+            "local_path": "data/road.shp",
+            "geometry_type": "LineString",
+            "crs": "EPSG:4326",
+            "bbox": [120, 30, 121, 31],
+            "feature_count": 3,
+            "metadata": {},
+            "features": Features(),
+        },
+    )()
+    FakeDatasetModel.objects = FakeDatasetManager([row])
+    catalog = DjangoDatasetCatalog(FakeDatasetModel)
+
+    assert catalog.scan() == []
+    assert catalog.last_error["error_code"] == "local_catalog_unavailable"
+
+
 def test_local_location_index_is_used_before_remote_geocoding():
     descriptor = type(
         "Descriptor",
@@ -138,8 +170,24 @@ def test_local_location_index_is_used_before_remote_geocoding():
 
     resolution = resolve_local_location("甲市", Catalog([descriptor]))
 
-    assert resolution.provider == "PostGIS"
-    assert resolution.bbox == (120.0, 30.0, 121.0, 31.0)
+    assert resolution is None
+
+
+def test_local_location_index_requires_postgis_geometry():
+    descriptor = type(
+        "Descriptor",
+        (),
+        {
+            "name": "甲市",
+            "aliases": [],
+            "role": "boundary",
+            "bbox": [120, 30, 121, 31],
+            "local_path": "data/a.shp",
+            "dataset_id": "local-boundary",
+        },
+    )()
+
+    assert resolve_local_location("甲市", Catalog([descriptor])) is None
 
 
 def test_local_location_index_does_not_treat_a_generic_suffix_as_a_place():
@@ -245,9 +293,11 @@ def test_plan_sources_uses_remote_source_after_local_spatial_miss():
         provider="OpenStreetMap/Overpass",
         source_url="https://example.test/overpass",
         cache_path="data_cache/road.geojson",
+        dataset_id="remote-road",
         bbox=location.bbox,
         feature_count=4,
         status="available",
+        geometry_valid=True,
         spatial_valid=True,
     )
 
@@ -397,3 +447,112 @@ def test_location_resolution_failure_never_returns_a_global_extent(monkeypatch):
     assert resolution.error_code == "location_not_resolved"
     assert resolution.bbox is None
     assert resolution.geometry is None
+
+
+def test_remote_location_with_bbox_but_without_geometry_is_unresolved(monkeypatch):
+    import gis_mapping_agent.data_sources.remote as remote
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"display_name": "甲市", "boundingbox": ["30", "120", "31", "121"]}]
+
+    monkeypatch.setattr(remote.requests, "get", lambda *args, **kwargs: Response())
+
+    resolution = remote.resolve_location("甲市")
+
+    assert resolution.error_code == "location_not_resolved"
+    assert resolution.bbox is None
+    assert resolution.geometry is None
+
+
+def test_location_resolution_preserves_remote_failure_metadata(monkeypatch):
+    def fail_request(*args, **kwargs):
+        raise remote.RemoteDataSourceError(
+            "服务暂时不可用",
+            code="network_error",
+            retryable=True,
+            status_code=503,
+            retry_after=2.0,
+        )
+
+    monkeypatch.setattr(remote, "_request_with_retries", fail_request)
+
+    resolution = remote.resolve_location("甲市")
+
+    assert resolution.error_code == "network_error"
+    assert resolution.retryable is True
+    assert resolution.next_action == "retry_location_resolution"
+    assert resolution.status_code == 503
+
+
+def test_build_source_plan_preserves_location_failure_metadata():
+    intent = parse_intent("绘制甲市道路")
+    location = LocationResolution(
+        text="甲市",
+        precision="unknown",
+        bbox=None,
+        geometry=None,
+        provider="OpenStreetMap/Nominatim",
+        confidence=0.0,
+        error_code="network_error",
+        retryable=True,
+        next_action="retry_location_resolution",
+        status_code=503,
+    )
+
+    plan = build_source_plan(intent, location=location, catalog=Catalog([]))
+
+    assert plan.layers[0].error_code == "network_error"
+    assert plan.layers[0].retryable is True
+    assert plan.layers[0].next_action == "retry_location_resolution"
+
+
+def test_semantic_projection_keeps_each_requested_poi_source_distinct():
+    intent = parse_intent("绘制甲市并标注小学和高校")
+    source_plan = SourcePlan(
+        intent=intent,
+        location=None,
+        layers=(
+            PlannedSource(
+                role="primary_school",
+                source_type="remote",
+                provider="OpenStreetMap/Overpass",
+                source_url="https://overpass.example/schools",
+                cache_path="data_cache/remote_pois/primary-schools.geojson",
+                dataset_id="remote-primary-schools",
+                bbox=(120.0, 30.0, 121.0, 31.0),
+                feature_count=3,
+                status="available",
+                geometry_valid=True,
+                spatial_valid=True,
+            ),
+            PlannedSource(
+                role="university",
+                source_type="remote",
+                provider="OpenStreetMap/Overpass",
+                source_url="https://overpass.example/universities",
+                cache_path="data_cache/remote_pois/universities.geojson",
+                dataset_id="remote-universities",
+                bbox=(120.0, 30.0, 121.0, 31.0),
+                feature_count=2,
+                status="available",
+                geometry_valid=True,
+                spatial_valid=True,
+            ),
+        ),
+    )
+
+    projected = semantic_plan_from_source_plan(source_plan)
+
+    assert projected.path_for_layer("小学") == "data_cache/remote_pois/primary-schools.geojson"
+    assert projected.path_for_layer("高校") == "data_cache/remote_pois/universities.geojson"
+    instructions = projected.prompt_instructions()
+    assert "dataset_id='remote-primary-schools'" in instructions
+    assert "dataset_id='remote-universities'" in instructions
+    assert "primary-schools.geojson" not in instructions
+    assert "universities.geojson" not in instructions
+    assert projected.source_metadata["primary_school"]["dataset_id"] == "remote-primary-schools"
+    assert projected.source_metadata["university"]["dataset_id"] == "remote-universities"

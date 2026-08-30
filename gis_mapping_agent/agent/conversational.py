@@ -47,6 +47,7 @@ class ConversationState(TypedDict):
     needs_clarification: bool
     clarification_data: Dict[str, Any]
     last_operation: Optional[str]
+    source_plan: Optional[Dict[str, Any]]
     conversation_history: List[Dict[str, Any]]
 
 
@@ -187,6 +188,7 @@ class ConversationalMappingAgent:
                 "clarification": result.get("clarification_data", {}),
                 "current_map_state": result.get("current_map_state") is not None,
                 "last_operation": result.get("last_operation")
+                , "source_plan": result.get("source_plan")
             }
             
             # 如果有地图状态，添加相关信息
@@ -402,16 +404,25 @@ class ConversationalMappingAgent:
             ]
 
             try:
-                from mapping.trace import invoke_llm_with_trace
+                from mapping.trace import invoke_llm_with_trace, stream_llm_with_trace
             except Exception:
                 response = self.llm.invoke(messages)
             else:
-                response = invoke_llm_with_trace(
-                    session_id=getattr(self, "session_id", None),
-                    invoke=self.llm.invoke,
-                    messages=messages,
-                    attributes={"model": getattr(self.llm, "model_name", None), "phase": "intent"},
-                )
+                stream = getattr(self.llm, "stream", None)
+                if callable(stream):
+                    response = stream_llm_with_trace(
+                        session_id=getattr(self, "session_id", None),
+                        stream=stream,
+                        messages=messages,
+                        attributes={"model": getattr(self.llm, "model_name", None), "phase": "intent"},
+                    )
+                else:
+                    response = invoke_llm_with_trace(
+                        session_id=getattr(self, "session_id", None),
+                        invoke=self.llm.invoke,
+                        messages=messages,
+                        attributes={"model": getattr(self.llm, "model_name", None), "phase": "intent"},
+                    )
             intent = response.content.strip().lower()
 
             # 验证返回的意图
@@ -700,6 +711,7 @@ class ConversationalMappingAgent:
                     user_request,
                 ])
             result = self.creation_agent.create_map(create_request)
+            state["source_plan"] = result.get("source_plan")
 
             if result["success"]:
                 # 获取创建的地图状态

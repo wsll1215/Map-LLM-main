@@ -1,34 +1,29 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mappingApi } from "./mappingApi";
 
-describe("mappingApi trace loading", () => {
+describe("mapping operation idempotency", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("loads the full desktop trace page by default", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ items: [], next_cursor: null, total_count: 0 }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+  it("reuses the caller operation key for a deliberate process retry", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValue(new Response(JSON.stringify({ success: true, request_id: 7 }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await mappingApi.traceEvents(141, 194);
+    await mappingApi.process(7, "run-operation-1");
 
-    expect(fetchMock.mock.calls[0][0]).toContain("/events/?limit=100");
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(new Headers(request.headers).get("Idempotency-Key")).toBe("run-operation-1");
   });
 
-  it("scopes historical logs to the selected run", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ logs: [] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+  it("keeps a message id stable across an explicit message retry", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValue(new Response(JSON.stringify({ success: true, request_id: 7 }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await mappingApi.logs(142, 197);
+    await mappingApi.continue(7, "补充道路", "message-operation-1", "message-1");
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/mapping/api/process-logs/142/?run_id=197");
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("Idempotency-Key")).toBe("message-operation-1");
+    expect(headers.get("X-Message-Id")).toBe("message-1");
   });
 });

@@ -147,8 +147,10 @@ class DjangoDatasetCatalog:
     def __init__(self, dataset_model=None):
         self.dataset_model = dataset_model
         self.logger = get_logger("DjangoDatasetCatalog")
+        self.last_error = None
 
     def scan(self) -> List[DatasetDescriptor]:
+        self.last_error = None
         try:
             model = self.dataset_model
             if model is None:
@@ -163,12 +165,13 @@ class DjangoDatasetCatalog:
             for dataset in queryset:
                 metadata = dict(dataset.metadata or {})
                 feature_count = dataset.feature_count
-                # DatasetFeature is authoritative when it is available. The
-                # fallback keeps lightweight SQLite catalogs usable in tests.
-                try:
-                    feature_count = dataset.features.count()
-                except Exception:
-                    pass
+                # DatasetFeature is authoritative whenever the related manager
+                # exists. A database failure must fail closed; using the stale
+                # Dataset.feature_count would make an unavailable catalog look
+                # like a valid local source.
+                related_features = getattr(dataset, "features", None)
+                if related_features is not None:
+                    feature_count = related_features.count()
                 if feature_count is None or feature_count <= 0:
                     continue
                 descriptors.append(
@@ -188,6 +191,10 @@ class DjangoDatasetCatalog:
                 )
             return descriptors
         except Exception as exc:
+            self.last_error = {
+                "error_code": "local_catalog_unavailable",
+                "message": str(exc)[:300],
+            }
             self.logger.warning(f"运行时数据目录不可用: {exc}")
             return []
 

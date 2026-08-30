@@ -2,8 +2,10 @@
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import json
+import math
+import time
 
 
 from langchain_openai import ChatOpenAI
@@ -26,11 +28,44 @@ from ..data_sources.remote import (
     RemoteDataSourceError,
 )
 from ..data_sources.catalog import DjangoDatasetCatalog
-from ..data_sources.planner import parse_intent, plan_local_sources, resolve_local_location
+from ..data_sources.planner import (
+    parse_intent,
+    plan_local_sources,
+    resolve_local_location,
+    semantic_plan_from_source_plan,
+)
+from ..data_sources.coordinator import build_source_plan
 from ..gis import calculate_extent_from_files, format_extent_for_request
 from ..state import get_generalization_context
 from ..tools.registry import ALL_UNIFIED_TOOLS
 from ..tools.base import format_tool_result, tool_failure
+
+
+def tool_observation_error(observation: str) -> Optional[Dict[str, Any]]:
+    """Extract a structured tool failure without guessing from success text."""
+    text = str(observation or "").strip()
+    payload: Any = None
+    try:
+        decoded = json.loads(text)
+        payload = decoded.get("tool_result") if isinstance(decoded, dict) else None
+        if payload is None and isinstance(decoded, dict) and "success" in decoded:
+            payload = decoded
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+
+    if isinstance(payload, dict) and payload.get("success") is False:
+        return {
+            "error_code": payload.get("error_code") or "tool_error",
+            "retryable": bool(payload.get("retryable", False)),
+            "next_action": payload.get("next_action") or "inspect_trace",
+        }
+    if text.startswith(("❌", "错误")):
+        return {
+            "error_code": "tool_error",
+            "retryable": True,
+            "next_action": "adjust_tool_arguments",
+        }
+    return None
 
 
 def _boundary_extent_inputs(boundary_path: Optional[str]) -> Tuple[Optional[str], Optional[List[str]]]:
@@ -39,6 +74,23 @@ def _boundary_extent_inputs(boundary_path: Optional[str]) -> Tuple[Optional[str]
         return None, None
     path = Path(boundary_path).resolve()
     return str(path.parent), [path.name]
+
+
+def _extent_from_location(location: Any) -> Optional[List[float]]:
+    """Use the backend-verified location bbox as the runtime map extent."""
+    bbox = getattr(location, "bbox", None)
+    try:
+        values = [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+    if (
+        len(values) != 4
+        or not all(math.isfinite(value) for value in values)
+        or values[0] >= values[2]
+        or values[1] >= values[3]
+    ):
+        return None
+    return values
 
 
 class ThinkingGISMappingAgent:
@@ -68,6 +120,7 @@ class ThinkingGISMappingAgent:
         self._default_data_file_path = None
         self._explicit_data_files = False
         self._semantic_data_plan = None
+        self._source_plan = None
         self._source_errors = []
 
         # 验证配置
@@ -105,6 +158,7 @@ class ThinkingGISMappingAgent:
 
         # 当前地图状态
         self.current_map_state: Optional[MapState] = None
+        self.last_assistant_message_id: Optional[str] = None
 
         # self.logger.info("思考型GIS制图智能体初始化完成")
 
@@ -117,20 +171,38 @@ class ThinkingGISMappingAgent:
             # 从用户请求中提取数据目录和文件信息
             explicit_data_files = data_path_resolver.find_data_files_in_request(user_request)
             data_dir_from_request, data_files_from_request = extract_data_info_from_request(user_request)
-            intent = parse_intent(user_request)
+            intent = self._run_trace_phase(
+                event_type="intent_parse",
+                phase="intent",
+                summary="识别用户意图",
+                input_data={"request_text": user_request},
+                operation=lambda: parse_intent(user_request),
+                output_serializer=lambda value: {
+                    "location": {
+                        "text": value.location.text,
+                        "precision": value.location.precision,
+                    },
+                    "layers": [
+                        {"role": layer.role, "required": layer.required}
+                        for layer in value.layers
+                    ],
+                    "unknown_fields": list(value.unknown_fields),
+                    "confidence": value.confidence,
+                },
+            )
             self._explicit_data_files = bool(explicit_data_files or intent.explicit_sources)
             if not self._explicit_data_files:
                 data_dir_from_request, data_files_from_request = None, []
             self._default_data_file_path = None
             self._semantic_data_plan = None
             self._source_errors = []
+            self._source_plan = None
             location = None
             if not self._explicit_data_files and data_dir_from_request and data_files_from_request:
                 self._default_data_file_path = resolve_data_path(data_dir_from_request) / data_files_from_request[0]
 
             if not self._explicit_data_files and not data_files_from_request:
-                location_query = intent.location.text
-                if intent.layers and not location_query:
+                if intent.layers and not intent.location.text:
                     return {
                         "success": False,
                         "status": "needs_clarification",
@@ -141,72 +213,39 @@ class ThinkingGISMappingAgent:
                             "next_action": "provide_location",
                         },
                     }
-                if location_query:
-                    runtime_catalog = DjangoDatasetCatalog()
-                    location = resolve_local_location(location_query, runtime_catalog)
-                    if location is None:
-                        location = resolve_location(location_query)
-                    if location.error_code:
-                        return {
-                            "success": False,
-                            "status": "failed",
-                            "message": f"地点解析失败：{location_query}",
-                            "error_code": location.error_code,
-                            "error": location.error_code,
-                        }
-
             if not self._explicit_data_files:
-                self._semantic_data_plan = plan_local_sources(
-                    user_request,
-                    catalog=DjangoDatasetCatalog(),
-                    boundary_path=(
-                        str(self._default_data_file_path)
-                        if self._default_data_file_path
-                        and not str(self._default_data_file_path).lower().endswith(
-                            ".shp"
-                        )
-                        else None
+                self._source_plan = self._run_trace_phase(
+                    event_type="source_plan",
+                    phase="data_source",
+                    summary="规划数据源",
+                    input_data={
+                        "location": intent.location.text,
+                        "roles": [layer.role for layer in intent.layers],
+                    },
+                    operation=lambda: build_source_plan(
+                        intent,
+                        request_text=user_request,
+                        catalog=DjangoDatasetCatalog(),
+                        session_id=getattr(self, "session_id", None),
                     ),
-                    location_bbox=location.bbox if location else None,
+                    output_serializer=self._serialize_source_plan,
                 )
-                # Only acquire a remote boundary after the runtime catalog has
-                # failed to provide a verified local boundary.
-                if not self._semantic_data_plan.boundary_path and intent.location.text:
-                    try:
-                        remote_path = fetch_remote_boundary(intent.location.text)
-                    except Exception as exc:
-                        self._record_source_error("boundary", exc)
-                        remote_path = None
-                    if remote_path:
-                        data_dir_from_request = str(remote_path.parent)
-                        data_files_from_request = [remote_path.name]
-                        self._default_data_file_path = remote_path
-                        self._semantic_data_plan = plan_local_sources(
-                            user_request,
-                            catalog=DjangoDatasetCatalog(),
-                            boundary_path=str(remote_path),
-                            location_bbox=location.bbox if location else None,
-                        )
-                    else:
-                        self._semantic_data_plan = replace(
-                            self._semantic_data_plan,
-                            issues=tuple(
-                                dict.fromkeys(
-                                    (*self._semantic_data_plan.issues, "未找到可用的边界数据")
-                                )
-                            ),
-                        )
-                self._semantic_data_plan = self._add_remote_road_source(
-                    user_request, self._semantic_data_plan
-                )
-                self._semantic_data_plan = self._add_remote_river_source(
-                    user_request, self._semantic_data_plan
-                )
-                self._semantic_data_plan = self._add_remote_poi_source(
-                    user_request, self._semantic_data_plan
-                )
-                if self._semantic_data_plan.issues:
-                    message = "数据源校验未通过：" + "；".join(self._semantic_data_plan.issues)
+                self._semantic_data_plan = semantic_plan_from_source_plan(self._source_plan)
+                self._source_errors = [
+                    {
+                        "role": source.role,
+                        "error_code": source.error_code,
+                        "retryable": source.retryable,
+                        "next_action": source.next_action,
+                        "message": source.error_code,
+                    }
+                    for source in self._source_plan.layers
+                    if source.status in {"failed", "rejected"} and source.error_code
+                ]
+                if self._source_plan.location and self._source_plan.location.bbox:
+                    location = self._source_plan.location
+                if self._source_plan.issues:
+                    message = "数据源校验未通过：" + "；".join(self._source_plan.issues)
                     self.logger.error(message)
                     return {
                         "success": False,
@@ -216,21 +255,21 @@ class ThinkingGISMappingAgent:
                                        if self._source_errors else "resource_not_found"),
                         "source_errors": list(self._source_errors),
                     }
-                if self._semantic_data_plan.boundary_path:
-                    self._default_data_file_path = resolve_data_path(
-                        self._semantic_data_plan.boundary_path.removeprefix("data/")
-                    )
-                    data_dir_from_request, data_files_from_request = _boundary_extent_inputs(
-                        str(self._default_data_file_path)
-                    )
-
             # 自动计算范围
-            self.auto_extent, self.auto_extent_str = self._calculate_auto_extent(
-                data_directory=data_dir_from_request,
-                data_files=data_files_from_request if data_files_from_request else None,
-                margin_ratio=Config.HYPERPARAMETERS.AUTO_EXTENT_MARGIN_RATIO,
-                verbose=True
-            )
+            if not self._explicit_data_files and location is not None:
+                self.auto_extent = _extent_from_location(location)
+                self.auto_extent_str = (
+                    format_extent_for_request(self.auto_extent)
+                    if self.auto_extent
+                    else None
+                )
+            else:
+                self.auto_extent, self.auto_extent_str = self._calculate_auto_extent(
+                    data_directory=data_dir_from_request,
+                    data_files=data_files_from_request if data_files_from_request else None,
+                    margin_ratio=Config.HYPERPARAMETERS.AUTO_EXTENT_MARGIN_RATIO,
+                    verbose=True
+                )
 
             # 增强用户请求
             enhanced_request = self._enhance_request_with_auto_extent(user_request)
@@ -259,6 +298,8 @@ class ThinkingGISMappingAgent:
                 "map_state": final_map_state.model_dump() if final_map_state else None,
                 "thinking_steps": result.get("thinking_steps", []),
                 "source_errors": list(self._source_errors),
+                "assistant_message_id": self.last_assistant_message_id,
+                "source_plan": self._serialize_source_plan(self._source_plan),
             }
 
             if not result.get("terminal_tool"):
@@ -277,6 +318,156 @@ class ThinkingGISMappingAgent:
                 "source_errors": list(getattr(self, "_source_errors", [])),
             }
 
+    @staticmethod
+    def _serialize_source_plan(plan):
+        if plan is None:
+            return None
+        location_geometry = plan.location.geometry if plan.location else None
+        if location_geometry is not None and not isinstance(location_geometry, dict):
+            try:
+                from shapely.geometry import mapping as shapely_mapping
+
+                location_geometry = shapely_mapping(location_geometry)
+            except (ImportError, TypeError, ValueError):
+                location_geometry = None
+        return {
+            "location": {
+                "text": plan.location.text if plan.location else None,
+                "bbox": list(plan.location.bbox) if plan.location and plan.location.bbox else None,
+                "geometry": location_geometry,
+                "provider": plan.location.provider if plan.location else None,
+                "confidence": plan.location.confidence if plan.location else 0,
+                "error_code": plan.location.error_code if plan.location else None,
+                "retryable": plan.location.retryable if plan.location else False,
+                "next_action": plan.location.next_action if plan.location else None,
+                "status_code": plan.location.status_code if plan.location else None,
+            },
+            "layers": [
+                {
+                    "role": item.role,
+                    "source_type": item.source_type,
+                    "provider": item.provider,
+                    "dataset_id": item.dataset_id,
+                    "source_url": item.source_url,
+                    "cache_path": item.cache_path,
+                    "bbox": list(item.bbox),
+                    "status": item.status,
+                    "feature_count": item.feature_count,
+                    "geometry_valid": item.geometry_valid,
+                    "spatial_valid": item.spatial_valid,
+                    "error_code": item.error_code,
+                    "retryable": item.retryable,
+                    "next_action": item.next_action,
+                    "attempts": list(item.attempts),
+                    "metadata": dict(item.metadata),
+                }
+                for item in plan.layers
+            ],
+            "issues": list(plan.issues),
+        }
+
+    def _run_trace_phase(
+        self,
+        *,
+        event_type: str,
+        phase: str,
+        summary: str,
+        input_data: Any,
+        operation: Callable[[], Any],
+        output_serializer: Optional[Callable[[Any], Any]] = None,
+    ) -> Any:
+        """Execute one agent phase and close its trace span exactly once."""
+        try:
+            from mapping.trace import (
+                finish_trace_event,
+                publish_trace_event,
+                publish_trace_lifecycle,
+                run_for_session,
+                start_trace_event,
+                trace_lifecycle_names,
+            )
+
+            run = run_for_session(getattr(self, "session_id", None))
+        except Exception:
+            run = None
+
+        span = None
+        if run:
+            try:
+                span = start_trace_event(
+                    run=run,
+                    event_type=event_type,
+                    phase=phase,
+                    actor="agent",
+                    summary=summary,
+                    input_data=input_data,
+                )
+                lifecycle = trace_lifecycle_names(event_type)
+                if lifecycle:
+                    publish_trace_lifecycle(span, lifecycle[0])
+                else:
+                    publish_trace_event(span)
+            except Exception:
+                span = None
+
+        try:
+            result = operation()
+        except Exception as exc:
+            if span is not None:
+                try:
+                    span = finish_trace_event(
+                        span,
+                        status="error",
+                        error={
+                            "error_code": getattr(exc, "error_code", "internal_error"),
+                            "retryable": bool(getattr(exc, "retryable", False)),
+                            "next_action": "inspect_trace",
+                        },
+                    )
+                    lifecycle = trace_lifecycle_names(event_type)
+                    if lifecycle:
+                        publish_trace_lifecycle(span, lifecycle[1])
+                    else:
+                        publish_trace_event(span)
+                except Exception:
+                    pass
+            raise
+
+        if span is not None:
+            try:
+                output = output_serializer(result) if output_serializer else result
+            except Exception as exc:
+                try:
+                    span = finish_trace_event(
+                        span,
+                        status="error",
+                        error={
+                            "error_code": "trace_serialization_error",
+                            "retryable": False,
+                            "next_action": "inspect_trace",
+                            "message": str(exc),
+                        },
+                    )
+                    lifecycle = trace_lifecycle_names(event_type)
+                    if lifecycle:
+                        publish_trace_lifecycle(span, lifecycle[1])
+                    else:
+                        publish_trace_event(span)
+                except Exception:
+                    pass
+            else:
+                try:
+                    span = finish_trace_event(span, status="success", output_data=output)
+                    lifecycle = trace_lifecycle_names(event_type)
+                    if lifecycle:
+                        publish_trace_lifecycle(span, lifecycle[1])
+                    else:
+                        publish_trace_event(span)
+                except Exception:
+                    # Trace persistence must never change the GIS result.
+                    pass
+        return result
+
     def _execute_thinking_loop(self, user_request: str) -> Dict[str, Any]:
         """执行思考-行动-观察循环（使用OpenAI工具调用标准）"""
         thinking_steps = []
@@ -287,42 +478,51 @@ class ThinkingGISMappingAgent:
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_request)
         ]
+        last_tool_error: Optional[Dict[str, Any]] = None
+        tool_error_counts: Dict[str, int] = {}
 
         while iteration < self.max_iterations:
             iteration += 1
             if self.verbose:
                 print(f"\n🔄 步骤 {iteration}")
 
-            try:
-                from mapping.trace import invoke_llm_with_trace
-            except Exception:
-                response = self.llm.invoke(messages)
-            else:
-                response = invoke_llm_with_trace(
-                    session_id=getattr(self, "session_id", None),
-                    invoke=self.llm.invoke,
-                    messages=messages,
-                    attributes={"model": getattr(self.llm, "model_name", None), "phase": "tool_selection"},
-                )
+            response = self._stream_llm_response(
+                messages,
+                phase="tool_selection",
+                iteration=iteration,
+            )
             messages.append(response)
 
             if not response.tool_calls:
                 if self.verbose:
-                    print("✅ 任务完成")
+                    print("⚠️ 模型未执行工具，任务尚未完成")
 
-                self.logger.info("模型决定结束任务，没有工具调用。")
+                self.logger.warning("模型在没有工具调用的情况下结束，不能宣称地图完成。")
                 thinking_steps.append({
                     "iteration": iteration,
                     "thought": response.content,
-                    "action": "FINAL_ANSWER",
+                    "action": "NO_TOOL_CALL",
                     "action_input": "",
-                    "observation": "任务完成"
+                    "observation": "任务尚未完成：模型没有执行任何工具"
                 })
+                if last_tool_error:
+                    return {
+                        "success": False,
+                        "message": "工具调用失败后模型未继续修正参数，任务尚未完成",
+                        "output": response.content,
+                        "thinking_steps": thinking_steps,
+                        "error_code": last_tool_error["error_code"],
+                        "retryable": last_tool_error["retryable"],
+                        "next_action": last_tool_error["next_action"],
+                    }
                 return {
-                    "success": True,
-                    "message": "地图创建完成",
+                    "success": False,
+                    "message": "模型未执行地图工具，任务尚未完成",
                     "output": response.content,
-                    "thinking_steps": thinking_steps
+                    "thinking_steps": thinking_steps,
+                    "error_code": "agent_no_tool_call",
+                    "retryable": True,
+                    "next_action": "continue_tool_execution",
                 }
 
             for tool_call in response.tool_calls:
@@ -335,7 +535,52 @@ class ThinkingGISMappingAgent:
                     chinese_tool_name = TOOL_NAME_MAP.get(tool_name, tool_name)
                     print(f"🛠️ {chinese_tool_name}")
 
+                trace_span = None
+                trace_owned_by_tool = bool(
+                    getattr(self.tool_dict.get(tool_name), "owns_trace_span", False)
+                )
+                if not trace_owned_by_tool:
+                    try:
+                        from mapping.trace import (
+                            finish_trace_event,
+                            publish_trace_lifecycle,
+                            run_for_session,
+                            start_trace_event,
+                        )
+
+                        trace_run = run_for_session(getattr(self, "session_id", None))
+                        if trace_run:
+                            trace_span = start_trace_event(
+                                run=trace_run,
+                                event_type="tool_call",
+                                phase="tool",
+                                actor="agent",
+                                summary=f"执行工具: {tool_name}",
+                                input_data=tool_input,
+                                attributes={"tool_name": tool_name, "iteration": iteration},
+                            )
+                            publish_trace_lifecycle(trace_span, "tool_started")
+                    except Exception:
+                        trace_span = None
+
                 observation = self._execute_tool(tool_name, tool_input)
+                observation_error = tool_observation_error(observation)
+                if trace_span is not None:
+                    try:
+                        from mapping.trace import finish_trace_event, publish_trace_lifecycle
+
+                        trace_span = finish_trace_event(
+                            trace_span,
+                            status="error" if observation_error else "success",
+                            output_data={"observation": observation},
+                            error=observation_error,
+                        )
+                        publish_trace_lifecycle(trace_span, "tool_finished")
+                        from mapping.trace import publish_trace_event
+
+                        publish_trace_event(trace_span)
+                    except Exception:
+                        pass
                 self._publish_realtime_tool_event(
                     iteration=iteration,
                     tool_name=tool_name,
@@ -361,6 +606,23 @@ class ThinkingGISMappingAgent:
                     "action_input": json.dumps(tool_input, ensure_ascii=False),
                     "observation": observation
                 })
+
+                if observation_error:
+                    error_code = str(observation_error["error_code"])
+                    tool_error_counts[error_code] = tool_error_counts.get(error_code, 0) + 1
+                    last_tool_error = observation_error
+                    if tool_error_counts[error_code] >= 2:
+                        return {
+                            "success": False,
+                            "message": "同一工具错误连续出现，已停止重复调用",
+                            "output": observation,
+                            "thinking_steps": thinking_steps,
+                            "error_code": error_code,
+                            "retryable": observation_error["retryable"],
+                            "next_action": observation_error["next_action"],
+                        }
+                else:
+                    last_tool_error = None
 
                 if self._is_terminal_tool_success(tool_name, observation):
                     self.logger.debug(f"终止型工具已成功执行，结束任务: {tool_name}")
@@ -459,21 +721,44 @@ class ThinkingGISMappingAgent:
             if tool_name == "add_layer" and not self._explicit_data_files:
                 tool_input = dict(tool_input)
                 plan = getattr(self, "_semantic_data_plan", None)
-                planned_path = plan.path_for_layer(tool_input.get("name", "")) if plan else None
-                if plan and plan.requires_layer(tool_input.get("name", "")) and not planned_path:
-                    role = plan.role_for_layer(tool_input.get("name", "")) or "请求的"
+                layer_name = tool_input.get("name", "")
+                layer_role = plan.role_for_layer(layer_name) if plan else None
+                planned_path = plan.path_for_layer(layer_name) if plan else None
+                source_meta = (
+                    getattr(plan, "source_metadata", {}).get(layer_role, {})
+                    if plan and layer_role
+                    else {}
+                )
+                planned_dataset_id = source_meta.get("dataset_id")
+                if plan and (
+                    not layer_role
+                    or layer_role not in plan.requested_roles
+                    or (not planned_path and not planned_dataset_id)
+                ):
+                    role = layer_role or "请求的"
                     return format_tool_result(
                         tool_failure(
                             f"{role}图层没有经过校验的数据源，已阻止使用默认文件。",
                             ValueError("数据源未经过校验"),
                         )
                     )
-                if planned_path:
+                if planned_dataset_id:
+                    # Implicit requests must use the backend's registered
+                    # Dataset. The cache path is provenance only and must not
+                    # become an executable tool argument.
+                    tool_input["dataset_id"] = str(planned_dataset_id)
+                    tool_input["data_path"] = None
+                    tool_input["data_source_meta"] = source_meta
+                elif planned_path:
+                    # Planner-only/legacy callers have no Dataset registry;
+                    # retain their explicit compatibility path until migrated.
                     tool_input["data_path"] = planned_path
+                    if source_meta:
+                        tool_input["data_source_meta"] = source_meta
                 elif self._default_data_file_path:
                     tool_input["data_path"] = self._default_data_file_path.as_posix()
 
-                if plan and planned_path:
+                if plan and (planned_path or planned_dataset_id):
                     style = dict(tool_input.get("style") or {})
                     role = plan.role_for_layer(tool_input.get("name", ""))
                     semantic_defaults = {
@@ -705,6 +990,86 @@ class ThinkingGISMappingAgent:
             )
         except Exception as e:
             self.logger.warning(f"实时制图事件发布失败: {e}")
+
+    def _stream_llm_response(self, messages: List[Any], *, phase: str, iteration: int) -> Any:
+        """Stream one model turn and batch visible text events."""
+        from mapping.trace import stream_llm_with_trace
+
+        stream = getattr(self.llm, "stream", None)
+        if not callable(stream):
+            from mapping.trace import invoke_llm_with_trace
+
+            return invoke_llm_with_trace(
+                session_id=getattr(self, "session_id", None),
+                invoke=self.llm.invoke,
+                messages=messages,
+                attributes={"model": getattr(self.llm, "model_name", None), "phase": phase},
+            )
+
+        from mapping.realtime import publish_assistant_stream_event
+
+        session_id = getattr(self, "session_id", None)
+        message_id = f"{session_id or 'session'}:assistant:{iteration}"
+        self.last_assistant_message_id = message_id
+        publish_assistant_stream_event(
+            session_id=session_id,
+            event_type="assistant_started",
+            message_id=message_id,
+            iteration=iteration,
+        )
+        buffer: List[str] = []
+        sequence = 0
+        last_published = time.monotonic()
+
+        def flush() -> None:
+            nonlocal sequence, last_published
+            if not buffer:
+                return
+            sequence += 1
+            content = "".join(buffer)
+            buffer.clear()
+            publish_assistant_stream_event(
+                session_id=session_id,
+                event_type="assistant_delta",
+                message_id=message_id,
+                delta_seq=sequence,
+                content=content,
+                iteration=iteration,
+            )
+            last_published = time.monotonic()
+
+        def on_text(content: str) -> None:
+            nonlocal last_published
+            buffer.append(content)
+            if len("".join(buffer)) >= 256 or time.monotonic() - last_published >= 0.05:
+                flush()
+
+        try:
+            response = stream_llm_with_trace(
+                session_id=session_id,
+                stream=stream,
+                messages=messages,
+                attributes={"model": getattr(self.llm, "model_name", None), "phase": phase},
+                on_text=on_text,
+            )
+            flush()
+            final_content = (
+                response.get("content", "")
+                if isinstance(response, dict)
+                else getattr(response, "content", "")
+            )
+            if isinstance(final_content, str):
+                publish_assistant_stream_event(
+                    session_id=session_id,
+                    event_type="assistant_message",
+                    message_id=message_id,
+                    content=final_content,
+                    iteration=iteration,
+                )
+            return response
+        except Exception:
+            flush()
+            raise
 
     def _with_session_id(self, tool: Any, tool_input: Dict[str, Any]) -> Dict[str, Any]:
         """Inject session_id for tools that declare it."""

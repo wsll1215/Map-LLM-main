@@ -91,6 +91,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'accounts.middleware.WorkbenchBearerMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -119,10 +120,51 @@ WSGI_APPLICATION = 'xy_neo4j.wsgi.application'
 ASGI_APPLICATION = 'xy_neo4j.asgi.application'
 
 REDIS_URL = os.getenv('REDIS_URL', '').strip()
-MAP_GEOJSON_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_LIMIT', '5000')))
+MAP_SSE_HEARTBEAT_SECONDS = max(1, float(os.getenv('MAP_SSE_HEARTBEAT_SECONDS', '15')))
+MAP_SSE_REAUTH_LEAD_SECONDS = max(15, int(os.getenv('MAP_SSE_REAUTH_LEAD_SECONDS', '120')))
+MAP_MAX_STREAM_REQUESTS = max(1, int(os.getenv('MAP_MAX_STREAM_REQUESTS', '20')))
+MAP_MAX_SSE_CONNECTIONS = max(1, int(os.getenv('MAP_MAX_SSE_CONNECTIONS', '500')))
+MAP_MAX_SSE_CONNECTIONS_PER_USER = max(1, int(os.getenv('MAP_MAX_SSE_CONNECTIONS_PER_USER', '4')))
+MAP_MAX_SSE_CONNECTIONS_PER_SESSION = max(1, int(os.getenv('MAP_MAX_SSE_CONNECTIONS_PER_SESSION', '1')))
+MAP_SSE_LEASE_TTL_SECONDS = max(10, int(os.getenv('MAP_SSE_LEASE_TTL_SECONDS', '60')))
+MAP_MAX_ACTIVE_RUNS_PER_USER = max(1, int(os.getenv('MAP_MAX_ACTIVE_RUNS_PER_USER', '3')))
+MAP_MAX_ACTIVE_RUNS = max(1, int(os.getenv('MAP_MAX_ACTIVE_RUNS', '32')))
+MAP_SSE_REDIS_MAXLEN = max(100, int(os.getenv('MAP_SSE_REDIS_MAXLEN', '1000')))
+MAP_SSE_REDIS_TTL_SECONDS = max(60, int(os.getenv('MAP_SSE_REDIS_TTL_SECONDS', '86400')))
+MAP_SSE_REDIS_MAX_CONNECTIONS = max(1, int(os.getenv('MAP_SSE_REDIS_MAX_CONNECTIONS', '50')))
+MAP_SSE_COALESCE_WINDOW_MS = max(0, int(os.getenv('MAP_SSE_COALESCE_WINDOW_MS', '200')))
+MAP_GEOJSON_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_LIMIT', '8000')))
 MAP_WORKER_LIMIT = max(MAP_GEOJSON_LIMIT, int(os.getenv('MAP_WORKER_LIMIT', '30000')))
 MAP_GEOJSON_FALLBACK_LIMIT = max(1, int(os.getenv('MAP_GEOJSON_FALLBACK_LIMIT', '1000')))
 MAP_MVT_ENABLED = os.getenv('MAP_MVT_ENABLED', 'true').lower() == 'true'
+MAP_AUTH_ACCESS_TTL_SECONDS = max(60, int(os.getenv('MAP_AUTH_ACCESS_TTL_SECONDS', '600')))
+MAP_AUTH_REFRESH_IDLE_SECONDS = max(300, int(os.getenv('MAP_AUTH_REFRESH_IDLE_SECONDS', str(7 * 86400))))
+MAP_AUTH_REFRESH_ABSOLUTE_SECONDS = max(3600, int(os.getenv('MAP_AUTH_REFRESH_ABSOLUTE_SECONDS', str(30 * 86400))))
+MAP_AUTH_REFRESH_IDEMPOTENCY_SECONDS = max(1, int(os.getenv('MAP_AUTH_REFRESH_IDEMPOTENCY_SECONDS', '10')))
+MAP_AUTH_REFRESH_COOKIE_NAME = os.getenv('MAP_AUTH_REFRESH_COOKIE_NAME', 'map_refresh_token')
+MAP_AUTH_COOKIE_SECURE = os.getenv('MAP_AUTH_COOKIE_SECURE', 'false' if DEBUG else 'true').lower() == 'true'
+MAP_AUTH_COOKIE_SAMESITE = os.getenv('MAP_AUTH_COOKIE_SAMESITE', 'Lax')
+CSRF_COOKIE_SECURE = MAP_AUTH_COOKIE_SECURE
+CSRF_COOKIE_SAMESITE = MAP_AUTH_COOKIE_SAMESITE
+CSRF_COOKIE_HTTPONLY = False
+CSRF_FAILURE_VIEW = 'accounts.views.csrf_failure'
+MAP_AUTH_LOGIN_ATTEMPTS = max(3, int(os.getenv('MAP_AUTH_LOGIN_ATTEMPTS', '10')))
+MAP_AUTH_LOGIN_WINDOW_SECONDS = max(60, int(os.getenv('MAP_AUTH_LOGIN_WINDOW_SECONDS', '900')))
+MAP_AUTH_REDIS_REQUIRED = os.getenv('MAP_AUTH_REDIS_REQUIRED', 'false' if DEBUG else 'true').lower() == 'true'
+
+if REDIS_URL:
+    try:
+        import django_redis  # noqa: F401
+    except ImportError:
+        if MAP_AUTH_REDIS_REQUIRED:
+            raise RuntimeError('REDIS_URL 已配置，但 django-redis 未安装，拒绝使用进程内认证缓存')
+        CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache', 'LOCATION': 'map-llm-dev'}}
+    else:
+        CACHES = {'default': {'BACKEND': 'django_redis.cache.RedisCache', 'LOCATION': REDIS_URL, 'OPTIONS': {'CLIENT_CLASS': 'django_redis.client.DefaultClient'}}}
+else:
+    if MAP_AUTH_REDIS_REQUIRED:
+        raise RuntimeError('生产工作台认证需要配置 REDIS_URL，拒绝使用进程内认证缓存')
+    CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache', 'LOCATION': 'map-llm-dev'}}
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
 CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', 'False').lower() == 'true'

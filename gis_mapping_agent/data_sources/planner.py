@@ -54,6 +54,9 @@ class LocationResolution:
     provider: str
     confidence: float
     error_code: Optional[str] = None
+    retryable: bool = False
+    next_action: Optional[str] = None
+    status_code: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,7 @@ class PlannedSource:
     provider: str
     source_url: Optional[str]
     cache_path: Optional[str]
+    dataset_id: Optional[str] = None
     bbox: Tuple[float, float, float, float] = ()
     feature_count: int = 0
     status: str = "planned"
@@ -73,6 +77,7 @@ class PlannedSource:
     error_code: Optional[str] = None
     retryable: bool = False
     next_action: Optional[str] = None
+    attempts: Tuple[Mapping[str, Any], ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -91,6 +96,11 @@ class SourcePlan:
         return any(layer.status == "available" for layer in self.layers)
 
 
+# SourceResult is the execution-facing name used by the coordinator.  Keeping
+# the alias preserves the existing PlannedSource contract for older callers.
+SourceResult = PlannedSource
+
+
 def _contains_any(text: str, terms: Iterable[str]) -> bool:
     return any(term in text for term in terms)
 
@@ -106,6 +116,14 @@ _ROLE_TERMS = {
     "hospital": ("医院",),
     "park": ("公园",),
 }
+
+_SEMANTIC_POI_ROLES = (
+    ("primary_school", ("小学",)),
+    ("university", ("高校", "大学")),
+    ("school", ("学校",)),
+    ("hospital", ("医院",)),
+    ("park", ("公园",)),
+)
 
 _LOCATION_ACTIONS = "绘制|画|制作|显示|标注|查询|添加|把|展示|查看"
 _LOCATION_LAYER_TERMS = (
@@ -242,11 +260,24 @@ def resolve_local_location(query: Optional[str], catalog: Any) -> Optional[Locat
         return None
     candidates.sort(key=lambda item: (-item[0], item[1].local_path))
     descriptor = candidates[0][1]
+    geometry = None
+    try:
+        from mapping.dataset_reader import read_dataset_features
+
+        frame = read_dataset_features(descriptor.dataset_id, limit=100000)
+        if not frame.empty:
+            geometry = frame.geometry.unary_union
+    except Exception:
+        # The coordinator will report an unavailable catalog when the
+        # runtime dataset cannot be read; do not invent a geometry here.
+        geometry = None
+    if geometry is None:
+        return None
     return LocationResolution(
         text=str(query),
         precision="city",
         bbox=tuple(float(value) for value in descriptor.bbox),
-        geometry=None,
+        geometry=geometry,
         provider="PostGIS",
         confidence=0.95,
     )
@@ -306,6 +337,7 @@ def _as_planned_source(source: Any, role: str) -> PlannedSource:
         source_url=getattr(source, "source_url", None),
         cache_path=getattr(source, "cache_path", None)
         or getattr(source, "local_path", None),
+        dataset_id=getattr(source, "dataset_id", None),
         bbox=bbox,
         feature_count=int(getattr(source, "feature_count", 0) or 0),
         status=getattr(source, "status", "available"),
@@ -398,7 +430,9 @@ def plan_sources(
             and remote.role == layer.role
             and remote.status == "available"
             and remote.feature_count > 0
-            and remote.spatial_valid is not False
+            and (remote.dataset_id or remote.source_type == "local")
+            and remote.geometry_valid is True
+            and remote.spatial_valid is True
             and _valid_bbox(remote.bbox)
             and location_bbox is not None
             and _source_bbox_intersects(remote.bbox, location_bbox)
@@ -420,6 +454,12 @@ def plan_sources(
                 cache_path=error.get("cache_path"),
                 bbox=tuple(location.bbox or ()) if location and location.bbox else (),
                 status="failed",
+                spatial_valid=False if location_bbox is not None else None,
+                geometry_valid=False if error.get("error_code") in {
+                    "invalid_geometry",
+                    "render_error",
+                    "spatial_validation_error",
+                } else None,
                 error_code=error.get("error_code", "internal_error"),
                 retryable=bool(error.get("retryable", False)),
                 next_action=error.get("next_action"),
@@ -440,6 +480,7 @@ def plan_sources(
             bbox=tuple(location.bbox or ()) if location and location.bbox else (),
             status="failed",
             spatial_valid=False if location_bbox is not None else None,
+            geometry_valid=None,
             error_code="location_not_resolved"
             if location_bbox is None
             else "resource_not_found",
@@ -546,11 +587,21 @@ class SemanticLayerPlan:
     city_label_column: Optional[str] = None
     requested_roles: Tuple[str, ...] = ()
     issues: Tuple[str, ...] = ()
+    source_metadata: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+    def dataset_id_for_layer(self, layer_name: str) -> Optional[str]:
+        """Return the backend-selected Dataset id for a semantic layer."""
+        role = self.role_for_layer(layer_name)
+        if not role:
+            return None
+        value = self.source_metadata.get(role, {}).get("dataset_id")
+        return str(value) if value else None
 
     def role_for_layer(self, layer_name: str) -> Optional[str]:
         text = (layer_name or "").lower()
-        if _contains_any(text, _POI_TERMS):
-            return "poi"
+        for role, terms in _SEMANTIC_POI_ROLES:
+            if _contains_any(text, terms):
+                return role
         if _contains_any(text, _RIVER_TERMS):
             return "river"
         if _contains_any(text, _RAIL_TERMS) or _contains_any(text, _ROAD_TERMS):
@@ -568,8 +619,8 @@ class SemanticLayerPlan:
             return self.road_path
         if role == "boundary":
             return self.boundary_path
-        if role == "poi":
-            return self.poi_path
+        if role in {item[0] for item in _SEMANTIC_POI_ROLES}:
+            return self.source_metadata.get(role, {}).get("cache_path") or self.poi_path
         return None
 
     def requires_layer(self, layer_name: str) -> bool:
@@ -577,27 +628,119 @@ class SemanticLayerPlan:
         return bool(role and role in self.requested_roles)
 
     def prompt_instructions(self) -> str:
-        """Create compact, explicit constraints for the tool-calling model."""
+        """Expose backend decisions without exposing runtime file paths."""
         lines = ["系统已核验本次需求的数据源，调用 add_layer 时必须遵守以下映射："]
-        if self.boundary_path:
+
+        def has_verified_source(role: str, path: Optional[str]) -> bool:
+            metadata = self.source_metadata.get(role, {})
+            return bool(path or metadata.get("dataset_id"))
+
+        def source_label(role: str) -> str:
+            metadata = self.source_metadata.get(role, {})
+            source_type = metadata.get("source_type")
+            return "远程" if source_type == "remote" else "本地"
+
+        def source_identity(role: str) -> str:
+            metadata = self.source_metadata.get(role, {})
+            dataset_id = metadata.get("dataset_id")
+            if dataset_id:
+                return f"dataset_id='{dataset_id}'"
+            # Compatibility for planner-only tests and explicit legacy callers.
+            path = self.path_for_layer(role) or ""
+            return f"数据文件='{path}'"
+
+        if has_verified_source("boundary", self.boundary_path):
             label = (
                 f"，并使用 label_column='{self.city_label_column}' 标注所有城市"
                 if self.city_label_column
                 else ""
             )
-            source_label = "远程" if "data_cache" in self.boundary_path else "本地"
-            lines.append(f"- {source_label}边界/城市：{self.boundary_path}{label}")
-        if self.road_path:
-            source_label = "远程" if "data_cache" in self.road_path else "本地"
-            lines.append(f"- {source_label}道路：{self.road_path}")
-        if self.river_path:
-            source_label = "远程" if "data_cache" in self.river_path else "本地"
-            lines.append(f"- {source_label}河流：{self.river_path}")
-        if self.poi_path:
-            source_label = "远程" if "data_cache" in self.poi_path else "本地"
-            lines.append(f"- {source_label}{self.poi_label or 'POI'}：{self.poi_path}")
-        lines.append("不要把省界文件重复用作道路或河流；如果已核验数据源仍缺失，必须报告缺失，不得猜测路径。")
+            lines.append(f"- {source_label('boundary')}边界/城市：{source_identity('boundary')}{label}")
+        if has_verified_source("road", self.road_path):
+            lines.append(f"- {source_label('road')}道路：{source_identity('road')}")
+        if has_verified_source("river", self.river_path):
+            lines.append(f"- {source_label('river')}河流：{source_identity('river')}")
+        poi_labels = {
+            "primary_school": "小学",
+            "university": "高校",
+            "school": "学校",
+            "hospital": "医院",
+            "park": "公园",
+        }
+        planned_poi_roles = [
+            role
+            for role, _terms in _SEMANTIC_POI_ROLES
+            if has_verified_source(
+                role, self.source_metadata.get(role, {}).get("cache_path")
+            )
+        ]
+        if planned_poi_roles:
+            for poi_role in planned_poi_roles:
+                poi_path = self.source_metadata[poi_role]["cache_path"]
+                lines.append(
+                    f"- {source_label(poi_role)}{poi_labels.get(poi_role, 'POI')}：{source_identity(poi_role)}"
+                )
+        elif self.poi_path:
+            lines.append(
+                f"- {source_label('poi')}{self.poi_label or 'POI'}：{source_identity('poi')}"
+            )
+        lines.append("不要把省界文件重复用作道路或河流；如果已核验数据源仍缺失，必须报告缺失，不得猜测数据源。")
         return "\n".join(lines)
+
+
+def semantic_plan_from_source_plan(source_plan: SourcePlan) -> SemanticLayerPlan:
+    """Project a verified SourcePlan into the legacy renderer contract.
+
+    The renderer still consumes paths during the transition to PostGIS.  This
+    projection is deliberately one-way: it never lets the model invent a
+    path, and source status remains authoritative in ``source_plan``.
+    """
+    paths: Dict[str, Optional[str]] = {}
+    for source in source_plan.layers:
+        if source.status == "available" and source.cache_path:
+            paths.setdefault(source.role, source.cache_path)
+    poi_role = next(
+        (role for role in ("primary_school", "university", "school", "hospital", "park") if role in paths),
+        None,
+    )
+    category = {
+        "primary_school": "primary_schools",
+        "university": "universities",
+        "school": "schools",
+        "hospital": "hospitals",
+        "park": "parks",
+    }.get(poi_role)
+    label = {
+        "primary_school": "小学",
+        "university": "高校",
+        "school": "学校",
+        "hospital": "医院",
+        "park": "公园",
+    }.get(poi_role)
+    requested_roles = tuple(layer.role for layer in source_plan.intent.layers)
+    return SemanticLayerPlan(
+        boundary_path=paths.get("boundary"),
+        road_path=paths.get("road") or paths.get("railway"),
+        river_path=paths.get("river"),
+        poi_path=paths.get(poi_role) if poi_role else None,
+        poi_category=category,
+        poi_label=label,
+        requested_roles=requested_roles,
+        issues=source_plan.issues,
+        source_metadata={
+            source.role: {
+                "dataset_id": source.dataset_id,
+                "source_type": source.source_type,
+                "provider": source.provider,
+                "source_url": source.source_url,
+                "cache_path": source.cache_path,
+                "attribution": source.metadata.get("attribution"),
+                "scope_geometry": source.metadata.get("scope_geometry"),
+            }
+            for source in source_plan.layers
+            if source.status == "available"
+        },
+    )
 
 
 def plan_local_sources(
@@ -741,7 +884,7 @@ def plan_local_sources(
                 ("road", _contains_any(text, _ROAD_TERMS) or _contains_any(text, _RAIL_TERMS)),
                 ("river", _contains_any(text, _RIVER_TERMS)),
                 ("boundary", bool(resolved_boundary_path)),
-                ("poi", _contains_any(text, _POI_TERMS)),
+                (poi_role or "poi", bool(poi_role)),
             )
             if requested
         ),

@@ -43,6 +43,22 @@ _CITY_LABEL_ALIASES = {
 }
 
 
+def _safe_label_point(geometry: Any) -> Any:
+    """Return a usable centroid, or None for empty/invalid geometries."""
+    if geometry is None or getattr(geometry, "is_empty", True):
+        return None
+    try:
+        point = geometry.centroid
+        if point is None or point.is_empty or not point.is_valid:
+            return None
+        x, y = float(point.x), float(point.y)
+        if not (pd.notna(x) and pd.notna(y)):
+            return None
+        return point
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return None
+
+
 class RenderingMixin:
     def _redraw_map(self):
         """清除并根据当前状态重新绘制所有图层和元素"""
@@ -130,8 +146,12 @@ class RenderingMixin:
                 # 添加地理标签
                 if layer.style.label_column and layer.style.label_column in layer.gdf.columns:
                     self.logger.info(f"开始为图层 '{layer.name}' 添加标签，使用列 '{layer.style.label_column}'")
+                    skipped_labels = 0
                     for _, row in layer.gdf.iterrows():
-                        centroid = row.geometry.centroid
+                        centroid = _safe_label_point(row.geometry)
+                        if centroid is None:
+                            skipped_labels += 1
+                            continue
                         label_text = row[layer.style.label_column]
                         label_text = _CITY_LABEL_ALIASES.get(str(label_text), label_text)
 
@@ -148,6 +168,10 @@ class RenderingMixin:
                             text_props['fontfamily'] = self.chinese_font
 
                         self.ax.text(centroid.x, centroid.y, label_text, **text_props)
+                    if skipped_labels:
+                        self.logger.warning(
+                            f"图层 '{layer.name}' 跳过 {skipped_labels} 个空或无效几何的标签"
+                        )
 
         # 先绘制图例（较低层级，避免遮挡文字）
         self._draw_auto_legend()

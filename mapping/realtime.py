@@ -30,11 +30,14 @@ def publish_agent_map_event(
     if request_id is None:
         return
 
-    preview = _save_matplotlib_preview(
-        map_tools=map_tools,
-        request_id=request_id,
+    preview = _save_preview_with_trace(
+        session_id=session_id,
         iteration=iteration,
         tool_name=tool_name,
+        tool_input=tool_input or {},
+        map_state=map_state,
+        map_tools=map_tools,
+        request_id=request_id,
     )
 
     try:
@@ -70,18 +73,119 @@ def publish_agent_map_event(
     publish_map_build_event(request_id, payload)
 
 
+def _save_preview_with_trace(
+    *,
+    session_id: Optional[str],
+    iteration: int,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    map_state: Any,
+    map_tools: Any,
+    request_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Generate one preview and close the corresponding render span."""
+    span = None
+    trace_module = None
+    try:
+        from . import trace as trace_module
+
+        run = trace_module.run_for_session(session_id)
+        if run:
+            span = trace_module.start_trace_event(
+                run=run,
+                event_type="render",
+                phase="render",
+                actor="system",
+                summary="渲染实时预览",
+                input_data={
+                    "iteration": iteration,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                },
+                attributes=_render_attributes(map_state),
+            )
+            trace_module.publish_trace_lifecycle(span, "render_started")
+    except Exception:
+        span = None
+        trace_module = None
+
+    try:
+        preview = _save_matplotlib_preview(
+            map_tools=map_tools,
+            request_id=request_id,
+            iteration=iteration,
+            tool_name=tool_name,
+        )
+    except Exception as exc:
+        preview = {
+            "error": str(exc)[:300],
+            "iteration": iteration,
+            "tool_name": tool_name,
+            "created_at_ms": int(time.time() * 1000),
+        }
+
+    if span is not None and trace_module is not None:
+        has_preview = bool(preview and preview.get("image_url"))
+        error = None
+        if not has_preview:
+            error = {
+                "error_code": "render_error",
+                "retryable": True,
+                "next_action": "use_png_fallback",
+            }
+            if preview and preview.get("error"):
+                error["message"] = str(preview["error"])[:300]
+        try:
+            span = trace_module.finish_trace_event(
+                span,
+                status="success" if has_preview else "error",
+                output_data={"preview": preview or {}},
+                attributes={
+                    **_render_attributes(map_state),
+                    "iteration": iteration,
+                    "tool_name": tool_name,
+                },
+                error=error,
+            )
+            trace_module.publish_trace_lifecycle(span, "render_finished")
+            trace_module.publish_trace_event(span)
+        except Exception:
+            # A trace failure must not hide an already generated preview.
+            pass
+    return preview
+
+
+def _render_attributes(map_state: Any) -> Dict[str, Any]:
+    layers = list(getattr(map_state, "layers", []) or []) if map_state else []
+    return {
+        "render_mode": sorted({_effective_render_mode(layer) for layer in layers})
+        or ["matplotlib"],
+        "feature_count": sum(int(getattr(layer, "feature_count", 0) or 0) for layer in layers),
+        "layer_count": len(layers),
+    }
+
+
 def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> str:
     """Publish a structured event to the SSE broker.
 
     The broker is Redis-backed when ``REDIS_URL`` is configured and falls back
     to an in-process queue for local development and tests.
     """
+    event_name = str(payload.get("type") or "message")
+    event_payload = dict(payload)
+    if event_name in {"process_log", "progress"}:
+        step = str(event_payload.get("step") or "")
+        message = str(event_payload.get("message") or "")
+        if step and message:
+            event_payload["_coalesce_key"] = (
+                f"{event_name}:{step}:{message}:{event_payload.get('level', 'info')}"
+                f":{event_payload.get('progress')}"
+            )
     try:
         from .sse_protocol import get_event_broker
 
         broker = get_event_broker()
-        event_name = str(payload.get("type") or "message")
-        event_id = broker.publish_sync(str(request_id), event_name, payload)
+        event_id = broker.publish_sync(str(request_id), event_name, event_payload)
         return str(event_id or "")
     except Exception:
         # The in-memory broker is also the explicit last-resort transport.
@@ -89,9 +193,11 @@ def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> str:
         try:
             from .sse_protocol import get_default_broker
 
-            fallback = dict(payload)
+            fallback = dict(event_payload)
             fallback.setdefault("transport_status", "degraded")
-            fallback.setdefault("transport_error", "Redis 实时通道不可用，已降级为本地事件队列")
+            fallback.setdefault(
+                "transport_error", "Redis 实时通道不可用，已降级为本地事件队列"
+            )
             return str(
                 get_default_broker().publish_sync(
                     str(request_id), str(payload.get("type") or "message"), fallback
@@ -100,6 +206,33 @@ def publish_map_build_event(request_id: int, payload: Dict[str, Any]) -> str:
             )
         except Exception:
             return ""
+
+
+def publish_assistant_stream_event(
+    *,
+    session_id: Optional[str],
+    event_type: str,
+    message_id: str,
+    delta_seq: Optional[int] = None,
+    content: str = "",
+    iteration: Optional[int] = None,
+) -> str:
+    """Publish a multiplex-safe assistant stream event without persisting tokens."""
+    request_id = _request_id_from_session(session_id)
+    if request_id is None:
+        return ""
+    payload: Dict[str, Any] = {
+        "type": event_type,
+        "request_id": request_id,
+        "message_id": message_id,
+    }
+    if delta_seq is not None:
+        payload["delta_seq"] = delta_seq
+    if content:
+        payload["content"] = content
+    if iteration is not None:
+        payload["iteration"] = iteration
+    return publish_map_build_event(request_id, payload)
 
 
 def _request_id_from_session(session_id: Optional[str]) -> Optional[int]:
@@ -177,9 +310,14 @@ def _save_matplotlib_preview(
         if callable(redraw) and getattr(map_tools, "ax", None) is not None:
             redraw()
 
-        safe_tool_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(tool_name or "tool")).strip("_") or "tool"
+        safe_tool_name = (
+            re.sub(r"[^a-zA-Z0-9_-]+", "_", str(tool_name or "tool")).strip("_")
+            or "tool"
+        )
         timestamp_ms = int(time.time() * 1000)
-        preview_dir = _generated_maps_dir() / "realtime_previews" / f"request_{request_id}"
+        preview_dir = (
+            _generated_maps_dir() / "realtime_previews" / f"request_{request_id}"
+        )
         preview_dir.mkdir(parents=True, exist_ok=True)
         filename = f"step_{int(iteration):03d}_{safe_tool_name}_{timestamp_ms}.png"
         file_path = preview_dir / filename
@@ -220,7 +358,11 @@ def _save_figure_without_closing(figure: Any, ax: Any, file_path: Path) -> None:
                 continue
             bbox_display = item.get_window_extent(renderer=renderer)
             bbox_inches = bbox_display.transformed(figure.dpi_scale_trans.inverted())
-            total_bbox = bbox_inches if total_bbox is None else Bbox.union([total_bbox, bbox_inches])
+            total_bbox = (
+                bbox_inches
+                if total_bbox is None
+                else Bbox.union([total_bbox, bbox_inches])
+            )
     except Exception:
         total_bbox = None
 
@@ -238,7 +380,11 @@ def _save_figure_without_closing(figure: Any, ax: Any, file_path: Path) -> None:
 
 def _cleanup_preview_dir(preview_dir: Path) -> None:
     try:
-        files = sorted(preview_dir.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True)
+        files = sorted(
+            preview_dir.glob("*.png"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
         for old_file in files[MAX_PREVIEW_FILES_PER_REQUEST:]:
             old_file.unlink(missing_ok=True)
     except Exception:
@@ -249,7 +395,9 @@ def _generated_maps_dir() -> Path:
     try:
         from django.conf import settings
 
-        if getattr(settings, "configured", False) and getattr(settings, "GENERATED_MAPS_DIR", None):
+        if getattr(settings, "configured", False) and getattr(
+            settings, "GENERATED_MAPS_DIR", None
+        ):
             return Path(settings.GENERATED_MAPS_DIR)
     except Exception:
         pass
@@ -294,9 +442,16 @@ def _view_state(map_state: Any, map_version: Optional[int] = None) -> Dict[str, 
             _layer_payload(layer, map_version)
             for layer in (getattr(map_state, "layers", []) or [])
         ],
-        "legend_items": [_dump_model(item) for item in (getattr(map_state, "legend_items", []) or [])],
-        "legends": [_dump_model(legend) for legend in (getattr(map_state, "legends", []) or [])],
-        "annotations": [_dump_model(annotation) for annotation in (getattr(map_state, "annotations", []) or [])],
+        "legend_items": [
+            _dump_model(item) for item in (getattr(map_state, "legend_items", []) or [])
+        ],
+        "legends": [
+            _dump_model(legend) for legend in (getattr(map_state, "legends", []) or [])
+        ],
+        "annotations": [
+            _dump_model(annotation)
+            for annotation in (getattr(map_state, "annotations", []) or [])
+        ],
         "elements": _elements_summary(map_state),
         "output_path": getattr(map_state, "output_path", None),
     }
@@ -309,7 +464,9 @@ def _elements_summary(map_state: Any) -> Dict[str, Any]:
     }
 
 
-def _target_layer_for_tool(map_state: Any, tool_name: str, tool_input: Dict[str, Any]) -> Any:
+def _target_layer_for_tool(
+    map_state: Any, tool_name: str, tool_input: Dict[str, Any]
+) -> Any:
     if map_state is None:
         return None
 
@@ -328,13 +485,12 @@ def _target_layer_for_tool(map_state: Any, tool_name: str, tool_input: Dict[str,
 
 
 def _layer_payload(layer: Any, version: Optional[int] = None) -> Dict[str, Any]:
-    from gis_mapping_agent.data_sources.metadata import source_metadata_from_path
-
     style = getattr(layer, "style", None)
-    style_payload = style.model_dump() if hasattr(style, "model_dump") else dict(style or {})
-    source_meta = source_metadata_from_path(
-        getattr(layer, "data_source", None), getattr(layer, "data_source_meta", None)
+    style_payload = (
+        style.model_dump() if hasattr(style, "model_dump") else dict(style or {})
     )
+    explicit_source_meta = dict(getattr(layer, "data_source_meta", None) or {})
+    source_meta = _runtime_source_metadata(explicit_source_meta)
     return {
         "id": getattr(layer, "layer_id", None),
         "name": getattr(layer, "name", None),
@@ -354,6 +510,43 @@ def _layer_payload(layer: Any, version: Optional[int] = None) -> Dict[str, Any]:
     }
 
 
+def _runtime_source_metadata(supplied: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve provenance from the registered Dataset used at runtime."""
+    dataset_id = supplied.get("dataset_id")
+    unavailable = {
+        **supplied,
+        "dataset_id": dataset_id,
+        "source_type": None,
+        "provider": supplied.get("provider") or "未注册运行时数据集",
+        "source_url": supplied.get("source_url"),
+        "cache_path": supplied.get("cache_path"),
+        "status": "unavailable",
+    }
+    if not dataset_id:
+        # Explicit import metadata is already authoritative for legacy layers;
+        # never infer it from ``data_source`` or a cache path.
+        return dict(supplied) if supplied.get("source_type") else unavailable
+    try:
+        from .models import Dataset
+
+        dataset = Dataset.objects.get(
+            dataset_id=str(dataset_id), status=Dataset.STATUS_AVAILABLE
+        )
+    except Exception:
+        return unavailable
+    metadata = dict(dataset.metadata or {})
+    return {
+        **supplied,
+        "dataset_id": dataset.dataset_id,
+        "source_type": dataset.source_type,
+        "provider": metadata.get("provider") or dataset.source_type,
+        "source_url": dataset.source_url or None,
+        "attribution": metadata.get("attribution"),
+        "cache_path": metadata.get("cache_path") or dataset.local_path or None,
+        "status": dataset.status,
+    }
+
+
 def _effective_render_mode(layer: Any) -> str:
     explicit = getattr(layer, "render_mode", "geojson")
     if explicit in {"mvt", "pmtiles"}:
@@ -362,11 +555,11 @@ def _effective_render_mode(layer: Any) -> str:
     try:
         from django.conf import settings
 
-        geojson_limit = getattr(settings, "MAP_GEOJSON_LIMIT", 5000)
+        geojson_limit = getattr(settings, "MAP_GEOJSON_LIMIT", 8000)
         worker_limit = getattr(settings, "MAP_WORKER_LIMIT", 30000)
-        mvt_enabled = getattr(settings, "MAP_MVT_ENABLED", False)
+        mvt_enabled = getattr(settings, "MAP_MVT_ENABLED", True)
     except Exception:
-        geojson_limit, worker_limit, mvt_enabled = 5000, 30000, True
+        geojson_limit, worker_limit, mvt_enabled = 8000, 30000, True
     if feature_count > worker_limit:
         return "mvt" if mvt_enabled else "geojson-worker"
     return "geojson-worker" if feature_count > geojson_limit else "geojson"
@@ -380,9 +573,22 @@ def _dump_model(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
     result = {}
-    for key in ("label", "type", "style", "title", "position", "items", "font_size",
-                "background_color", "border", "annotation_id", "text", "color",
-                "rotation", "alignment"):
+    for key in (
+        "label",
+        "type",
+        "style",
+        "title",
+        "position",
+        "items",
+        "font_size",
+        "background_color",
+        "border",
+        "annotation_id",
+        "text",
+        "color",
+        "rotation",
+        "alignment",
+    ):
         if hasattr(value, key):
             result[key] = getattr(value, key)
     return result

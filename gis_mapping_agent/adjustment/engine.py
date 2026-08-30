@@ -3,8 +3,10 @@
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 import copy
+import hashlib
 import json
 import time
+from pathlib import Path
 from urllib.parse import unquote
 
 from ..models.schemas import (
@@ -851,18 +853,21 @@ class ModificationEngine:
     def _add_layer(self, map_state: MapState, layer_name: str, parameters: Dict[str, Any]) -> None:
         """添加图层"""
         from ..models.schemas import LayerConfig, GeometryType
-        from pathlib import Path
         import geopandas as gpd
 
         # 从参数中获取数据源
         source = parameters.get("source", "")
         style = parameters.get("style", {})
+        source_meta = parameters.get("data_source_meta") or {}
+        dataset_id = source_meta.get("dataset_id")
 
         # 解析数据源路径
         if not source:
             raise ValueError(f"添加图层需要指定数据源")
 
-        if source.startswith("remote_poi://"):
+        if dataset_id:
+            data_path = None
+        elif source.startswith("remote_poi://"):
             source_payload = source.removeprefix("remote_poi://")
             source_kind, separator, encoded_place = source_payload.partition("/")
             place = unquote(encoded_place) if separator else ""
@@ -878,9 +883,46 @@ class ModificationEngine:
                     code="remote_data_empty",
                     retryable=False,
                 )
+            from mapping.dataset_reader import register_geojson_dataset
+
+            candidate_dataset_id = "remote-" + hashlib.sha1(
+                f"{source_kind}:{place}:{data_path.resolve()}".encode("utf-8")
+            ).hexdigest()[:24]
+            registered_dataset_id = register_geojson_dataset(
+                data_path,
+                role={
+                    "universities": "university",
+                    "primary_schools": "primary_school",
+                    "schools": "school",
+                    "hospitals": "hospital",
+                    "parks": "park",
+                }.get(source_kind, source_kind),
+                provider="OpenStreetMap/Overpass",
+                source_url="https://overpass-api.de/api/interpreter",
+                attribution="© OpenStreetMap contributors",
+            )
+            if not registered_dataset_id:
+                raise RemoteDataSourceError(
+                    "远程数据已下载，但未能注册到 PostGIS",
+                    code="local_catalog_unavailable",
+                    retryable=True,
+                )
+            dataset_id = str(registered_dataset_id or candidate_dataset_id)
+            source_meta = {
+                **source_meta,
+                "dataset_id": dataset_id,
+                "source_type": "remote",
+                "provider": "OpenStreetMap/Overpass",
+                "source_url": "https://overpass-api.de/api/interpreter",
+                "cache_path": str(data_path),
+                "attribution": "© OpenStreetMap contributors",
+            }
+            data_path = None
         else:
             # 处理本地数据源路径
             from ..utils.data_path_resolver import extract_data_info_from_request, resolve_data_path
+            from mapping.dataset_reader import register_geodataframe_dataset
+            from ..utils.config import Config
 
             data_dir, data_files = extract_data_info_from_request(source)
             if not data_files:
@@ -904,11 +946,53 @@ class ModificationEngine:
                 if not data_path:
                     raise FileNotFoundError(f"找不到数据文件: {data_files[0]}")
 
-        if not data_path.exists():
+            if not data_path.exists():
+                raise FileNotFoundError(f"数据文件不存在: {data_path}")
+
+            imported_frame = gpd.read_file(data_path)
+            try:
+                relative_source = data_path.relative_to(Config.PROJECT_ROOT).as_posix()
+            except ValueError:
+                relative_source = data_path.as_posix()
+            source_type = source_meta.get(
+                "source_type",
+                "local" if data_path.is_relative_to(Config.DATA_DIRECTORY_BASE) else "upload",
+            )
+            candidate_dataset_id = "import-" + hashlib.sha1(
+                f"{source_type}:{relative_source}".encode("utf-8")
+            ).hexdigest()[:24]
+            registered_dataset_id = register_geodataframe_dataset(
+                imported_frame,
+                dataset_id=candidate_dataset_id,
+                name=layer_name,
+                role=str(source_meta.get("role") or layer_name),
+                source_type=source_type,
+                local_path=relative_source,
+                provider=source_meta.get("provider"),
+                source_url=source_meta.get("source_url"),
+                attribution=source_meta.get("attribution"),
+            )
+            if not registered_dataset_id:
+                raise RuntimeError("显式数据文件未能注册到 PostGIS")
+            dataset_id = str(registered_dataset_id)
+            source_meta = {
+                **source_meta,
+                "dataset_id": dataset_id,
+                "source_type": source_type,
+                "cache_path": relative_source,
+            }
+            data_path = None
+
+        if not dataset_id and (data_path is None or not data_path.exists()):
             raise FileNotFoundError(f"数据文件不存在: {data_path}")
 
         # 读取数据以获取几何类型
-        gdf = gpd.read_file(data_path)
+        if dataset_id:
+            from mapping.dataset_reader import read_dataset_features
+
+            gdf = read_dataset_features(str(dataset_id))
+        else:
+            raise RuntimeError("运行时图层缺少已注册的 dataset_id")
         geom_type_str = gdf.geometry.geom_type.iloc[0]
 
         # 映射几何类型
@@ -924,16 +1008,17 @@ class ModificationEngine:
 
         # 创建图层配置
         from ..utils.helpers import generate_unique_id, parse_color
-        from ..utils.config import Config
         from ..data_sources.metadata import source_metadata_from_path
 
-        # 将绝对路径转换为相对于PROJECT_ROOT的相对路径
-        try:
-            relative_path = data_path.relative_to(Config.PROJECT_ROOT)
-            data_source_str = str(relative_path).replace('\\', '/')
-        except ValueError:
-            # 如果无法转换为相对路径，使用绝对路径
-            data_source_str = str(data_path)
+        if dataset_id:
+            data_source_str = f"dataset://{dataset_id}"
+        else:
+            # File paths are retained only for explicit import operations.
+            try:
+                relative_path = data_path.relative_to(Config.PROJECT_ROOT)
+                data_source_str = str(relative_path).replace('\\', '/')
+            except ValueError:
+                data_source_str = str(data_path)
 
         # 处理样式参数：参数名称映射和颜色解析
         processed_style = {}
@@ -964,7 +1049,10 @@ class ModificationEngine:
             geometry_type=geometry_type,
             style=processed_style if processed_style else style,
             visible=True,
-            data_source_meta=source_metadata_from_path(data_source_str),
+            data_source_meta={
+                **source_metadata_from_path(data_source_str),
+                **source_meta,
+            },
         )
 
         # 添加到地图状态

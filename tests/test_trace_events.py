@@ -11,7 +11,10 @@ from mapping.trace import (
     invoke_llm_with_trace,
     record_trace_event,
     start_trace_event,
+    stream_llm_with_trace,
+    trace_lifecycle_names,
 )
+from tests.api_auth import login_client
 
 
 pytestmark = pytest.mark.usefixtures("django_test_database")
@@ -58,6 +61,14 @@ def test_record_trace_event_assigns_sequence_and_parent_relationship():
     assert child.parent_event_id == root.event_id
     assert child.trace_id == run.trace_id
     assert child.input_data == {"api_key": "[REDACTED]", "location": "北京"}
+
+
+def test_trace_lifecycle_uses_only_protocol_event_names():
+    assert trace_lifecycle_names("tool_call") == ("tool_started", "tool_finished")
+    assert trace_lifecycle_names("llm_generation") == ("llm_started", "llm_finished")
+    assert trace_lifecycle_names("data_fetch") == ("data_fetch_started", "data_fetch_finished")
+    assert trace_lifecycle_names("render") == ("render_started", "render_finished")
+    assert trace_lifecycle_names("source_plan") is None
 
 
 def test_record_trace_event_persists_timing_and_structured_error():
@@ -111,6 +122,112 @@ def test_trace_event_does_not_store_sensitive_nested_values():
     assert event.output_data["token"] == "[REDACTED]"
     assert event.attributes["password"] == "[REDACTED]"
 
+    embedded = record_trace_event(
+        run=run,
+        event_type="tool_call",
+        output_data={"observation": '{"api_key":"embedded-secret","value":"ok"}'},
+    )
+    assert "embedded-secret" not in embedded.output_data["observation"]
+    assert "[REDACTED]" in embedded.output_data["observation"]
+
+
+def test_agent_phase_trace_records_one_complete_span():
+    request, run = _run("phase-owner")
+    from gis_mapping_agent.agent.thinking import ThinkingGISMappingAgent
+
+    agent = ThinkingGISMappingAgent.__new__(ThinkingGISMappingAgent)
+    agent.session_id = f"web_session_{request.id}"
+
+    result = agent._run_trace_phase(
+        event_type="source_plan",
+        phase="data_source",
+        summary="规划数据源",
+        input_data={"roles": ["road"]},
+        operation=lambda: {"status": "available", "feature_count": 3},
+    )
+
+    assert result["status"] == "available"
+    event = ProcessLog.objects.get(run=run, event_type="source_plan")
+    assert event.status == "success"
+    assert event.input_data == {"roles": ["road"]}
+    assert event.output_data["feature_count"] == 3
+    assert event.finished_at is not None
+
+
+def test_agent_phase_trace_closes_span_when_output_serialization_fails():
+    request, run = _run("phase-serializer-owner")
+    from gis_mapping_agent.agent.thinking import ThinkingGISMappingAgent
+
+    agent = ThinkingGISMappingAgent.__new__(ThinkingGISMappingAgent)
+    agent.session_id = f"web_session_{request.id}"
+
+    result = agent._run_trace_phase(
+        event_type="source_plan",
+        phase="data_source",
+        summary="规划数据源",
+        input_data={},
+        operation=lambda: {"status": "available"},
+        output_serializer=lambda _value: (_ for _ in ()).throw(TypeError("不可序列化")),
+    )
+
+    event = ProcessLog.objects.get(run=run, event_type="source_plan")
+    assert result == {"status": "available"}
+    assert event.status == "error"
+    assert event.error["error_code"] == "trace_serialization_error"
+    assert event.finished_at is not None
+
+
+def test_base_gis_tool_declares_trace_span_ownership():
+    from gis_mapping_agent.tools.base import BaseGISTool
+
+    assert BaseGISTool.owns_trace_span is True
+
+
+def test_tool_span_keeps_raw_validated_and_actual_inputs_separate():
+    from gis_mapping_agent.tools.base import BaseGISTool, GISToolInput, GISToolOutput
+
+    class Input(GISToolInput):
+        value: str
+
+    class Tool(BaseGISTool):
+        name: str = "trace_input_tool"
+        description: str = "验证工具参数并执行地图操作"
+        args_schema: type = Input
+
+        def _execute_tool(self, input_data, run_manager=None):
+            return GISToolOutput(
+                success=True,
+                message="执行完成",
+                data={"value": input_data.value},
+            )
+
+    request, run = _run("tool-input-owner")
+    result = Tool()._run(value="北京", session_id=f"web_session_{request.id}")
+
+    assert '"success": true' in result
+    event = ProcessLog.objects.get(run=run, event_type="tool_call")
+    assert event.attributes["tool_description"] == "验证工具参数并执行地图操作"
+    assert event.attributes["validated_input"] == {"value": "北京"}
+    assert event.attributes["actual_input"] == {"value": "北京"}
+    assert event.attributes["map_state_changed"] is False
+    assert event.attributes["retry_count"] == 0
+    assert event.output_data["tool_result"]["success"] is True
+
+
+def test_agent_detects_structured_tool_failure_instead_of_marking_success():
+    from gis_mapping_agent.agent.thinking import tool_observation_error
+
+    details = tool_observation_error(
+        '{"tool_result":{"success":false,"error_code":"resource_not_found",'
+        '"retryable":true,"next_action":"select_valid_resource"}}'
+    )
+
+    assert details == {
+        "error_code": "resource_not_found",
+        "retryable": True,
+        "next_action": "select_valid_resource",
+    }
+
 
 def test_tool_trace_event_has_one_identity_from_start_to_finish():
     _request, run = _run("tool-lifecycle-owner")
@@ -158,6 +275,79 @@ def test_llm_invocation_records_input_output_and_model_metadata():
     assert event.output_data["tool_calls"] == ["fetch"]
 
 
+def test_llm_invocation_publishes_lifecycle_events_for_one_span(monkeypatch):
+    request, _run_obj = _run("llm-lifecycle-owner")
+    lifecycle_events = []
+
+    monkeypatch.setattr(
+        "mapping.trace.publish_trace_lifecycle",
+        lambda event, lifecycle: lifecycle_events.append((event.event_id, lifecycle)),
+    )
+
+    invoke_llm_with_trace(
+        session_id=f"web_session_{request.id}",
+        invoke=lambda _messages: {"content": "完成", "tool_calls": []},
+        messages=[{"role": "user", "content": "绘制地图"}],
+        attributes={"model": "test-model"},
+    )
+
+    assert [lifecycle for _span_id, lifecycle in lifecycle_events] == [
+        "llm_started",
+        "llm_finished",
+    ]
+    assert lifecycle_events[0][0] == lifecycle_events[1][0]
+
+
+def test_stream_llm_with_trace_emits_text_deltas_and_returns_aggregated_response():
+    request, run = _run("stream-owner")
+    emitted = []
+
+    class Chunk:
+        def __init__(self, content, tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls or []
+
+        def __add__(self, other):
+            return Chunk(self.content + other.content, self.tool_calls + other.tool_calls)
+
+    response = stream_llm_with_trace(
+        session_id=f"web_session_{request.id}",
+        stream=lambda _messages: iter([Chunk("正在"), Chunk("获取数据")]),
+        messages=[{"role": "user", "content": "绘制地图"}],
+        attributes={"model": "test-model", "phase": "intent"},
+        on_text=emitted.append,
+    )
+
+    assert emitted == ["正在", "获取数据"]
+    assert response.content == "正在获取数据"
+    event = ProcessLog.objects.get(run=run, event_type="llm_generation")
+    assert event.status == "success"
+    assert event.output_data["content"] == "正在获取数据"
+
+
+def test_stream_llm_with_trace_publishes_lifecycle_events_for_one_span(monkeypatch):
+    request, _run_obj = _run("stream-lifecycle-owner")
+    lifecycle_events = []
+
+    monkeypatch.setattr(
+        "mapping.trace.publish_trace_lifecycle",
+        lambda event, lifecycle: lifecycle_events.append((event.event_id, lifecycle)),
+    )
+
+    stream_llm_with_trace(
+        session_id=f"web_session_{request.id}",
+        stream=lambda _messages: iter([{"content": "完成"}]),
+        messages=[{"role": "user", "content": "绘制地图"}],
+        attributes={"model": "test-model"},
+    )
+
+    assert [lifecycle for _span_id, lifecycle in lifecycle_events] == [
+        "llm_started",
+        "llm_finished",
+    ]
+    assert lifecycle_events[0][0] == lifecycle_events[1][0]
+
+
 def test_trace_event_collection_returns_filtered_summaries_with_cursor():
     request, run = _run("api-owner")
     record_trace_event(
@@ -176,10 +366,7 @@ def test_trace_event_collection_returns_filtered_summaries_with_cursor():
         error={"error_code": "network_error", "retryable": True},
     )
 
-    from django.test import Client
-
-    client = Client()
-    client.force_login(request.user)
+    client = login_client(request.user)
     response = client.get(
         f"/mapping/api/map-requests/{request.id}/runs/{run.id}/events/"
         "?event_type=error&errors_only=true&limit=1"
@@ -203,10 +390,7 @@ def test_trace_event_collection_repairs_legacy_logs_without_run_binding():
         step="数据源规划",
     )
 
-    from django.test import Client
-
-    client = Client()
-    client.force_login(request.user)
+    client = login_client(request.user)
     response = client.get(
         f"/mapping/api/map-requests/{request.id}/runs/{run.id}/events/"
     )
@@ -233,10 +417,7 @@ def test_trace_event_detail_returns_structured_payload_and_error():
         error={"error_code": "validation_error", "next_action": "retry"},
     )
 
-    from django.test import Client
-
-    client = Client()
-    client.force_login(request.user)
+    client = login_client(request.user)
     response = client.get(
         f"/mapping/api/map-requests/{request.id}/runs/{run.id}/events/{event.event_id}/"
     )
@@ -257,10 +438,7 @@ def test_trace_event_detail_repairs_legacy_log_before_lookup():
         step="渲染地图",
     )
 
-    from django.test import Client
-
-    client = Client()
-    client.force_login(request.user)
+    client = login_client(request.user)
     response = client.get(
         f"/mapping/api/map-requests/{request.id}/runs/{run.id}/events/{legacy_log.event_id}/"
     )
@@ -276,10 +454,7 @@ def test_trace_event_detail_does_not_cross_request_ownership():
         username="private-trace-other", password="secret"
     )
 
-    from django.test import Client
-
-    client = Client()
-    client.force_login(other_user)
+    client = login_client(other_user)
     response = client.get(
         f"/mapping/api/map-requests/{request.id}/runs/{run.id}/events/{event.event_id}/"
     )

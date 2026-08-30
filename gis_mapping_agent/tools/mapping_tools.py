@@ -1,6 +1,6 @@
 """Basic map LangChain tools."""
 
-from typing import Optional, Type
+from typing import Any, Dict, Optional, Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -83,10 +83,12 @@ class InitMapTool(BaseTool):
 class AddLayerInput(BaseModel):
     """添加图层输入"""
     name: str = Field(description="图层名称")
-    data_path: str = Field(description="数据文件路径")
+    data_path: Optional[str] = Field(default=None, description="仅用于显式文件导入；运行时数据使用 dataset_id")
+    dataset_id: Optional[str] = Field(default=None, description="后端已注册的数据集ID")
     geometry_type: Optional[str] = Field(default=None, description="几何类型（可选，不指定则自动检测）")
     visible: Optional[bool] = Field(default=True, description="是否可见")
     add_legend: Optional[bool] = Field(default=None, description="是否为此图层添加图例项，None表示使用地图的全局设置")
+    data_source_meta: Optional[Dict[str, Any]] = Field(default=None, description="后端核验的数据源元数据")
 
 
 class AddLayerTool(BaseTool):
@@ -98,10 +100,12 @@ class AddLayerTool(BaseTool):
     def _run(
         self,
         name: str,
-        data_path: str,
+        data_path: Optional[str] = None,
+        dataset_id: Optional[str] = None,
         geometry_type: Optional[str] = None,
         visible: Optional[bool] = True,
-        add_legend: Optional[bool] = None
+        add_legend: Optional[bool] = None,
+        data_source_meta: Optional[Dict[str, Any]] = None,
     ) -> str:
         """执行添加图层"""
         tools = get_unified_tools()
@@ -109,9 +113,11 @@ class AddLayerTool(BaseTool):
         params = {
             "name": name,
             "data_path": data_path,
+            "dataset_id": dataset_id,
             "geometry_type": geometry_type,
             "visible": visible,
-            "add_legend": add_legend
+            "add_legend": add_legend,
+            "data_source_meta": data_source_meta,
         }
         
         result = tools.add_layer(params)

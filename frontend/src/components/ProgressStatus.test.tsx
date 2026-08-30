@@ -3,6 +3,15 @@ import { describe, expect, it } from "vitest";
 import { ProgressStatus } from "./ProgressStatus";
 
 describe("ProgressStatus", () => {
+  it("does not invent a percentage when the backend has not reported one", () => {
+    const markup = renderToStaticMarkup(
+      <ProgressStatus status="processing" message="正在获取数据" />,
+    );
+
+    expect(markup).toContain("等待后端进度");
+    expect(markup).not.toContain("58%");
+  });
+
   it("shows a deterministic stage and percentage for a running task", () => {
     const markup = renderToStaticMarkup(
       <ProgressStatus
@@ -16,6 +25,16 @@ describe("ProgressStatus", () => {
     expect(markup).toContain("58%");
     expect(markup).toContain("正在处理道路图层");
     expect(markup).toContain('aria-valuenow="58"');
+  });
+
+  it("uses a compact phase rail that remains readable in the inspector", () => {
+    const markup = renderToStaticMarkup(
+      <ProgressStatus status="processing" message="正在处理道路图层" latestProgress={58} />,
+    );
+
+    expect(markup).toContain('aria-label="处理阶段"');
+    expect(markup).toContain('class="progress-phase progress-phase-active"');
+    expect(markup).not.toContain("ant-steps");
   });
 
   it("does not present a partial result as fully completed", () => {

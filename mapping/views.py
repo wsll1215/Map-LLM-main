@@ -10,16 +10,18 @@ from django.shortcuts import render, get_object_or_404
 from django.http import JsonResponse
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
+from django.middleware.csrf import get_token
 from django.views.decorators.http import require_http_methods
 from django.conf import settings
 from django.utils import timezone
 from django.db import close_old_connections
 
-from .models import MapRequest, MapRun, GeneratedMap, ChatMessage, ProcessLog
+from .models import Dataset, MapRequest, MapRun, GeneratedMap, ChatMessage, ProcessLog
 from .realtime import publish_map_build_event
 from .task_dispatch import dispatch_conversation, dispatch_map_request
 from .finalization import LayerValidation, finalize_execution
 from .trace import record_trace_event, trace_event_to_dict
+from .run_limits import active_run_admission, active_run_capacity_error
 
 MAP_LLM_DIR = settings.BASE_DIR
 if str(MAP_LLM_DIR) not in sys.path:
@@ -179,48 +181,64 @@ def _finalize_map_request(
     *,
     clarification_required=False,
     intent_text=None,
+    use_latest_artifact=True,
 ):
     """Validate the persisted state and artifact before publishing completion."""
     from gis_mapping_agent.data_sources.planner import parse_intent
     from gis_mapping_agent.state import get_state_manager
-    from gis_mapping_agent.data_sources.metadata import source_metadata_from_path
 
     response = response if isinstance(response, dict) else {}
     intent = parse_intent(intent_text or map_request.request_text)
-    required_roles = {layer.role for layer in intent.layers if layer.required}
+    source_plan = response.get('source_plan') or {}
+    planned_layers = {
+        item.get('role'): item for item in source_plan.get('layers', []) if item.get('role')
+    }
+    required_roles = {
+        layer.role for layer in intent.layers if layer.required
+    }
     state = get_state_manager().load_state(f'web_session_{map_request.id}')
     layers = []
     if state:
         for layer in state.layers:
             data_source = getattr(layer, 'data_source', None)
             data_source_meta = getattr(layer, 'data_source_meta', None) or {}
-            source_meta = source_metadata_from_path(data_source, data_source_meta)
-            source_type = data_source_meta.get('source_type') or (
-                source_meta.get('source_type') if data_source else None
-            )
+            dataset = _runtime_dataset_for_layer(data_source_meta)
+            source_type = dataset.source_type if dataset else None
             extent = getattr(layer, 'extent', None)
-            spatial_valid = (
-                isinstance(extent, (list, tuple))
-                and len(extent) == 4
-                and all(isinstance(value, (int, float)) for value in extent)
-                and extent[0] < extent[2]
-                and extent[1] < extent[3]
-            )
+            from .finalization import validate_source_spatial
+            planned = planned_layers.get(_map_layer_role(getattr(layer, 'name', '')), {})
+            source_plan_location = source_plan.get('location') or {}
+            location_for_validation = type('ResolvedLocation', (), {
+                'geometry': source_plan_location.get('geometry'),
+                'bbox': source_plan_location.get('bbox') or getattr(state.config, 'extent', None),
+            })()
+            spatial = validate_source_spatial(layer, location_for_validation, _map_layer_role(getattr(layer, 'name', '')))
             layers.append(
                 LayerValidation(
                     role=_map_layer_role(getattr(layer, 'name', '')),
                     required=False,
                     source_type=source_type,
                     feature_count=int(getattr(layer, 'feature_count', 0) or 0),
-                    spatial_valid=spatial_valid,
-                    geometry_valid=True,
+                    spatial_valid=spatial.spatial_valid,
+                    geometry_valid=spatial.geometry_valid,
                     source_valid=bool(
-                        data_source or getattr(layer, 'data', None)
-                    ) and source_type in {'local', 'remote', 'upload'},
+                        dataset
+                        and source_type in {'local', 'remote', 'upload'}
+                        and int(getattr(dataset, 'feature_count', 0) or 0) > 0
+                    )
+                    and (not planned or planned.get('status') == 'available')
+                    and (
+                        not planned.get('dataset_id')
+                        or planned.get('dataset_id') == dataset.dataset_id
+                    ),
                 )
             )
 
-    latest_artifact = map_request.generated_maps.order_by('-version', '-created_at', '-id').first()
+    latest_artifact = (
+        map_request.generated_maps.order_by('-version', '-created_at', '-id').first()
+        if use_latest_artifact
+        else None
+    )
     png_path = None
     if latest_artifact:
         png_path = Path(settings.GENERATED_MAPS_DIR) / latest_artifact.file_path
@@ -231,6 +249,8 @@ def _finalize_map_request(
         trace_id=response.get('tool_trace_id') or f'web_session_{map_request.id}:create',
         map_version=latest_artifact.version if latest_artifact else None,
         clarification_required=clarification_required,
+        execution_error_code=response.get('error_code'),
+        execution_error_message=response.get('error_message') or response.get('message'),
     )
     map_request.status = result.status
     map_request.completion_report = result.completion_report
@@ -252,17 +272,50 @@ def _finalize_map_request(
     return result
 
 
+def _runtime_dataset_for_layer(data_source_meta):
+    """Resolve a layer source from the runtime catalog, never from its path."""
+    dataset_id = (data_source_meta or {}).get('dataset_id')
+    if not dataset_id:
+        return None
+    try:
+        dataset = Dataset.objects.filter(
+            dataset_id=str(dataset_id),
+            status=Dataset.STATUS_AVAILABLE,
+        ).first()
+        if not dataset:
+            return None
+        related_features = getattr(dataset, 'features', None)
+        if related_features is not None:
+            dataset.feature_count = related_features.count()
+        return dataset if int(getattr(dataset, 'feature_count', 0) or 0) > 0 else None
+    except Exception:
+        return None
+
+
 def _record_dispatch_failure(map_request, run, error):
     """Persist a worker submission failure so clients never observe a stuck run."""
     message = f'任务提交失败：{error}'
-    map_request.status = 'failed'
-    map_request.error_message = message
-    map_request.result_message = message
-    map_request.clarification_data = {}
-    map_request.save()
+    final_result = _finalize_map_request(
+        map_request,
+        {
+            'success': False,
+            'status': 'failed',
+            'response': message,
+            'message': message,
+            'error_code': 'worker_unavailable',
+            'source_plan': run.source_plan if run else {},
+        },
+        use_latest_artifact=False,
+    )
+    message = final_result.error_message or message
 
     if run and run.status in {MapRun.STATUS_PENDING, MapRun.STATUS_RUNNING}:
-        run.transition_to(MapRun.STATUS_FAILED, error_message=message)
+        run.transition_to(
+            MapRun.STATUS_FAILED,
+            error_code=final_result.error_code,
+            error_message=message,
+            completion_report=final_result.completion_report,
+        )
 
     _record_error_event(map_request, run, message, '任务提交')
     ChatMessage.objects.create(
@@ -270,17 +323,36 @@ def _record_dispatch_failure(map_request, run, error):
         message_type='assistant',
         content=message,
     )
-    _publish_lifecycle_event(map_request, 'request_failed', message=message)
-    _publish_lifecycle_event(map_request, 'done', status='failed', message=message)
+    _publish_lifecycle_event(
+        map_request,
+        'request_failed',
+        message=message,
+        completion_report=final_result.completion_report,
+    )
+    _publish_lifecycle_event(
+        map_request,
+        'done',
+        status=final_result.status,
+        message=message,
+        completion_report=final_result.completion_report,
+    )
     return message
 
 
 def _record_run_trace(run, response):
     """Persist the agent trace when a run returns one."""
-    if not run or not isinstance(response, dict) or not response.get('tool_trace_id'):
+    if not run or not isinstance(response, dict):
         return
-    run.trace_id = str(response['tool_trace_id'])
-    run.save(update_fields={'trace_id', 'updated_at'})
+    update_fields = set()
+    if response.get('tool_trace_id'):
+        run.trace_id = str(response['tool_trace_id'])
+        update_fields.add('trace_id')
+    if response.get('source_plan'):
+        run.source_plan = response['source_plan']
+        update_fields.add('source_plan')
+    if update_fields:
+        update_fields.add('updated_at')
+        run.save(update_fields=update_fields)
 
 
 def _stream_encoding(stream):
@@ -382,14 +454,11 @@ def get_or_create_conversation_agent(session_id, user_id=None):
             os.chdir(original_cwd)
 
 
-@login_required
 def mapping_index(request):
-    """地图制作主页"""
-    # 获取用户最近的地图制作请求
-    recent_requests = MapRequest.objects.filter(user=request.user)[:10]
-    
+    """Render the token-authenticated workbench shell."""
+
+    get_token(request)
     context = {
-        'recent_requests': recent_requests,
         'map_llm_available': MAP_LLM_AVAILABLE,
     }
     
@@ -412,14 +481,47 @@ def create_map_request(request):
                 'success': False,
                 'message': '请输入制图需求描述'
             })
+
+        idempotency_key = request.headers.get('Idempotency-Key', '').strip()
+        if len(idempotency_key) > 255:
+            return JsonResponse({
+                'success': False,
+                'error_code': 'invalid_idempotency_key',
+                'message': 'Idempotency-Key 不能超过 255 个字符',
+            }, status=400)
+        if idempotency_key:
+            existing = MapRequest.objects.filter(
+                user=request.user,
+                creation_idempotency_key=idempotency_key,
+            ).first()
+            if existing:
+                return JsonResponse({
+                    'success': True,
+                    'message': '地图制作请求已存在',
+                    'request_id': existing.id,
+                }, status=200)
         
         # 创建地图请求
-        map_request = MapRequest.objects.create(
-            user=request.user,
-            request_text=request_text,
-            status='pending',
-            completion_report={},
-        )
+        try:
+            map_request = MapRequest.objects.create(
+                user=request.user,
+                request_text=request_text,
+                status='pending',
+                completion_report={},
+                creation_idempotency_key=idempotency_key or None,
+            )
+        except IntegrityError:
+            if not idempotency_key:
+                raise
+            existing = MapRequest.objects.get(
+                user=request.user,
+                creation_idempotency_key=idempotency_key,
+            )
+            return JsonResponse({
+                'success': True,
+                'message': '地图制作请求已存在',
+                'request_id': existing.id,
+            }, status=200)
         
         # 创建用户消息
         ChatMessage.objects.create(
@@ -455,34 +557,96 @@ def process_map_request(request):
                 'success': False,
                 'message': '缺少请求ID'
             })
+
+        idempotency_key = request.headers.get('Idempotency-Key', '').strip()
+        if len(idempotency_key) > 255:
+            return JsonResponse({
+                'success': False,
+                'error_code': 'invalid_idempotency_key',
+                'message': 'Idempotency-Key 不能超过 255 个字符',
+                'retryable': False,
+                'next_action': 'retry_with_valid_idempotency_key',
+            }, status=400)
         
         map_request = get_object_or_404(MapRequest, id=request_id, user=request.user)
+
+        if idempotency_key:
+            existing_run = map_request.runs.filter(
+                idempotency_key=idempotency_key,
+            ).first()
+            if existing_run:
+                return JsonResponse({
+                    'success': True,
+                    'processing': existing_run.status in {
+                        MapRun.STATUS_PENDING,
+                        MapRun.STATUS_RUNNING,
+                    },
+                    'message': '地图制作任务已提交',
+                    'request_id': map_request.id,
+                    'run_id': existing_run.id,
+                    'trace_id': existing_run.trace_id,
+                    'status': existing_run.status,
+                })
         
         if not MAP_LLM_AVAILABLE:
             # 如果 Map-LLM 不可用，返回模拟响应
             return _handle_map_llm_unavailable(map_request)
-        
-        # 更新状态为处理中
-        map_request.status = 'processing'
-        map_request.clarification_data = {}
-        map_request.save()
+
+        # Admission is the only serialized section.  Agent execution starts
+        # after the run row has been committed and the lock is released.
+        with active_run_admission():
+            map_request.refresh_from_db()
+            if idempotency_key:
+                existing_run = map_request.runs.filter(
+                    idempotency_key=idempotency_key,
+                ).first()
+                if existing_run:
+                    return JsonResponse({
+                        'success': True,
+                        'processing': existing_run.status in {
+                            MapRun.STATUS_PENDING,
+                            MapRun.STATUS_RUNNING,
+                        },
+                        'message': '地图制作任务已提交',
+                        'request_id': map_request.id,
+                        'run_id': existing_run.id,
+                        'trace_id': existing_run.trace_id,
+                        'status': existing_run.status,
+                    })
+            if map_request.status == 'processing':
+                return JsonResponse({
+                    'success': False,
+                    'error_code': 'request_already_running',
+                    'message': '该地图请求正在执行，请等待当前任务结束',
+                    'retryable': True,
+                    'next_action': 'poll_task_status',
+                }, status=409)
+            limit_error = active_run_capacity_error(request.user.id)
+            if limit_error:
+                return JsonResponse({'success': False, **limit_error}, status=429)
+
+            # Update status and create the run in the same admission section.
+            map_request.status = 'processing'
+            map_request.clarification_data = {}
+            map_request.save()
+
+            ChatMessage.objects.create(
+                request=map_request,
+                message_type='system',
+                content='正在处理您的制图请求，请稍候...'
+            )
+
+            run = MapRun.objects.create(
+                request=map_request,
+                idempotency_key=idempotency_key or f"legacy-{map_request.id}-{timezone.now().timestamp()}",
+                trace_id=f"web_session_{map_request.id}:create",
+            )
+
         _cancel_realtime_preview_cleanup(map_request.id)
         _clear_realtime_previews(map_request.id)
         _publish_lifecycle_event(map_request, 'request_started', message='地图制作任务已启动')
-        
-        # 创建系统消息
-        ChatMessage.objects.create(
-            request=map_request,
-            message_type='system',
-            content='正在处理您的制图请求，请稍候...'
-        )
-        
+
         # 后台执行制图任务，避免长 HTTP 请求阻塞实时预览/日志轮询。
-        run = MapRun.objects.create(
-            request=map_request,
-            idempotency_key=f"legacy-{map_request.id}-{timezone.now().timestamp()}",
-            trace_id=f"web_session_{map_request.id}:create",
-        )
         try:
             dispatch_map_request(map_request.id, run.id)
         except Exception as exc:
@@ -492,6 +656,10 @@ def process_map_request(request):
                     'success': False,
                     'processing': False,
                     'message': message,
+                    'error_code': 'worker_unavailable',
+                    'retryable': True,
+                    'next_action': 'retry_later',
+                    'trace_id': run.trace_id if run else None,
                     'request_id': map_request.id,
                 },
                 status=503,
@@ -501,7 +669,10 @@ def process_map_request(request):
             'success': True,
             'processing': True,
             'message': '地图制作任务已启动',
-            'request_id': map_request.id
+            'request_id': map_request.id,
+            'run_id': run.id,
+            'trace_id': run.trace_id,
+            'status': run.status,
         })
         
     except Exception as e:
@@ -543,25 +714,54 @@ def _process_map_request_in_background(map_request_id, run_id=None):
         try:
             map_request = MapRequest.objects.get(id=map_request_id)
             run = MapRun.objects.filter(id=run_id, request=map_request).first() if run_id else None
-            map_request.status = 'failed'
-            map_request.error_message = f'后台制图失败: {str(e)}'
-            map_request.save()
+            error_msg = f'后台制图失败: {str(e)}'
+            final_result = _finalize_map_request(
+                map_request,
+                {
+                    'success': False,
+                    'status': 'failed',
+                    'response': error_msg,
+                    'message': error_msg,
+                    'error_code': getattr(e, 'error_code', 'internal_error'),
+                    'source_plan': run.source_plan if run else {},
+            },
+                use_latest_artifact=False,
+            )
+            error_msg = final_result.error_message or error_msg
             if run and run.status in {MapRun.STATUS_PENDING, MapRun.STATUS_RUNNING}:
                 if run.status == MapRun.STATUS_PENDING:
                     run.transition_to(MapRun.STATUS_RUNNING)
-                run.transition_to(MapRun.STATUS_FAILED, error_message=map_request.error_message)
-            _record_error_event(map_request, run, map_request.error_message, '后台任务')
+                terminal_status = {
+                    'needs_clarification': MapRun.STATUS_AWAITING_INPUT,
+                    'completed': MapRun.STATUS_COMPLETED,
+                    'partial': MapRun.STATUS_PARTIAL,
+                    'failed': MapRun.STATUS_FAILED,
+                }[final_result.status]
+                run.transition_to(
+                    terminal_status,
+                    error_code=final_result.error_code,
+                    error_message=final_result.error_message,
+                    completion_report=final_result.completion_report,
+                )
+            _record_error_event(map_request, run, error_msg, '后台任务')
             ChatMessage.objects.create(
                 request=map_request,
                 message_type='assistant',
-                content=map_request.error_message
+                content=error_msg
             )
             _publish_lifecycle_event(
                 map_request,
                 'request_failed',
-                message=map_request.error_message,
+                message=error_msg,
+                completion_report=final_result.completion_report,
             )
-            _publish_lifecycle_event(map_request, 'done', message=map_request.error_message)
+            _publish_lifecycle_event(
+                map_request,
+                'done',
+                status=final_result.status,
+                message=error_msg,
+                completion_report=final_result.completion_report,
+            )
         except Exception:
             pass
     finally:
@@ -585,27 +785,82 @@ def continue_conversation(request):
                 'message': '缺少请求ID或消息内容'
             })
 
+        client_message_id = request.headers.get('X-Message-Id', '').strip()
+        if len(client_message_id) > 255:
+            return JsonResponse({
+                'success': False,
+                'error_code': 'invalid_message_id',
+                'message': 'X-Message-Id 不能超过 255 个字符',
+            }, status=400)
+
         # 获取原始请求
         map_request = get_object_or_404(MapRequest, id=request_id, user=request.user)
-        include_clarification_context = map_request.status == 'needs_clarification'
-
+        if client_message_id:
+            existing_message = map_request.chat_messages.filter(
+                client_message_id=client_message_id,
+                message_type='user',
+            ).first()
+            if existing_message:
+                latest_run = map_request.runs.order_by('-created_at', '-id').first()
+                return JsonResponse({
+                    'success': True,
+                    'processing': map_request.status == 'processing',
+                    'message': '消息已提交',
+                    'request_id': map_request.id,
+                    'stream_after_id': '',
+                    'run_id': latest_run.id if latest_run else None,
+                }, status=200)
         if not MAP_LLM_AVAILABLE:
             return JsonResponse({
                 'success': False,
                 'message': 'Map-LLM 不可用'
             })
 
-        # 创建用户消息
-        ChatMessage.objects.create(
-            request=map_request,
-            message_type='user',
-            content=message_text
-        )
+        with active_run_admission():
+            map_request.refresh_from_db()
+            existing_message = map_request.chat_messages.filter(
+                client_message_id=client_message_id,
+                message_type='user',
+            ).first() if client_message_id else None
+            if existing_message:
+                latest_run = map_request.runs.order_by('-created_at', '-id').first()
+                return JsonResponse({
+                    'success': True,
+                    'processing': map_request.status == 'processing',
+                    'message': '消息已提交',
+                    'request_id': map_request.id,
+                    'stream_after_id': '',
+                    'run_id': latest_run.id if latest_run else None,
+                }, status=200)
+            if map_request.status == 'processing':
+                return JsonResponse({
+                    'success': False,
+                    'error_code': 'request_already_running',
+                    'message': '该地图请求正在执行，请等待当前任务结束',
+                    'retryable': True,
+                    'next_action': 'poll_task_status',
+                }, status=409)
+            limit_error = active_run_capacity_error(request.user.id)
+            if limit_error:
+                return JsonResponse({'success': False, **limit_error}, status=429)
+            include_clarification_context = map_request.status == 'needs_clarification'
 
-        # 更新状态
-        map_request.status = 'processing'
-        map_request.clarification_data = {}
-        map_request.save()
+            ChatMessage.objects.create(
+                request=map_request,
+                message_type='user',
+                content=message_text,
+                client_message_id=client_message_id or None,
+            )
+
+            map_request.status = 'processing'
+            map_request.clarification_data = {}
+            map_request.save()
+
+            run = MapRun.objects.create(
+                request=map_request,
+                idempotency_key=f"conversation-{map_request.id}-{timezone.now().timestamp()}",
+                trace_id=f"web_session_{map_request.id}:conversation",
+            )
 
         _cancel_realtime_preview_cleanup(map_request.id)
         _clear_realtime_previews(map_request.id)
@@ -613,11 +868,6 @@ def continue_conversation(request):
             map_request, 'request_started', message='地图调整任务已启动'
         )
 
-        run = MapRun.objects.create(
-            request=map_request,
-            idempotency_key=f"conversation-{map_request.id}-{timezone.now().timestamp()}",
-            trace_id=f"web_session_{map_request.id}:conversation",
-        )
         try:
             dispatch_conversation(
                 map_request.id,
@@ -632,6 +882,10 @@ def continue_conversation(request):
                     'success': False,
                     'processing': False,
                     'message': message,
+                    'error_code': 'worker_unavailable',
+                    'retryable': True,
+                    'next_action': 'retry_later',
+                    'trace_id': run.trace_id if run else None,
                     'request_id': map_request.id,
                 },
                 status=503,
@@ -786,6 +1040,7 @@ def _continue_conversation_in_background(
             },
             clarification_required=needs_clarification,
             intent_text=f"{map_request.request_text}\n{message_text}",
+            use_latest_artifact=not needs_clarification and success,
         )
         if not success and not needs_clarification:
             map_request.error_message = response_text
@@ -845,17 +1100,42 @@ def _continue_conversation_in_background(
             map_request = MapRequest.objects.get(id=map_request_id)
             run = MapRun.objects.filter(id=run_id, request=map_request).first() if run_id else None
             error_msg = f'继续对话失败: {str(e)}'
-            map_request.status = 'failed'
-            map_request.error_message = error_msg
-            map_request.result_message = error_msg
-            map_request.save()
+            final_result = _finalize_map_request(
+                map_request,
+                {
+                    'success': False,
+                    'status': 'failed',
+                    'response': error_msg,
+                    'message': error_msg,
+                    'error_code': getattr(e, 'error_code', 'internal_error'),
+                    'source_plan': run.source_plan if run else {},
+                },
+                use_latest_artifact=False,
+            )
+            error_msg = final_result.error_message or error_msg
             if run and run.status in {MapRun.STATUS_PENDING, MapRun.STATUS_RUNNING}:
                 if run.status == MapRun.STATUS_PENDING:
                     run.transition_to(MapRun.STATUS_RUNNING)
-                run.transition_to(MapRun.STATUS_FAILED, error_message=error_msg)
+                run.transition_to(
+                    MapRun.STATUS_FAILED,
+                    error_code=final_result.error_code,
+                    error_message=error_msg,
+                    completion_report=final_result.completion_report,
+                )
             _record_error_event(map_request, run, error_msg, '后台对话任务')
-            _publish_lifecycle_event(map_request, 'request_failed', message=error_msg)
-            _publish_lifecycle_event(map_request, 'done', message=error_msg)
+            _publish_lifecycle_event(
+                map_request,
+                'request_failed',
+                message=error_msg,
+                completion_report=final_result.completion_report,
+            )
+            _publish_lifecycle_event(
+                map_request,
+                'done',
+                status=final_result.status,
+                message=error_msg,
+                completion_report=final_result.completion_report,
+            )
             ChatMessage.objects.create(
                 request=map_request,
                 message_type='assistant',
@@ -872,41 +1152,57 @@ def _continue_conversation_in_background(
 
 
 def _handle_map_llm_unavailable(map_request):
-    """处理 Map-LLM 不可用的情况 - 返回演示响应"""
-    map_request.status = 'completed'
-    map_request.result_message = '演示模式：地图制作功能正常'
-    map_request.save()
+    """Record an unavailable dependency without manufacturing a result."""
+    message = 'Map-LLM 不可用，未生成地图成果'
+    final_result = _finalize_map_request(
+        map_request,
+        {
+            'success': False,
+            'status': 'failed',
+            'response': message,
+            'message': message,
+            'error_code': 'internal_error',
+        },
+        use_latest_artifact=False,
+    )
+    message = final_result.error_message or message
 
     ChatMessage.objects.create(
         request=map_request,
         message_type='assistant',
-        content='''地图制作功能已就绪！
-
-当前为演示模式，Map-LLM 集成功能包括：
-✅ 智能制图请求处理
-✅ 聊天界面交互
-✅ 地图文件管理
-✅ 用户会话记录
-
-要启用完整的 Map-LLM 功能，请：
-1. 确保 Map-LLM 项目在正确位置
-2. 安装相关依赖包
-3. 配置 API 密钥
-
-您的制图需求已记录，系统架构运行正常！'''
+        content=message,
     )
     _publish_lifecycle_event(map_request, 'request_started', message='演示模式任务已启动')
     _publish_lifecycle_event(
         map_request,
         'assistant_message',
-        content=map_request.result_message,
+        content=message,
     )
-    _publish_lifecycle_event(map_request, 'request_completed', message=map_request.result_message)
-    _publish_lifecycle_event(map_request, 'done', message=map_request.result_message)
+    terminal_event = {
+        'needs_clarification': 'request_needs_clarification',
+        'completed': 'request_completed',
+        'partial': 'request_partial',
+        'failed': 'request_failed',
+    }[final_result.status]
+    _publish_lifecycle_event(
+        map_request,
+        terminal_event,
+        message=message,
+        completion_report=final_result.completion_report,
+    )
+    _publish_lifecycle_event(
+        map_request,
+        'done',
+        status=final_result.status,
+        message=message,
+        completion_report=final_result.completion_report,
+    )
 
     return {
-        'success': True,
-        'message': '演示模式：功能正常',
+        'success': final_result.status == 'completed',
+        'status': final_result.status,
+        'message': message,
+        'error_code': final_result.error_code,
         'request_id': map_request.id
     }
 
@@ -1020,6 +1316,7 @@ def _process_with_map_llm(map_request, run=None):
                 agent_status = response.get('status')
                 clarification = response.get('clarification') or {}
                 agent_trace_id = response.get('tool_trace_id')
+                agent_source_plan = response.get('source_plan')
             else:
                 agent_output = str(response)
                 agent_success = True
@@ -1027,6 +1324,7 @@ def _process_with_map_llm(map_request, run=None):
                 agent_status = None
                 clarification = {}
                 agent_trace_id = None
+                agent_source_plan = None
 
             # 构造 result 格式以兼容后续处理
             result = {
@@ -1034,6 +1332,7 @@ def _process_with_map_llm(map_request, run=None):
                 'agent_output': agent_output,
                 'message': agent_error or '地图制作完成',
                 'tool_trace_id': agent_trace_id,
+                'source_plan': agent_source_plan,
             }
 
             if agent_status == 'needs_clarification':
@@ -1042,6 +1341,7 @@ def _process_with_map_llm(map_request, run=None):
                     map_request,
                     {**result, 'response': agent_output, 'tool_trace_id': agent_trace_id},
                     clarification_required=True,
+                    use_latest_artifact=False,
                 )
                 ChatMessage.objects.create(
                     request=map_request,
@@ -1074,6 +1374,7 @@ def _process_with_map_llm(map_request, run=None):
                     'message': map_request.result_message,
                     'response': map_request.result_message,
                     'clarification': clarification,
+                    'source_plan': agent_source_plan,
                     'request_id': map_request.id,
                     'result': result,
                 }
@@ -1125,29 +1426,57 @@ def _process_with_map_llm(map_request, run=None):
                     'message': final_message,
                     'response': final_message,
                     'completion_report': final_result.completion_report,
+                    'source_plan': agent_source_plan,
                     'request_id': map_request.id,
                     'result': result
                 }
             else:
-                # 处理失败
+                # Agent failure is only evidence; the finalizer owns the terminal state.
                 error_msg = result.get('message', '地图制作失败')
-                map_request.status = 'failed'
-                map_request.error_message = error_msg
-                map_request.result_message = f'地图制作失败：{error_msg}'
                 map_request.clarification_data = {}
-                map_request.save()
+                final_result = _finalize_map_request(
+                    map_request,
+                    {
+                        **result,
+                        'response': error_msg,
+                    },
+                    use_latest_artifact=False,
+                )
+                final_message = final_result.error_message or error_msg
 
                 ChatMessage.objects.create(
                     request=map_request,
                     message_type='assistant',
-                    content=f"地图制作失败：{error_msg}"
+                    content=final_message,
                 )
-                _publish_lifecycle_event(map_request, 'request_failed', message=error_msg)
-                _publish_lifecycle_event(map_request, 'done', message=error_msg)
+                terminal_event = (
+                    'request_completed' if final_result.status == 'completed'
+                    else 'request_partial' if final_result.status == 'partial'
+                    else 'request_needs_clarification'
+                    if final_result.status == 'needs_clarification'
+                    else 'request_failed'
+                )
+                _publish_lifecycle_event(
+                    map_request,
+                    terminal_event,
+                    message=final_message,
+                    completion_report=final_result.completion_report,
+                )
+                _publish_lifecycle_event(
+                    map_request,
+                    'done',
+                    message=final_message,
+                    status=final_result.status,
+                    completion_report=final_result.completion_report,
+                )
 
                 return {
-                    'success': False,
-                    'message': error_msg,
+                    'success': final_result.status == 'completed',
+                    'status': final_result.status,
+                    'message': final_message,
+                    'error_code': final_result.error_code or result.get('error_code') or 'agent_error',
+                    'completion_report': final_result.completion_report,
+                    'source_plan': agent_source_plan,
                     'request_id': map_request.id
                 }
 
@@ -1169,12 +1498,37 @@ def _process_with_map_llm(map_request, run=None):
         except:
             pass
 
-        # 异常处理
+        # An exception is evidence only; the Finalizer owns the terminal state.
         error_msg = f"处理过程中发生错误: {str(e)}"
-        map_request.status = 'failed'
-        map_request.error_message = error_msg
-        map_request.result_message = error_msg
-        map_request.save()
+        final_result = _finalize_map_request(
+            map_request,
+            {
+                'success': False,
+                'status': 'failed',
+                'response': error_msg,
+                'message': error_msg,
+                'error_code': getattr(e, 'error_code', 'internal_error'),
+                'source_plan': locals().get('agent_source_plan') or {},
+            },
+            use_latest_artifact=False,
+        )
+        error_msg = final_result.error_message or error_msg
+
+        if run and run.status in {MapRun.STATUS_PENDING, MapRun.STATUS_RUNNING}:
+            if run.status == MapRun.STATUS_PENDING:
+                run.transition_to(MapRun.STATUS_RUNNING)
+            terminal_status = {
+                'needs_clarification': MapRun.STATUS_AWAITING_INPUT,
+                'completed': MapRun.STATUS_COMPLETED,
+                'partial': MapRun.STATUS_PARTIAL,
+                'failed': MapRun.STATUS_FAILED,
+            }[final_result.status]
+            run.transition_to(
+                terminal_status,
+                error_code=final_result.error_code,
+                error_message=final_result.error_message,
+                completion_report=final_result.completion_report,
+            )
 
         _record_error_event(map_request, run, error_msg, '错误处理')
 
@@ -1183,12 +1537,33 @@ def _process_with_map_llm(map_request, run=None):
             message_type='assistant',
             content=error_msg
         )
-        _publish_lifecycle_event(map_request, 'request_failed', message=error_msg)
-        _publish_lifecycle_event(map_request, 'done', message=error_msg)
+        terminal_event = {
+            'needs_clarification': 'request_needs_clarification',
+            'completed': 'request_completed',
+            'partial': 'request_partial',
+            'failed': 'request_failed',
+        }[final_result.status]
+        _publish_lifecycle_event(
+            map_request,
+            terminal_event,
+            message=error_msg,
+            completion_report=final_result.completion_report,
+        )
+        _publish_lifecycle_event(
+            map_request,
+            'done',
+            status=final_result.status,
+            message=error_msg,
+            completion_report=final_result.completion_report,
+        )
 
         return {
-            'success': False,
+            'success': final_result.status == 'completed',
+            'status': final_result.status,
             'message': error_msg,
+            'error_code': final_result.error_code or getattr(e, 'error_code', 'internal_error'),
+            'completion_report': final_result.completion_report,
+            'source_plan': locals().get('agent_source_plan'),
             'request_id': map_request.id
         }
 

@@ -14,6 +14,7 @@ import os
 import json
 from pathlib import Path
 from .models import MapRequest, GeneratedMap, ChatMessage, ProcessLog
+from .views import _finalize_map_request
 from django.conf import settings
 
 # 导入数据库管理模块
@@ -437,9 +438,20 @@ class MapRequestAdminEnhanced(admin.ModelAdmin):
     delete_selected_with_files.short_description = '🗑️ 删除选中的会话（包括所有文件）'
 
     def mark_as_completed(self, request, queryset):
-        """标记为已完成"""
-        updated = queryset.update(status='completed')
-        self.message_user(request, f'成功标记 {updated} 个会话为已完成')
+        """仅将通过统一成果校验的请求标记为已完成。"""
+        updated = 0
+        for map_request in queryset:
+            result = _finalize_map_request(
+                map_request,
+                {"response": map_request.result_message},
+                use_latest_artifact=True,
+            )
+            if result.status == "completed":
+                updated += 1
+        if updated:
+            self.message_user(request, f'已通过成果校验并标记 {updated} 个会话为已完成')
+        else:
+            self.message_user(request, '没有请求通过成果校验，未标记为已完成')
 
     mark_as_completed.short_description = '✅ 标记为已完成'
 
@@ -477,4 +489,3 @@ class MapRequestAdminEnhanced(admin.ModelAdmin):
 
 # GeneratedMapAdminEnhanced 已删除
 # 生成的地图现在仅作为 MapRequest 的内联模型显示，不再作为独立的 Admin 模块
-

@@ -1,4 +1,5 @@
 from gis_mapping_agent.agent.conversational import ConversationalMappingAgent
+from gis_mapping_agent.agent.thinking import ThinkingGISMappingAgent
 from gis_mapping_agent.models.schemas import GeometryType, LayerConfig, MapConfig, MapState, SessionInfo
 
 from langchain_core.messages import HumanMessage
@@ -28,6 +29,10 @@ class FakeLLM:
     def invoke(self, messages):
         self.calls += 1
         return FakeResponse(self.content)
+
+    def stream(self, messages):
+        self.stream_calls = getattr(self, "stream_calls", 0) + 1
+        yield FakeResponse(self.content)
 
 
 class FakeCreationAgent:
@@ -89,9 +94,55 @@ def test_llm_intent_takes_priority_over_modify_keywords_when_available():
 
     result = agent._classify_intent(state)
 
-    assert agent.llm.calls == 1
+    assert agent.llm.stream_calls == 1
+    assert agent.llm.calls == 0
     assert result["user_intent"] == "create"
     assert result["task_type"] == "create"
+
+
+def test_intent_classification_uses_streaming_model_response_when_available():
+    agent = make_agent_with_fake_llm("query")
+    result = agent._classify_intent(make_state("查看当前地图状态", has_map_state=True))
+
+    assert result["user_intent"] == "query"
+    assert agent.llm.stream_calls == 1
+    assert agent.llm.calls == 0
+
+
+def test_thinking_agent_emits_authoritative_assistant_message_after_stream(monkeypatch):
+    published = []
+
+    class Chunk:
+        def __init__(self, content):
+            self.content = content
+            self.tool_calls = []
+
+        def __add__(self, other):
+            return Chunk(self.content + other.content)
+
+    class StreamingLLM:
+        model_name = "test-model"
+
+        def stream(self, _messages):
+            return iter([Chunk("正在"), Chunk("获取数据")])
+
+    monkeypatch.setattr(
+        "mapping.realtime.publish_assistant_stream_event",
+        lambda **payload: published.append(payload),
+    )
+    agent = ThinkingGISMappingAgent.__new__(ThinkingGISMappingAgent)
+    agent.llm = StreamingLLM()
+    agent.session_id = None
+
+    response = agent._stream_llm_response([], phase="tool_selection", iteration=1)
+
+    assert response.content == "正在获取数据"
+    assert [item["event_type"] for item in published] == [
+        "assistant_started",
+        "assistant_delta",
+        "assistant_message",
+    ]
+    assert published[-1]["content"] == "正在获取数据"
 
 
 def test_rule_fallback_prefers_complete_map_creation_request():

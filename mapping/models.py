@@ -31,6 +31,12 @@ class MapRequest(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name='用户')
     title = models.CharField(max_length=200, verbose_name='地图标题', blank=True)
     request_text = models.TextField(verbose_name='制图需求描述')
+    creation_idempotency_key = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name='创建幂等键',
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态')
     
     # 地图配置参数（JSON格式存储）
@@ -50,6 +56,12 @@ class MapRequest(models.Model):
         verbose_name = '地图制作请求'
         verbose_name_plural = '地图制作请求'
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'creation_idempotency_key'],
+                name='mapping_request_user_creation_key_uniq',
+            )
+        ]
     
     def __str__(self):
         return f"{self.user.username} - {self.title or '未命名地图'} ({self.get_status_display()})"
@@ -173,6 +185,7 @@ class MapRun(models.Model):
     error_code = models.CharField(max_length=100, blank=True, verbose_name='错误代码')
     error_message = models.TextField(blank=True, verbose_name='错误信息')
     completion_report = models.JSONField(default=dict, blank=True, verbose_name='完成报告')
+    source_plan = models.JSONField(default=dict, blank=True, verbose_name='来源计划诊断')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -373,6 +386,12 @@ class ChatMessage(models.Model):
     ]
 
     request = models.ForeignKey(MapRequest, on_delete=models.CASCADE, related_name='chat_messages', verbose_name='关联请求')
+    client_message_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name='客户端消息ID',
+    )
     message_type = models.CharField(max_length=20, choices=MESSAGE_TYPES, verbose_name='消息类型')
     content = models.TextField(verbose_name='消息内容')
 
@@ -385,6 +404,12 @@ class ChatMessage(models.Model):
         verbose_name = '聊天消息'
         verbose_name_plural = '聊天消息'
         ordering = ['created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['request', 'client_message_id'],
+                name='mapping_message_request_client_id_uniq',
+            )
+        ]
 
     def __str__(self):
         return f"{self.get_message_type_display()}: {self.content[:50]}..."

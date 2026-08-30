@@ -27,6 +27,8 @@ export interface LayerPayload {
   data_hash?: string | null;
   feature_count?: number;
   extent?: [number, number, number, number] | null;
+  /** Client-side identity for a viewport-limited Worker response. */
+  data_bbox?: [number, number, number, number] | null;
   render_mode?: "geojson" | "geojson-worker" | "mvt" | "pmtiles";
   data_url?: string | null;
   data_source_meta?: DataSourceMeta | null;
@@ -34,6 +36,7 @@ export interface LayerPayload {
 }
 
 export interface DataSourceMeta {
+  dataset_id?: string | null;
   source_type: "local" | "remote" | "upload" | string;
   provider?: string | null;
   source_url?: string | null;
@@ -41,6 +44,16 @@ export interface DataSourceMeta {
   cache_path?: string | null;
   status?: "available" | "pending" | "failed" | string;
   error?: string | null;
+}
+
+export interface PreviewMeta {
+  image_url?: string | null;
+  version?: number | null;
+  iteration?: number | null;
+  tool_name?: string | null;
+  created_at_ms?: number | null;
+  is_final?: boolean;
+  fallback?: boolean;
 }
 
 export interface RenderSpec {
@@ -73,7 +86,7 @@ export interface ViewStatePayload {
   output_path?: string | null;
 }
 
-export type MapStreamEventName = "request_started" | "trace_event" | "tool_started" | "tool_finished" | "llm_started" | "llm_finished" | "data_fetch_started" | "data_fetch_finished" | "render_started" | "render_finished" | "map_initialized" | "layer_upserted" | "map_element_updated" | "process_log" | "assistant_message" | "request_completed" | "request_partial" | "request_failed" | "request_needs_clarification" | "done";
+export type MapStreamEventName = "request_started" | "trace_event" | "tool_started" | "tool_finished" | "llm_started" | "llm_finished" | "data_fetch_started" | "data_fetch_finished" | "render_started" | "render_finished" | "map_initialized" | "layer_upserted" | "map_element_updated" | "process_log" | "assistant_started" | "assistant_delta" | "assistant_message" | "request_completed" | "request_partial" | "request_failed" | "request_needs_clarification" | "done";
 
 export interface MapStreamEvent {
   id: string;

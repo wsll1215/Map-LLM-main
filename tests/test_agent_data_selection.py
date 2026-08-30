@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from gis_mapping_agent.agent.thinking import ThinkingGISMappingAgent, _boundary_extent_inputs
+from gis_mapping_agent.agent.thinking import (
+    ThinkingGISMappingAgent,
+    _boundary_extent_inputs,
+    _extent_from_location,
+)
 from gis_mapping_agent.data_sources.planner import plan_local_sources
 
 
@@ -21,6 +25,16 @@ def test_verified_boundary_is_reused_for_extent_calculation():
 
     assert data_dir.endswith("data_cache\\boundaries") or data_dir.endswith("data_cache/boundaries")
     assert data_files == ["city.geojson"]
+
+
+def test_runtime_extent_uses_resolved_location_without_reading_cache_file():
+    location = type(
+        "ResolvedLocation",
+        (),
+        {"bbox": (120.0, 30.0, 121.0, 31.0)},
+    )()
+
+    assert _extent_from_location(location) == [120.0, 30.0, 121.0, 31.0]
 
 
 def test_location_default_file_overrides_model_hallucinated_path():
@@ -73,6 +87,88 @@ def test_semantic_layer_plan_enables_all_city_labels_on_boundary_layer():
     assert tool.received["style"]["label_column"] == "name"
 
 
+def test_registered_semantic_source_injects_dataset_id_and_drops_cache_path():
+    tool = CaptureTool()
+    agent = object.__new__(ThinkingGISMappingAgent)
+    agent.tool_dict = {"add_layer": tool}
+    agent.session_id = None
+    agent._default_data_file_path = Path("data/data1/Guangdong.shp")
+    agent._explicit_data_files = False
+    agent._semantic_data_plan = type(
+        "Plan",
+        (),
+        {
+            "requested_roles": ("road",),
+            "role_for_layer": lambda _self, _name: "road",
+            "path_for_layer": lambda _self, _name: "data_cache/roads/road.geojson",
+            "source_metadata": {
+                "road": {
+                    "dataset_id": "remote-road-123",
+                    "source_type": "remote",
+                    "cache_path": "data_cache/roads/road.geojson",
+                }
+            },
+        },
+    )()
+
+    agent._execute_tool("add_layer", {"name": "道路", "data_path": "model-guessed.shp"})
+
+    assert tool.received["dataset_id"] == "remote-road-123"
+    assert tool.received["data_path"] is None
+    assert tool.received["data_source_meta"]["source_type"] == "remote"
+
+
+def test_dataset_only_semantic_source_is_executable_without_cache_path():
+    tool = CaptureTool()
+    agent = object.__new__(ThinkingGISMappingAgent)
+    agent.tool_dict = {"add_layer": tool}
+    agent.session_id = None
+    agent._default_data_file_path = Path("data/guessed.shp")
+    agent._explicit_data_files = False
+    agent._semantic_data_plan = type(
+        "Plan",
+        (),
+        {
+            "requested_roles": ("road",),
+            "role_for_layer": lambda _self, _name: "road",
+            "path_for_layer": lambda _self, _name: None,
+            "source_metadata": {
+                "road": {
+                    "dataset_id": "registered-road-1",
+                    "source_type": "local",
+                    "cache_path": None,
+                }
+            },
+        },
+    )()
+
+    result = agent._execute_tool("add_layer", {"name": "道路", "data_path": "guessed.shp"})
+
+    assert tool.received["dataset_id"] == "registered-road-1"
+    assert tool.received["data_path"] is None
+    assert result == "{'success': True}"
+
+
+def test_dataset_only_source_is_included_in_model_instructions():
+    from gis_mapping_agent.data_sources.planner import SemanticLayerPlan
+
+    plan = SemanticLayerPlan(
+        requested_roles=("road",),
+        source_metadata={
+            "road": {
+                "dataset_id": "registered-road-2",
+                "source_type": "local",
+                "cache_path": None,
+            }
+        },
+    )
+
+    instructions = plan.prompt_instructions()
+
+    assert "dataset_id='registered-road-2'" in instructions
+    assert "道路" in instructions
+
+
 def test_semantic_layer_plan_assigns_distinguishable_visual_defaults():
     tool = CaptureTool()
     agent = object.__new__(ThinkingGISMappingAgent)
@@ -88,6 +184,31 @@ def test_semantic_layer_plan_assigns_distinguishable_visual_defaults():
 
     assert tool.received["style"]["color"] == "#D97706"
     assert tool.received["style"]["linewidth"] == 1.4
+
+
+def test_semantic_layer_plan_resolves_specific_poi_roles_without_falling_back_to_path():
+    plan = plan_local_sources("标注甲市的小学")
+    university_plan = plan_local_sources("标注甲市的高校")
+
+    assert plan.role_for_layer("小学") == "primary_school"
+    assert university_plan.role_for_layer("高校") == "university"
+    assert "primary_school" in plan.requested_roles
+    assert "university" in university_plan.requested_roles
+
+
+def test_unrecognized_model_layer_cannot_bypass_verified_source_plan():
+    tool = CaptureTool()
+    agent = object.__new__(ThinkingGISMappingAgent)
+    agent.tool_dict = {"add_layer": tool}
+    agent.session_id = None
+    agent._default_data_file_path = Path("data/data1/Guangdong.shp")
+    agent._explicit_data_files = False
+    agent._semantic_data_plan = plan_local_sources("绘制甲市的主要道路")
+
+    result = agent._execute_tool("add_layer", {"name": "模型猜测图层", "data_path": "secret.shp"})
+
+    assert "没有经过校验的数据源" in result
+    assert tool.received is None
 
 
 def test_missing_local_roads_fall_back_to_remote_source(monkeypatch):

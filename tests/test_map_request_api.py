@@ -1,33 +1,29 @@
 import os
 import json
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "xy_neo4j.settings")
 
 import django
 import pytest
 from django.contrib.auth import get_user_model
-from django.test import Client
 
 django.setup()
 
 from gis_mapping_agent.models.schemas import GeometryType, LayerConfig, MapConfig, MapState, SessionInfo
 from gis_mapping_agent.state import MapStateManager
-from mapping.models import ChatMessage, GeneratedMap, MapRequest, MapRun, ProcessLog
+from mapping.models import ChatMessage, Dataset, GeneratedMap, MapRequest, MapRun, ProcessLog
 from mapping import rest_api
 from mapping.views import _build_clarification_context
+from tests.api_auth import login_client
 
 pytestmark = pytest.mark.usefixtures("django_test_database")
 
 
 def make_user(username):
     return get_user_model().objects.create_user(username=username, password="secret")
-
-
-def login_client(user):
-    client = Client()
-    client.force_login(user)
-    return client
 
 
 def test_map_request_collection_creates_request_without_running_agent():
@@ -47,6 +43,400 @@ def test_map_request_collection_creates_request_without_running_agent():
     assert created.request_text == "绘制北京道路图"
     assert created.status == MapRequest.STATUS_CHOICES[0][0]
     assert created.completion_report == {}
+
+
+def test_process_failure_preserves_source_plan_for_run_diagnostics(monkeypatch):
+    user = make_user("source-plan-failure-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制定州小学",
+        status="pending",
+    )
+    source_plan = {
+        "location": {"text": "定州", "bbox": [114.2, 38.4, 114.8, 38.9]},
+        "layers": [{"role": "primary_school", "status": "failed", "error_code": "network_error"}],
+    }
+
+    class FailedAgent:
+        def chat(self, *_args, **_kwargs):
+            return {
+                "success": False,
+                "message": "远程数据暂时不可用",
+                "source_plan": source_plan,
+            }
+
+    monkeypatch.setattr(
+        "mapping.views.get_or_create_conversation_agent",
+        lambda *_args, **_kwargs: FailedAgent(),
+    )
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+
+    from mapping.views import _process_with_map_llm
+
+    result = _process_with_map_llm(request)
+
+    assert result["source_plan"] == source_plan
+
+
+def test_process_failure_uses_finalizer_for_terminal_status(monkeypatch):
+    user = make_user("finalizer-failure-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制未知区域",
+        status="pending",
+    )
+    calls = []
+
+    class FailedAgent:
+        def chat(self, *_args, **_kwargs):
+            return {
+                "success": False,
+                "status": "failed",
+                "message": "地点无法解析",
+                "source_plan": {"issues": ["location_not_resolved"], "layers": []},
+            }
+
+    class FinalResult:
+        status = "failed"
+        error_code = "location_not_resolved"
+        error_message = "地点无法解析"
+        completion_report = {"missing_layers": ["boundary"]}
+
+    monkeypatch.setattr(
+        "mapping.views.get_or_create_conversation_agent",
+        lambda *_args, **_kwargs: FailedAgent(),
+    )
+    monkeypatch.setattr(
+        "mapping.views._finalize_map_request",
+        lambda *_args, **_kwargs: calls.append(True) or FinalResult(),
+    )
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+
+    from mapping.views import _process_with_map_llm
+
+    result = _process_with_map_llm(request)
+
+    assert calls == [True]
+    assert result["status"] == "failed"
+    assert result["error_code"] == "location_not_resolved"
+
+
+def test_unhandled_agent_exception_uses_finalizer_for_terminal_status(monkeypatch):
+    from types import SimpleNamespace
+    from mapping.views import _process_with_map_llm
+
+    user = make_user("unhandled-agent-error-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制异常区域",
+        status="processing",
+    )
+    calls = []
+
+    def raise_agent(*_args, **_kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr("mapping.views.get_or_create_conversation_agent", raise_agent)
+    monkeypatch.setattr(
+        "mapping.views._finalize_map_request",
+        lambda *_args, **_kwargs: calls.append(True)
+        or SimpleNamespace(
+            status="failed",
+            error_code="internal_error",
+            error_message="处理过程中发生错误: provider unavailable",
+            completion_report={},
+        ),
+    )
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+
+    result = _process_with_map_llm(request)
+
+    assert calls == [True]
+    assert result["status"] == "failed"
+
+
+def test_background_agent_exception_uses_finalizer_for_terminal_status(monkeypatch):
+    from types import SimpleNamespace
+    from mapping.views import _process_map_request_in_background
+
+    user = make_user("background-agent-error-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制后台异常区域",
+        status="processing",
+    )
+    run = MapRun.objects.create(
+        request=request,
+        idempotency_key="background-agent-error",
+        trace_id="trace-background-error",
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        "mapping.views._process_with_map_llm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("background provider unavailable")
+        ),
+    )
+
+    def fake_finalize(map_request, *_args, **_kwargs):
+        calls.append(map_request.id)
+        map_request.status = "failed"
+        map_request.error_message = "后台制图失败"
+        map_request.result_message = "后台制图失败"
+        map_request.save(update_fields=["status", "error_message", "result_message", "updated_at"])
+        return SimpleNamespace(
+            status="failed",
+            error_code="internal_error",
+            error_message="后台制图失败",
+            completion_report={},
+        )
+
+    monkeypatch.setattr("mapping.views._finalize_map_request", fake_finalize)
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("mapping.views._record_error_event", lambda *_args, **_kwargs: None)
+
+    _process_map_request_in_background(request.id, run.id)
+
+    assert calls == [request.id]
+
+
+def test_dispatch_failure_uses_finalizer_for_terminal_status(monkeypatch):
+    from types import SimpleNamespace
+    from mapping.views import _record_dispatch_failure
+
+    user = make_user("dispatch-error-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制提交失败区域",
+        status="processing",
+    )
+    run = MapRun.objects.create(
+        request=request,
+        idempotency_key="dispatch-error",
+        trace_id="trace-dispatch-error",
+    )
+    calls = []
+
+    def fake_finalize(map_request, *_args, **_kwargs):
+        calls.append(map_request.id)
+        map_request.status = "failed"
+        map_request.error_message = "任务提交失败"
+        map_request.result_message = "任务提交失败"
+        map_request.save(update_fields=["status", "error_message", "result_message", "updated_at"])
+        return SimpleNamespace(
+            status="failed",
+            error_code="worker_unavailable",
+            error_message="任务提交失败",
+            completion_report={},
+        )
+
+    monkeypatch.setattr("mapping.views._finalize_map_request", fake_finalize)
+    monkeypatch.setattr("mapping.views._record_error_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+
+    _record_dispatch_failure(request, run, RuntimeError("queue unavailable"))
+
+    assert calls == [request.id]
+
+
+def test_background_conversation_exception_uses_finalizer_for_terminal_status(monkeypatch):
+    from types import SimpleNamespace
+    from mapping.views import _continue_conversation_in_background
+
+    user = make_user("background-conversation-error-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制连续调整区域",
+        status="processing",
+    )
+    run = MapRun.objects.create(
+        request=request,
+        idempotency_key="conversation-error",
+        trace_id="trace-conversation-error",
+    )
+    calls = []
+
+    class FailedAgent:
+        def chat(self, *_args, **_kwargs):
+            raise RuntimeError("conversation provider unavailable")
+
+    monkeypatch.setattr(
+        "mapping.views.get_or_create_conversation_agent",
+        lambda *_args, **_kwargs: FailedAgent(),
+    )
+
+    def fake_finalize(map_request, *_args, **_kwargs):
+        calls.append(map_request.id)
+        map_request.status = "failed"
+        map_request.error_message = "继续对话失败"
+        map_request.result_message = "继续对话失败"
+        map_request.save(update_fields=["status", "error_message", "result_message", "updated_at"])
+        return SimpleNamespace(
+            status="failed",
+            error_code="internal_error",
+            error_message="继续对话失败",
+            completion_report={},
+        )
+
+    monkeypatch.setattr("mapping.views._finalize_map_request", fake_finalize)
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("mapping.views._record_error_event", lambda *_args, **_kwargs: None)
+
+    _continue_conversation_in_background(request.id, "继续调整", run.id)
+
+    assert calls == [request.id]
+
+
+def test_unavailable_agent_does_not_mark_request_completed_without_artifact(monkeypatch):
+    from types import SimpleNamespace
+    from mapping.views import _handle_map_llm_unavailable
+
+    user = make_user("unavailable-agent-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制依赖不可用区域",
+        status="pending",
+    )
+    calls = []
+
+    def fake_finalize(map_request, *_args, **_kwargs):
+        calls.append(map_request.id)
+        map_request.status = "failed"
+        map_request.result_message = "Map-LLM 不可用"
+        map_request.error_message = "Map-LLM 不可用"
+        map_request.save(update_fields=["status", "result_message", "error_message", "updated_at"])
+        return SimpleNamespace(
+            status="failed",
+            error_code="internal_error",
+            error_message="Map-LLM 不可用",
+            completion_report={},
+        )
+
+    monkeypatch.setattr("mapping.views._finalize_map_request", fake_finalize)
+    monkeypatch.setattr("mapping.views._publish_lifecycle_event", lambda *_args, **_kwargs: None)
+
+    _handle_map_llm_unavailable(request)
+
+    assert calls == [request.id]
+
+
+def test_finalizer_rejects_path_inferred_source_without_registered_dataset(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from django.test import override_settings
+    from PIL import Image
+
+    from mapping.finalization import SpatialValidation
+    from mapping.views import _finalize_map_request
+
+    user = make_user("unregistered-source-finalizer-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制甲市道路",
+        status="processing",
+    )
+    output = tmp_path / "map.png"
+    Image.new("RGB", (2, 2), "white").save(output)
+    GeneratedMap.objects.create(
+        request=request,
+        filename="map.png",
+        file_path="map.png",
+        version=1,
+    )
+    state = SimpleNamespace(
+        config=SimpleNamespace(extent=[120, 30, 121, 31]),
+        layers=[
+            SimpleNamespace(
+                name="道路",
+                data_source="data_cache/remote_roads/road.geojson",
+                data_source_meta={},
+                data=None,
+                feature_count=4,
+                extent=[120, 30, 121, 31],
+            )
+        ],
+    )
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.state.get_state_manager",
+        lambda: SimpleNamespace(load_state=lambda _session_id: state),
+    )
+    monkeypatch.setattr(
+        "mapping.finalization.validate_source_spatial",
+        lambda *_args, **_kwargs: SpatialValidation(
+            role="road",
+            feature_count=4,
+            geometry_valid=True,
+            spatial_valid=True,
+        ),
+    )
+
+    with override_settings(GENERATED_MAPS_DIR=tmp_path):
+        result = _finalize_map_request(
+            request,
+            {
+                "success": True,
+                "response": "地图已生成",
+                "source_plan": {
+                    "layers": [{
+                        "role": "road",
+                        "status": "available",
+                        "dataset_id": "missing-road-dataset",
+                    }],
+                    "location": {"bbox": [120, 30, 121, 31]},
+                },
+            },
+        )
+
+    assert result.status == "failed"
+    assert "road" in result.completion_report["missing_layers"]
+
+
+def test_runtime_dataset_lookup_returns_registered_available_dataset(monkeypatch):
+    from types import SimpleNamespace
+    from mapping.views import _runtime_dataset_for_layer
+
+    dataset = SimpleNamespace(
+        dataset_id="registered-road",
+        source_type=Dataset.SOURCE_LOCAL,
+        feature_count=3,
+    )
+    manager = SimpleNamespace(
+        filter=lambda **_kwargs: SimpleNamespace(first=lambda: dataset)
+    )
+    monkeypatch.setattr(
+        "mapping.views.Dataset",
+        SimpleNamespace(STATUS_AVAILABLE=Dataset.STATUS_AVAILABLE, objects=manager),
+    )
+
+    resolved = _runtime_dataset_for_layer({"dataset_id": dataset.dataset_id})
+
+    assert resolved is not None
+    assert resolved.dataset_id == dataset.dataset_id
+
+
+def test_runtime_dataset_lookup_fails_closed_when_feature_count_query_fails(monkeypatch):
+    from mapping.views import _runtime_dataset_for_layer
+
+    class Features:
+        def count(self):
+            raise RuntimeError("database connection lost")
+
+    dataset = SimpleNamespace(
+        dataset_id="registered-road-db-error",
+        source_type=Dataset.SOURCE_LOCAL,
+        feature_count=3,
+        features=Features(),
+    )
+    manager = SimpleNamespace(
+        filter=lambda **_kwargs: SimpleNamespace(first=lambda: dataset)
+    )
+    monkeypatch.setattr(
+        "mapping.views.Dataset",
+        SimpleNamespace(STATUS_AVAILABLE=Dataset.STATUS_AVAILABLE, objects=manager),
+    )
+
+    assert _runtime_dataset_for_layer({"dataset_id": dataset.dataset_id}) is None
 
 
 def test_map_request_creation_normalizes_null_completion_report():
@@ -267,6 +657,45 @@ def test_process_request_assigns_trace_id_before_dispatch(monkeypatch):
 
     assert response.status_code == 200
     assert request.runs.get().trace_id == f"web_session_{request.id}:create"
+
+
+def test_legacy_run_creation_uses_admission_lock_for_process_and_continue(monkeypatch):
+    user = make_user("admission-lock-owner")
+    process_request = MapRequest.objects.create(
+        user=user, request_text="绘制北京道路图"
+    )
+    continue_request = MapRequest.objects.create(
+        user=user, request_text="绘制北京道路图", status="completed"
+    )
+    admissions = []
+
+    @contextmanager
+    def admission():
+        admissions.append(True)
+        yield
+
+    monkeypatch.setattr("mapping.views.active_run_admission", admission)
+    monkeypatch.setattr("mapping.views.MAP_LLM_AVAILABLE", True)
+    monkeypatch.setattr("mapping.views.dispatch_map_request", lambda *_args: None)
+    monkeypatch.setattr("mapping.views.dispatch_conversation", lambda *_args: None)
+
+    client = login_client(user)
+    process_response = client.post(
+        "/mapping/api/process-request/",
+        data=json.dumps({"request_id": process_request.id}),
+        content_type="application/json",
+    )
+    continue_response = client.post(
+        "/mapping/api/continue-conversation/",
+        data=json.dumps(
+            {"request_id": continue_request.id, "message": "补充道路"}
+        ),
+        content_type="application/json",
+    )
+
+    assert process_response.status_code == 200
+    assert continue_response.status_code == 200
+    assert admissions == [True, True]
 
 
 def test_continue_conversation_marks_run_failed_when_dispatch_raises(monkeypatch):
@@ -691,6 +1120,7 @@ def seed_snapshot(tmp_path, map_request):
                 extent=[115, 39, 117, 41],
                 render_mode="geojson",
                 data_url="/mapping/api/map-requests/1/snapshots/1/layers/roads/",
+                data_source_meta={"dataset_id": "local-roads"},
             )
         ],
     )
@@ -725,6 +1155,29 @@ def test_snapshot_current_returns_spec_and_layer_manifests_without_geojson(tmp_p
     assert cached.status_code == 304
 
 
+def test_layer_manifest_does_not_infer_remote_source_from_cache_path():
+    layer = SimpleNamespace(
+        layer_id="unregistered",
+        name="道路",
+        geometry_type="line",
+        feature_count=1,
+        extent=[120, 30, 121, 31],
+        data_hash="hash",
+        render_mode="geojson",
+        data_url=None,
+        data_source="data_cache/remote_roads/road.geojson",
+        data_source_meta={},
+        render_spec=None,
+        visible=True,
+        z_order=1,
+    )
+
+    payload = rest_api._layer_manifest(layer, 1)
+
+    assert payload["data_source_meta"]["source_type"] is None
+    assert payload["data_source_meta"]["status"] == "unavailable"
+
+
 def test_snapshot_version_and_layer_are_user_scoped(tmp_path, monkeypatch):
     owner = make_user("snapshot-private-owner")
     other = make_user("snapshot-private-other")
@@ -753,21 +1206,11 @@ def test_layer_data_returns_geojson_on_demand_without_sse_payload(tmp_path, monk
     map_request = MapRequest.objects.create(user=user, request_text="layer data")
     manager = seed_snapshot(tmp_path, map_request)
     monkeypatch.setattr(rest_api, "get_state_manager", lambda: manager)
-    monkeypatch.setattr(
-        rest_api,
-        "DataLoader",
-        lambda: type(
-            "Loader",
-            (),
-            {
-                "load_shapefile": lambda self, source: object(),
-                "create_geojson_from_gdf": lambda self, data: {
-                    "type": "FeatureCollection",
-                    "features": [],
-                },
-            },
-        )(),
-    )
+    class Frame:
+        def to_json(self):
+            return json.dumps({"type": "FeatureCollection", "features": []})
+
+    monkeypatch.setattr(rest_api, "read_dataset_features", lambda *_args: Frame())
 
     response = login_client(user).get(
         f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/data/"
@@ -776,6 +1219,40 @@ def test_layer_data_returns_geojson_on_demand_without_sse_payload(tmp_path, monk
     assert response.status_code == 200
     assert response.json()["type"] == "FeatureCollection"
     assert response["Cache-Control"].startswith("private")
+
+
+def test_layer_data_passes_source_scope_geometry_to_postgis_reader(tmp_path, monkeypatch):
+    user = make_user("scoped-layer-data-owner")
+    map_request = MapRequest.objects.create(user=user, request_text="scoped layer")
+    manager = seed_snapshot(tmp_path, map_request)
+    state = manager.load_state(f"web_session_{map_request.id}")
+    state.layers[0].data_source_meta = {
+        "dataset_id": "local-roads",
+        "scope_geometry": {
+            "type": "Polygon",
+            "coordinates": [[[120, 30], [121, 30], [121, 31], [120, 31], [120, 30]]],
+        },
+    }
+    assert manager.save_state(state)
+    monkeypatch.setattr(rest_api, "get_state_manager", lambda: manager)
+    calls = []
+
+    class Frame:
+        def to_json(self):
+            return json.dumps({"type": "FeatureCollection", "features": []})
+
+    def reader(dataset_id, bbox=None, limit=None, clip_geometry=None):
+        calls.append((dataset_id, bbox, limit, clip_geometry))
+        return Frame()
+
+    monkeypatch.setattr(rest_api, "read_dataset_features", reader)
+
+    response = login_client(user).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/data/"
+    )
+
+    assert response.status_code == 200
+    assert calls[0][3]["type"] == "Polygon"
 
 
 def test_layer_data_reports_pending_until_processing_snapshot_is_ready():
@@ -798,16 +1275,6 @@ def test_mvt_tile_endpoint_returns_cached_pbf_and_enforces_snapshot_ownership(tm
     owner = make_user("mvt-owner")
     other = make_user("mvt-other")
     map_request = MapRequest.objects.create(user=owner, request_text="mvt")
-    source = Path(tmp_path) / "roads.geojson"
-    source.write_text(json.dumps({
-        "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "id": "road-1",
-            "properties": {"name": "中央路"},
-            "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
-        }],
-    }), encoding="utf-8")
     manager = MapStateManager(str(Path(tmp_path) / "mvt.db"))
     state = MapState(
         config=MapConfig(map_id="mvt-map", title="MVT", extent=[-1, -1, 2, 2]),
@@ -816,7 +1283,8 @@ def test_mvt_tile_endpoint_returns_cached_pbf_and_enforces_snapshot_ownership(tm
             layer_id="roads",
             name="Roads",
             geometry_type=GeometryType.LINE,
-            data_source=str(source),
+            data_source="remote-cache/roads.geojson",
+            data_source_meta={"dataset_id": "remote-roads"},
             feature_count=30001,
             render_mode="mvt",
             data_hash="roads-v1",
@@ -824,6 +1292,7 @@ def test_mvt_tile_endpoint_returns_cached_pbf_and_enforces_snapshot_ownership(tm
     )
     assert manager.save_state(state)
     monkeypatch.setattr(rest_api, "get_state_manager", lambda: manager)
+    monkeypatch.setattr(rest_api, "read_dataset_tile", lambda *_args: b"pbf")
 
     response = login_client(owner).get(
         f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/2/1.pbf"
@@ -845,6 +1314,33 @@ def test_mvt_tile_endpoint_returns_cached_pbf_and_enforces_snapshot_ownership(tm
     assert login_client(owner).get(
         f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/99/1.pbf"
     ).status_code == 400
+
+
+def test_mvt_tile_endpoint_rejects_unregistered_file_fallback(tmp_path, monkeypatch):
+    user = make_user("mvt-no-file-fallback-owner")
+    map_request = MapRequest.objects.create(user=user, request_text="mvt no fallback")
+    manager = MapStateManager(str(Path(tmp_path) / "mvt-no-fallback.db"))
+    state = MapState(
+        config=MapConfig(map_id="mvt-no-fallback", title="MVT", extent=[-1, -1, 2, 2]),
+        session_info=SessionInfo(session_id=f"web_session_{map_request.id}"),
+        layers=[LayerConfig(
+            layer_id="roads",
+            name="Roads",
+            geometry_type=GeometryType.LINE,
+            data_source=str(Path(tmp_path) / "roads.geojson"),
+            feature_count=30001,
+            render_mode="mvt",
+        )],
+    )
+    assert manager.save_state(state)
+    monkeypatch.setattr(rest_api, "get_state_manager", lambda: manager)
+
+    response = login_client(user).get(
+        f"/mapping/api/map-requests/{map_request.id}/snapshots/1/layers/roads/tiles/2/2/1.pbf"
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "dataset_not_registered"
 
 
 def test_mvt_tile_endpoint_reports_pending_before_snapshot_is_saved():
@@ -869,21 +1365,11 @@ def test_current_layer_data_route_resolves_latest_snapshot(tmp_path, monkeypatch
     map_request = MapRequest.objects.create(user=user, request_text="current layer", status="completed")
     manager = seed_snapshot(tmp_path, map_request)
     monkeypatch.setattr(rest_api, "get_state_manager", lambda: manager)
-    monkeypatch.setattr(
-        rest_api,
-        "DataLoader",
-        lambda: type(
-            "Loader",
-            (),
-            {
-                "load_shapefile": lambda self, source: object(),
-                "create_geojson_from_gdf": lambda self, data: {
-                    "type": "FeatureCollection",
-                    "features": [],
-                },
-            },
-        )(),
-    )
+    class Frame:
+        def to_json(self):
+            return json.dumps({"type": "FeatureCollection", "features": []})
+
+    monkeypatch.setattr(rest_api, "read_dataset_features", lambda *_args: Frame())
 
     response = login_client(user).get(
         f"/mapping/api/map-requests/{map_request.id}/snapshots/current/layers/roads/data/"
@@ -894,6 +1380,9 @@ def test_current_layer_data_route_resolves_latest_snapshot(tmp_path, monkeypatch
 
 
 def test_request_detail_exposes_available_result_after_latest_run_failed(tmp_path, monkeypatch):
+    from django.test import override_settings
+    from PIL import Image
+
     user = make_user("failed-after-success-owner")
     map_request = MapRequest.objects.create(
         user=user,
@@ -920,8 +1409,12 @@ def test_request_detail_exposes_available_result_after_latest_run_failed(tmp_pat
         file_size=100,
         version=2,
     )
+    artifact_path = tmp_path / "user_1" / "session_1" / "v2_map.png"
+    artifact_path.parent.mkdir(parents=True)
+    Image.new("RGB", (2, 2), "white").save(artifact_path)
 
-    response = login_client(user).get(f"/mapping/api/map-requests/{map_request.id}/")
+    with override_settings(GENERATED_MAPS_DIR=tmp_path):
+        response = login_client(user).get(f"/mapping/api/map-requests/{map_request.id}/")
 
     assert response.status_code == 200
     payload = response.json()

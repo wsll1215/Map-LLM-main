@@ -9,7 +9,6 @@ https://docs.djangoproject.com/en/3.2/howto/deployment/asgi/
 
 import os
 
-from channels.auth import AuthMiddlewareStack
 from channels.routing import ProtocolTypeRouter
 from django.core.asgi import get_asgi_application
 
@@ -18,6 +17,7 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'xy_neo4j.settings')
 django_asgi_app = get_asgi_application()
 
 from mapping.sse import MapBuildSSEApplication
+from accounts.middleware import WorkbenchBearerASGIMiddleware
 
 
 class HttpApplication:
@@ -35,5 +35,5 @@ class HttpApplication:
         await self.django_app(scope, receive, send)
 
 application = ProtocolTypeRouter({
-    "http": AuthMiddlewareStack(HttpApplication(django_asgi_app)),
+    "http": WorkbenchBearerASGIMiddleware(HttpApplication(django_asgi_app)),
 })

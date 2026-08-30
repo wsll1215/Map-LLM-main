@@ -2,6 +2,7 @@
 
 from typing import Any, Dict
 import gc
+import hashlib
 from pathlib import Path
 
 import geopandas as gpd
@@ -34,6 +35,52 @@ def _is_global_placeholder_extent(extent: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return min_x <= -180 and min_y <= -90 and max_x >= 180 and max_y >= 90
+
+
+def _load_layer_data(params: Dict[str, Any]):
+    """Load runtime data from Dataset/PostGIS; files remain import-only input."""
+    source_meta = params.get("data_source_meta") or {}
+    dataset_id = source_meta.get("dataset_id")
+    if not dataset_id:
+        from mapping.dataset_reader import DatasetReadError
+
+        raise DatasetReadError(
+            "运行时图层必须使用已注册的 dataset_id；文件只能用于显式导入",
+            code="dataset_not_registered",
+        )
+    from mapping.dataset_reader import read_dataset_features
+
+    reader_kwargs = {}
+    scope_geometry = source_meta.get("scope_geometry")
+    if scope_geometry is not None:
+        reader_kwargs["clip_geometry"] = scope_geometry
+    return (
+        read_dataset_features(str(dataset_id), **reader_kwargs),
+        f"dataset://{dataset_id}",
+    )
+
+
+def _load_import_data(params: Dict[str, Any]):
+    """Read an explicit file as an import step, never as a runtime dataset."""
+    data_path = params.get("data_path")
+    if not data_path:
+        raise ValueError("显式导入必须提供 data_path")
+    if Path(data_path).is_absolute():
+        file_path = Path(data_path)
+    elif str(data_path).startswith(("data\\", "data/")):
+        file_path = Config.PROJECT_ROOT / data_path
+    else:
+        potential_path = Config.PROJECT_ROOT / data_path
+        file_path = potential_path if potential_path.exists() else Config.DATA_DIRECTORY_BASE / data_path
+        if not file_path.exists() and "\\" not in data_path and "/" not in data_path:
+            file_path = Config.DATA_DIRECTORY_BASE / "data1" / data_path
+    if not file_path.exists():
+        raise FileNotFoundError(f"数据路径不存在: {file_path}")
+    try:
+        data_source = str(file_path.relative_to(Config.PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        data_source = str(file_path)
+    return gpd.read_file(str(file_path)), data_source
 
 
 class MapOperationsMixin:
@@ -213,59 +260,90 @@ class MapOperationsMixin:
 
             # 解析参数
             name = params.get('name', 'unnamed_layer')
-            data_path = params.get('data_path')
+            source_meta = params.get("data_source_meta") or {}
+            dataset_id = params.get("dataset_id") or source_meta.get("dataset_id")
+            data_path = None if dataset_id else params.get('data_path')
             geometry_type = params.get('geometry_type', None)  # 改为None，稍后自动检测
             visible = params.get('visible', True)
             add_legend = params.get('add_legend', None)  # None表示使用地图的全局设置
             style = params.get('style', None)  # 样式参数
 
-            if not data_path:
-                raise ValueError("必须提供data_path参数")
+            if not dataset_id and not data_path:
+                raise ValueError("必须提供 dataset_id 或显式 data_path 参数")
 
-            # 智能路径处理
-            # 如果data_path已经是绝对路径，直接使用
-            if Path(data_path).is_absolute():
-                file_path = Path(data_path)
-            # 如果以"data\"或"data/"开头（如"data\data1\..."或"data/data1/..."），说明是相对于PROJECT_ROOT的路径
-            elif data_path.startswith("data\\") or data_path.startswith("data/"):
-                file_path = Config.PROJECT_ROOT / data_path
+            if dataset_id:
+                file_path = None
+                data_source_to_save = f"dataset://{dataset_id}"
             else:
-                # 其他情况：可能是相对路径或只是文件名
-                # 首先尝试作为相对于PROJECT_ROOT的路径
-                potential_path = Config.PROJECT_ROOT / data_path
-                if potential_path.exists():
-                    file_path = potential_path
+                # Explicit imports are the only path-based operation.
+                if Path(data_path).is_absolute():
+                    file_path = Path(data_path)
+                elif data_path.startswith("data\\") or data_path.startswith("data/"):
+                    file_path = Config.PROJECT_ROOT / data_path
                 else:
-                    # 如果不存在，尝试拼接基础数据目录
-                    base_data_dir = Config.DATA_DIRECTORY_BASE
-                    file_path = base_data_dir / data_path
+                    potential_path = Config.PROJECT_ROOT / data_path
+                    if potential_path.exists():
+                        file_path = potential_path
+                    else:
+                        base_data_dir = Config.DATA_DIRECTORY_BASE
+                        file_path = base_data_dir / data_path
+                        if not file_path.exists():
+                            if '\\' not in data_path and '/' not in data_path:
+                                data1_path = base_data_dir / "data1" / data_path
+                                if data1_path.exists():
+                                    self.logger.info(f"在data1目录中找到文件: {data_path}")
+                                    file_path = data1_path
 
-                    # 如果文件仍不存在，尝试在data1目录中查找（针对广东数据的默认行为）
-                    if not file_path.exists():
-                        # 检查是否只是文件名（不包含路径分隔符）
-                        if '\\' not in data_path and '/' not in data_path:
-                            # 尝试在data1目录中查找
-                            data1_path = base_data_dir / "data1" / data_path
-                            if data1_path.exists():
-                                self.logger.info(f"在data1目录中找到文件: {data_path}")
-                                file_path = data1_path
+                if not file_path.exists():
+                    raise FileNotFoundError(f"数据路径不存在: {file_path}")
 
-            # 如果路径仍然不存在，则报错
-            if not file_path.exists():
-                raise FileNotFoundError(f"数据路径不存在: {file_path}")
+                try:
+                    rel_path = file_path.relative_to(Config.PROJECT_ROOT)
+                    data_source_to_save = str(rel_path).replace('\\', '/')
+                    self.logger.debug(f"数据路径转换为相对路径: {data_source_to_save}")
+                except ValueError:
+                    # 如果无法转换为相对路径，保持绝对路径
+                    data_source_to_save = str(file_path)
+                    self.logger.warning(f"无法将路径转换为相对路径，使用绝对路径: {data_source_to_save}")
 
-            # 将绝对路径转换为相对路径（相对于PROJECT_ROOT）
-            try:
-                rel_path = file_path.relative_to(Config.PROJECT_ROOT)
-                data_source_to_save = str(rel_path).replace('\\', '/')
-                self.logger.debug(f"数据路径转换为相对路径: {data_source_to_save}")
-            except ValueError:
-                # 如果无法转换为相对路径，保持绝对路径
-                data_source_to_save = str(file_path)
-                self.logger.warning(f"无法将路径转换为相对路径，使用绝对路径: {data_source_to_save}")
+            if dataset_id:
+                gdf = _load_layer_data(params)[0]
+            else:
+                # Reading a path is an import operation only. Normalize it
+                # first, then read the authoritative DatasetFeature rows.
+                imported_frame = gpd.read_file(str(file_path))
+                from mapping.dataset_reader import register_geodataframe_dataset
 
-            # 使用绝对路径读取文件
-            gdf = gpd.read_file(str(file_path))
+                try:
+                    relative_source = file_path.relative_to(Config.PROJECT_ROOT).as_posix()
+                except ValueError:
+                    relative_source = file_path.as_posix()
+                role = str(
+                    params.get("role")
+                    or (params.get("data_source_meta") or {}).get("role")
+                    or name
+                )
+                source_type = (params.get("data_source_meta") or {}).get(
+                    "source_type",
+                    "local" if file_path.is_relative_to(Config.DATA_DIRECTORY_BASE) else "upload",
+                )
+                dataset_id = "import-" + hashlib.sha1(
+                    f"{source_type}:{relative_source}".encode("utf-8")
+                ).hexdigest()[:24]
+                register_geodataframe_dataset(
+                    imported_frame,
+                    dataset_id=dataset_id,
+                    name=name,
+                    role=role,
+                    source_type=source_type,
+                    local_path=relative_source,
+                    provider=(params.get("data_source_meta") or {}).get("provider"),
+                    source_url=(params.get("data_source_meta") or {}).get("source_url"),
+                    attribution=(params.get("data_source_meta") or {}).get("attribution"),
+                )
+                gdf, data_source_to_save = _load_layer_data(
+                    {"data_source_meta": {"dataset_id": dataset_id}}
+                )
 
             if gdf.empty:
                 # raise ValueError(f"数据文件为空: {data_path}")
@@ -333,6 +411,12 @@ class MapOperationsMixin:
                 z_order = 3
 
             # 创建图层配置（使用相对路径保存）
+            supplied_source_meta = dict(params.get("data_source_meta") or {})
+            source_meta_base = (
+                {"dataset_id": dataset_id}
+                if dataset_id
+                else source_metadata_from_path(data_source_to_save)
+            )
             layer_config = LayerConfig(
                 layer_id=generate_unique_id(),
                 name=name,
@@ -343,7 +427,10 @@ class MapOperationsMixin:
                 z_order=z_order,
                 feature_count=len(gdf),
                 extent=[float(value) for value in gdf.total_bounds],
-                data_source_meta=source_metadata_from_path(data_source_to_save),
+                data_source_meta={
+                    **source_meta_base,
+                    **supplied_source_meta,
+                },
             )
 
             # 处理样式：如果提供了样式参数，使用它；否则自动分配颜色

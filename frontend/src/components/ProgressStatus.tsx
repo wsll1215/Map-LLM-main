@@ -1,5 +1,5 @@
 import { BulbOutlined, CheckCircleFilled, CloseCircleFilled, ReloadOutlined, WarningOutlined } from "@ant-design/icons";
-import { Alert, Progress, Steps, Tag } from "antd";
+import { Progress, Tag } from "antd";
 
 export type ProgressStatusValue = "idle" | "pending" | "processing" | "needs_clarification" | "completed" | "partial" | "failed";
 
@@ -18,10 +18,10 @@ export function progressModel(status: ProgressStatusValue, latestProgress?: numb
   const reported = typeof latestProgress === "number" ? Math.max(0, Math.min(100, latestProgress)) : null;
   if (status === "completed") return { percent: 100, current: 3 };
   if (status === "partial") return { percent: 100, current: 3 };
-  if (status === "failed") return { percent: reported ?? 0, current: 2 };
+  if (status === "failed") return { percent: reported, current: 2 };
   if (status === "needs_clarification") return { percent: 25, current: 1 };
-  if (status === "processing") return { percent: Math.max(reported ?? 58, 34), current: 2 };
-  if (status === "pending") return { percent: Math.max(reported ?? 12, 8), current: 0 };
+  if (status === "processing") return { percent: reported, current: 2 };
+  if (status === "pending") return { percent: reported, current: 0 };
   return { percent: 0, current: 0 };
 }
 
@@ -36,22 +36,17 @@ function statusIcon(status: ProgressStatusValue) {
 export function ProgressStatus({ status, message, latestProgress }: { status: ProgressStatusValue; message?: string; latestProgress?: number | null }) {
   const copy = STATUS_COPY[status];
   const model = progressModel(status, latestProgress);
-  const items = STAGES.map((title, index) => ({
-    title,
-    status: status === "failed" && index === model.current
-      ? "error" as const
-      : index < model.current || status === "completed"
-        ? "finish" as const
-        : index === model.current && (status === "processing" || status === "pending" || status === "partial")
-          ? "process" as const
-          : "wait" as const,
-  }));
+  const phaseStatus = (index: number) => {
+    if (status === "failed" && index === model.current) return "error";
+    if (index < model.current || status === "completed" || status === "partial") return "done";
+    if (index === model.current && (status === "processing" || status === "pending" || status === "needs_clarification")) return "active";
+    return "pending";
+  };
 
   return <section className={`progress-status progress-status-${status}`} aria-label="处理进度">
-    <div className="progress-status-header"><div className="progress-status-title"><span className="progress-status-icon" aria-hidden="true">{statusIcon(status)}</span><div><span className="progress-status-kicker">任务进度</span><strong>{copy.label}</strong></div></div><Tag color={copy.color}>{status === "partial" ? "未完全交付" : `${model.percent}%`}</Tag></div>
-    <Progress percent={model.percent} status={status === "failed" ? "exception" : status === "completed" ? "success" : "active"} showInfo={false} />
-    <Steps className="progress-status-steps" size="small" responsive={false} items={items} />
-    <div className="progress-status-message"><strong>{message || copy.detail}</strong>{message && message !== copy.detail && <span>{copy.detail}</span>}</div>
-    {status === "failed" && <Alert className="progress-status-alert" type="error" showIcon title="本轮没有完成" description={copy.detail} />}
+    <div className="progress-status-header"><div className="progress-status-title"><span className="progress-status-icon" aria-hidden="true">{statusIcon(status)}</span><div><span className="progress-status-kicker">任务进度</span><strong>{copy.label}</strong></div></div><Tag color={copy.color}>{status === "partial" ? "未完全交付" : model.percent == null ? "等待后端进度" : `${model.percent}%`}</Tag></div>
+    <Progress className={model.percent == null && (status === "pending" || status === "processing") ? "progress-indeterminate" : undefined} percent={model.percent ?? 0} status={status === "failed" ? "exception" : status === "completed" ? "success" : "active"} showInfo={false} />
+    <div className="progress-phase-rail" role="list" aria-label="处理阶段">{STAGES.map((title, index) => { const phase = phaseStatus(index); return <div className={`progress-phase progress-phase-${phase}`} role="listitem" key={title}><span className="progress-phase-marker" aria-hidden="true">{phase === "done" ? <CheckCircleFilled /> : phase === "error" ? <CloseCircleFilled /> : index + 1}</span><span className="progress-phase-label">{title}</span></div>; })}</div>
+    <div className="progress-status-message" aria-live="polite"><strong>{message || copy.detail}</strong>{message && message !== copy.detail && <span>{copy.detail}</span>}</div>
   </section>;
 }

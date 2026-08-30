@@ -92,6 +92,55 @@ describe("workbenchReducer", () => {
     expect(completed.lastEventId).toBe("2");
   });
 
+  it("keeps transport alive for a compatibility status until canonical done", () => {
+    const statusEvent = workbenchReducer(initialWorkbenchState, {
+      type: "stream_event",
+      event: { id: "status-1", event: "request_completed", data: { status: "completed" } },
+    });
+    const doneEvent = workbenchReducer(statusEvent, {
+      type: "stream_event",
+      event: { id: "done-1", event: "done", data: { status: "completed" } },
+    });
+
+    expect(statusEvent.status).toBe("completed");
+    expect(statusEvent.transportStatus).toBe("connected");
+    expect(doneEvent.transportStatus).toBe("idle");
+  });
+
+  it("merges assistant deltas by message and ignores repeated delta sequence", () => {
+    const started = workbenchReducer(initialWorkbenchState, {
+      type: "stream_event",
+      event: { id: "1", event: "assistant_started", data: { message_id: "msg-1" } },
+    });
+    const first = workbenchReducer(started, {
+      type: "stream_event",
+      event: { id: "2", event: "assistant_delta", data: { message_id: "msg-1", delta_seq: 1, content: "正在" } },
+    });
+    const duplicate = workbenchReducer(first, {
+      type: "stream_event",
+      event: { id: "2-replay", event: "assistant_delta", data: { message_id: "msg-1", delta_seq: 1, content: "正在" } },
+    });
+    const second = workbenchReducer(duplicate, {
+      type: "stream_event",
+      event: { id: "3", event: "assistant_delta", data: { message_id: "msg-1", delta_seq: 2, content: "处理" } },
+    });
+
+    expect(second.messages).toEqual([{ role: "assistant", content: "正在处理" }]);
+  });
+
+  it("replaces a streaming assistant message with the final snapshot", () => {
+    const streaming = workbenchReducer(initialWorkbenchState, {
+      type: "stream_event",
+      event: { id: "4", event: "assistant_delta", data: { message_id: "msg-2", delta_seq: 1, content: "临时" } },
+    });
+    const finished = workbenchReducer(streaming, {
+      type: "stream_event",
+      event: { id: "5", event: "assistant_message", data: { message_id: "msg-2", content: "最终结果", complete: true } },
+    });
+
+    expect(finished.messages).toEqual([{ role: "assistant", content: "最终结果" }]);
+  });
+
   it("ignores a duplicate event id", () => {
     const state = workbenchReducer(initialWorkbenchState, {
       type: "stream_event",
@@ -154,6 +203,26 @@ describe("workbenchReducer", () => {
     expect(processing.error).toBeNull();
     expect(processing.transportStatus).toBe("reconnecting");
     expect(processing.transportError).toBe("流式连接已断开");
+  });
+
+  it("keeps the current transport state for non-retryable stream diagnostics", () => {
+    const processing = workbenchReducer(
+      { ...initialWorkbenchState, requestId: 8, status: "processing", transportStatus: "connected" },
+      { type: "stream_error", message: "收到无法解析的 SSE 事件", retryable: false },
+    );
+
+    expect(processing.status).toBe("processing");
+    expect(processing.transportStatus).toBe("connected");
+    expect(processing.transportError).toBe("收到无法解析的 SSE 事件");
+  });
+
+  it("does not let status polling replace polling after a connection limit", () => {
+    const processing = workbenchReducer(
+      { ...initialWorkbenchState, requestId: 8, status: "processing", transportStatus: "polling" },
+      { type: "task_status", status: "processing", error: null },
+    );
+
+    expect(processing.transportStatus).toBe("polling");
   });
 
   it("syncs the terminal task status returned by the REST fallback", () => {
@@ -330,6 +399,45 @@ describe("workbenchReducer", () => {
     expect(unified.traceEvents).toHaveLength(1);
     expect(unified.traceEvents[0].event_type).toBe("tool_call");
     expect(unified.runId).toBe(7);
+  });
+
+  it("updates a running trace span when its finished snapshot arrives", () => {
+    const running = {
+      event_id: "evt-2",
+      event_seq: 1,
+      event_type: "tool_call",
+      status: "running",
+      summary: "执行工具",
+    };
+    const finished = { ...running, status: "success", duration_ms: 42 };
+    const first = workbenchReducer(initialWorkbenchState, {
+      type: "stream_event",
+      event: { id: "stream-1", event: "trace_event", data: { trace_event: running } },
+    });
+    const next = workbenchReducer(first, {
+      type: "stream_event",
+      event: { id: "stream-2", event: "trace_event", data: { trace_event: finished } },
+    });
+
+    expect(next.traceEvents).toEqual([finished]);
+  });
+
+  it("enters recovery and exposes the cursor gap so REST can refill trace events", () => {
+    const next = workbenchReducer(initialWorkbenchState, {
+      type: "stream_event",
+      event: {
+        id: "redis-gap-11",
+        event: "stream_error",
+        data: {
+          error_code: "stream_cursor_gap",
+          message: "实时事件已超出保留窗口",
+          next_action: "refresh_task_state",
+        },
+      },
+    });
+
+    expect(next.transportStatus).toBe("polling");
+    expect(next.transportError).toContain("stream_cursor_gap");
   });
 
   it("keeps every process log available for the trace viewer", () => {

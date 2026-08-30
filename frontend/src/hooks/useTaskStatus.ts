@@ -4,6 +4,13 @@ import type { MapRequestSummary } from "../types/api";
 
 const TERMINAL = new Set<MapRequestSummary["status"]>(["completed", "partial", "needs_clarification", "failed"]);
 
+export function shouldPollTaskStatus(
+  active: boolean,
+  transportStatus: "idle" | "connecting" | "connected" | "reconnecting" | "polling",
+): boolean {
+  return active && transportStatus !== "connected";
+}
+
 export function isTerminalTaskStatus(status: MapRequestSummary["status"]): boolean {
   return TERMINAL.has(status);
 }

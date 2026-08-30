@@ -1,5 +1,7 @@
 import json
+import math
 
+import pytest
 import requests
 
 import gis_mapping_agent.data_sources.remote as remote
@@ -252,6 +254,221 @@ def test_remote_request_timeout_is_capped_and_failure_is_typed(monkeypatch) -> N
 
     assert timeouts
     assert max(timeouts) <= remote.REMOTE_HTTP_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_code", "retryable"),
+    [
+        (400, "validation_error", False),
+        (404, "resource_not_found", False),
+    ],
+)
+def test_remote_http_client_classifies_non_retryable_statuses(
+    monkeypatch, status_code, error_code, retryable
+):
+    calls = []
+
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            raise requests.HTTPError(response=self)
+
+    monkeypatch.setattr(
+        remote.requests,
+        "get",
+        lambda *args, **kwargs: calls.append(kwargs) or Response(),
+    )
+
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote._request_with_retries("GET", "https://example.test", timeout=5)
+
+    assert caught.value.error_code == error_code
+    assert caught.value.retryable is retryable
+    assert len(calls) == 1
+
+
+def test_remote_http_client_retries_rate_limit_and_preserves_error_type(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": "0"}
+
+        def raise_for_status(self):
+            raise requests.HTTPError(response=self)
+
+    monkeypatch.setattr(
+        remote.requests,
+        "post",
+        lambda *args, **kwargs: calls.append(kwargs) or Response(),
+    )
+    monkeypatch.setattr(remote.time, "sleep", lambda _: None)
+
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote._request_with_retries("POST", "https://example.test", timeout=5)
+
+    assert caught.value.error_code == "rate_limited"
+    assert caught.value.retryable is True
+    assert len(calls) == remote.REMOTE_MAX_ATTEMPTS
+
+
+def test_remote_roads_preserve_validation_error_instead_of_relabeling_as_network(
+    monkeypatch,
+):
+    calls = []
+
+    class Response:
+        status_code = 400
+        headers = {}
+
+        def raise_for_status(self):
+            raise requests.HTTPError(response=self)
+
+    monkeypatch.setattr(
+        remote.requests,
+        "post",
+        lambda *args, **kwargs: calls.append(args[0]) or Response(),
+    )
+
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote.fetch_remote_roads("甲市", [120, 30, 121, 31])
+
+    assert caught.value.error_code == "validation_error"
+    assert caught.value.retryable is False
+    assert len(calls) == 1
+
+
+def test_remote_roads_switch_endpoint_when_response_schema_is_malformed(
+    tmp_path, monkeypatch
+):
+    class MalformedResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class ValidResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "elements": [
+                    {
+                        "type": "way",
+                        "id": 1,
+                        "tags": {"highway": "primary", "name": "新路"},
+                        "geometry": [
+                            {"lon": 120.1, "lat": 30.1},
+                            {"lon": 120.2, "lat": 30.2},
+                        ],
+                    }
+                ]
+            }
+
+    responses = iter([MalformedResponse(), ValidResponse()])
+    calls = []
+    monkeypatch.setattr(remote, "OVERPASS_ENDPOINTS", ("https://one", "https://two"))
+    monkeypatch.setattr(
+        remote.requests,
+        "post",
+        lambda url, **kwargs: calls.append(url) or next(responses),
+    )
+
+    path = remote.fetch_remote_roads("甲市", [120, 30, 121, 31], cache_dir=tmp_path)
+
+    assert path is not None
+    assert calls == ["https://one", "https://two"]
+
+
+def test_cache_writer_rejects_invalid_geojson_before_persisting(tmp_path):
+    path = tmp_path / "invalid.geojson"
+
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote._write_geojson_cache(
+            path,
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [999, 999]},
+                        "properties": {},
+                    }
+                ],
+            },
+        )
+
+    assert caught.value.error_code == "data_invalid"
+    assert not path.exists()
+
+
+def test_cache_writer_reports_cross_process_lock_contention(tmp_path, monkeypatch):
+    path = tmp_path / "locked.geojson"
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.write_text("other-process", encoding="utf-8")
+    monkeypatch.setattr(remote, "REMOTE_CACHE_LOCK_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote._write_geojson_cache(
+            path,
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [120, 30]},
+                        "properties": {},
+                    }
+                ],
+            },
+        )
+
+    assert caught.value.error_code == "cache_lock_timeout"
+    assert caught.value.retryable is True
+    assert not path.exists()
+
+
+def test_retry_after_is_clamped_to_a_non_negative_finite_delay(monkeypatch):
+    sleeps = []
+
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": "-1"}
+
+        def raise_for_status(self):
+            raise requests.HTTPError(response=self)
+
+    monkeypatch.setattr(remote.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(remote.time, "sleep", sleeps.append)
+
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote._request_with_retries("GET", "https://example.test", timeout=5)
+
+    assert caught.value.error_code == "rate_limited"
+    assert all(delay >= 0 and math.isfinite(delay) for delay in sleeps)
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    [
+        [float("nan"), 30, 121, 31],
+        [120, 30, float("inf"), 31],
+        [120, -91, 121, 31],
+        [120, 30, 181, 31],
+    ],
+)
+def test_remote_bbox_validation_rejects_non_finite_or_out_of_range_values(
+    bbox,
+):
+    with pytest.raises(remote.RemoteDataSourceError) as caught:
+        remote._validate_remote_bbox(bbox)
+
+    assert caught.value.error_code == "validation_error"
+    assert caught.value.retryable is False
 
 
 def test_fetch_remote_pois_caches_named_point_features(tmp_path, monkeypatch) -> None:

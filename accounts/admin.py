@@ -1,6 +1,6 @@
 from django.contrib import admin
-from .models import UserProfile
-from django.contrib.auth.hashers import make_password
+from .models import AuthAuditEvent, UserProfile
+from django.contrib.auth.forms import ReadOnlyPasswordHashField, UserChangeForm, UserCreationForm
 from django.contrib.auth.models import Group
 from django.utils.html import format_html
 from django.db.models import Count
@@ -9,6 +9,24 @@ from datetime import timedelta
 
 # 取消注册Group模型
 admin.site.unregister(Group)
+
+
+class UserProfileChangeForm(UserChangeForm):
+    """Use Django's hashed-password display without accepting plaintext input."""
+
+    password = ReadOnlyPasswordHashField(label='密码')
+
+    class Meta:
+        model = UserProfile
+        fields = '__all__'
+
+
+class UserProfileCreationForm(UserCreationForm):
+    """Create users through Django's password hashing and validation flow."""
+
+    class Meta:
+        model = UserProfile
+        fields = ('username', 'email', 'password1', 'password2')
 
 
 class UserProfileAdmin(admin.ModelAdmin):
@@ -42,13 +60,17 @@ class UserProfileAdmin(admin.ModelAdmin):
     readonly_fields = (
         'date_joined',
         'last_login',
+        'password',
         'user_stats_display'
     )
+
+    form = UserProfileChangeForm
+    add_form = UserProfileCreationForm
 
     # 字段分组
     fieldsets = (
         ('用户基本信息', {
-            'fields': ('username', 'email', 'mpassword'),
+            'fields': ('username', 'email', 'password'),
             'classes': ('wide', 'extrapretty'),
         }),
         ('权限信息', {
@@ -65,6 +87,20 @@ class UserProfileAdmin(admin.ModelAdmin):
             'classes': ('wide',),
         }),
     )
+
+    add_fieldsets = (
+        (None, {
+            'classes': ('wide',),
+            'fields': ('username', 'email', 'password1', 'password2'),
+        }),
+    )
+
+    def get_form(self, request, obj=None, **kwargs):
+        kwargs['form'] = self.add_form if obj is None else self.form
+        return super().get_form(request, obj, **kwargs)
+
+    def get_fieldsets(self, request, obj=None):
+        return self.add_fieldsets if obj is None else super().get_fieldsets(request, obj)
 
     # 批量操作
     actions = ['activate_users', 'deactivate_users', 'make_superuser', 'remove_superuser']
@@ -211,17 +247,26 @@ class UserProfileAdmin(admin.ModelAdmin):
         }
         js = ('js/admin_custom.js',)
 
-    def save_model(self, request, obj, form, change):
-        """保存模型时处理密码"""
-        if form.is_valid():
-            # 如果修改了密码字段，则更新password
-            if 'mpassword' in form.changed_data and obj.mpassword:
-                obj.password = make_password(obj.mpassword)
-        super().save_model(request, obj, form, change)
-
-
 # 注册模型
 admin.site.register(UserProfile, UserProfileAdmin)
+
+
+@admin.register(AuthAuditEvent)
+class AuthAuditEventAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "event_type", "user", "family_id", "request_id")
+    list_filter = ("event_type", "created_at")
+    search_fields = ("request_id", "user__username", "family_id")
+    readonly_fields = (
+        "user",
+        "event_type",
+        "family_id",
+        "refresh_token_id",
+        "request_id",
+        "ip_address",
+        "user_agent",
+        "details",
+        "created_at",
+    )
 
 # 自定义Admin站点标题和头部
 admin.site.site_title = "智能GIS制图系统 - 管理后台"

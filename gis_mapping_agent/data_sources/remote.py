@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -31,6 +33,8 @@ REMOTE_MAX_ATTEMPTS = 3
 REMOTE_BACKOFF_SECONDS = 0.5
 REMOTE_HTTP_TIMEOUT_SECONDS = 15
 REMOTE_TOTAL_TIMEOUT_SECONDS = 45
+REMOTE_CACHE_LOCK_TIMEOUT_SECONDS = 5.0
+REMOTE_CACHE_LOCK_STALE_SECONDS = 300.0
 REMOTE_POI_CATEGORIES: Dict[str, Dict[str, Any]] = {
     "universities": {"label": "高校", "filter": "[amenity~'^(university|college)$']"},
     "primary_schools": {"label": "小学", "filter": "[amenity='school']"},
@@ -44,32 +48,139 @@ _CACHE_LOCK = RLock()
 class RemoteDataSourceError(RuntimeError):
     """Typed remote-source failure that can be converted into a tool result."""
 
-    def __init__(self, message: str, *, code: str, retryable: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        retryable: bool = False,
+        status_code: Optional[int] = None,
+        retry_after: Optional[float] = None,
+    ):
         super().__init__(message)
         self.error_code = code
         self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _valid_geojson_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
+        return False
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        return False
+    try:
+        from shapely.geometry import shape
+
+        for feature in features:
+            geometry = feature.get("geometry") if isinstance(feature, dict) else None
+            if not geometry:
+                return False
+            value = shape(geometry)
+            if value.is_empty or not value.is_valid:
+                return False
+            min_x, min_y, max_x, max_y = value.bounds
+            if not all(math.isfinite(float(item)) for item in value.bounds):
+                return False
+            if min_x < -180 or max_x > 180 or min_y < -90 or max_y > 90:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def _valid_geojson_cache(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size <= 0:
-        return False
     try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return (
-            payload.get("type") == "FeatureCollection"
-            and isinstance(payload.get("features"), list)
-            and bool(payload["features"])
-            and all(isinstance(feature, dict) and feature.get("geometry") for feature in payload["features"])
-        )
-    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+    except Exception:
         return False
+    return _valid_geojson_payload(payload)
+
+
+@contextmanager
+def _cache_file_lock(path: Path):
+    """Serialize cache writers across Django/Celery processes."""
+    lock_path = path.with_name(f".{path.name}.lock")
+    deadline = time.monotonic() + max(0.0, REMOTE_CACHE_LOCK_TIMEOUT_SECONDS)
+    descriptor = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(
+                str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+        except FileExistsError:
+            try:
+                stale = (
+                    time.time() - lock_path.stat().st_mtime
+                    > REMOTE_CACHE_LOCK_STALE_SECONDS
+                )
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    continue
+            elif time.monotonic() < deadline:
+                time.sleep(0.05)
+            else:
+                raise RemoteDataSourceError(
+                    f"缓存写入锁超时: {path.name}",
+                    code="cache_lock_timeout",
+                    retryable=True,
+                )
+        except OSError as exc:
+            raise RemoteDataSourceError(
+                f"无法创建缓存写入锁: {path.name}",
+                code="cache_lock_failed",
+                retryable=True,
+            ) from exc
+    try:
+        yield
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _write_geojson_cache(path: Path, payload: Dict[str, Any]) -> None:
+    if not _valid_geojson_payload(payload):
+        raise RemoteDataSourceError(
+            "远程响应不是有效的 GeoJSON FeatureCollection",
+            code="data_invalid",
+            retryable=False,
+        )
     with _CACHE_LOCK:
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, path)
+        with _cache_file_lock(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            try:
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                )
+                os.replace(temporary, path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+
+def _parse_overpass_elements(response: Any) -> list[Dict[str, Any]]:
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Overpass 响应必须是对象")
+    elements = payload.get("elements")
+    if not isinstance(elements, list):
+        raise ValueError("Overpass 响应缺少有效 elements 数组")
+    return [element for element in elements if isinstance(element, dict)]
 
 
 def _request_with_retries(
@@ -95,6 +206,55 @@ def _request_with_retries(
             response = request_method(url, timeout=request_timeout, **kwargs)
             response.raise_for_status()
             return response
+        except requests.HTTPError as exc:
+            last_error = exc
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code == 400:
+                raise RemoteDataSourceError(
+                    f"远程请求参数无效: {url}",
+                    code="validation_error",
+                    status_code=status_code,
+                ) from exc
+            if status_code == 404:
+                raise RemoteDataSourceError(
+                    f"远程数据源不存在: {url}",
+                    code="resource_not_found",
+                    status_code=status_code,
+                ) from exc
+            if status_code == 429:
+                retryable = True
+                error_code = "rate_limited"
+                retry_after = None
+                try:
+                    candidate = float(
+                        (getattr(response, "headers", {}) or {}).get("Retry-After")
+                    )
+                    if math.isfinite(candidate) and candidate >= 0:
+                        retry_after = candidate
+                except (TypeError, ValueError, OverflowError):
+                    retry_after = None
+            elif status_code in {408, 500, 502, 503, 504}:
+                retryable = True
+                error_code = "network_error"
+                retry_after = None
+            else:
+                raise RemoteDataSourceError(
+                    f"远程服务返回 HTTP {status_code}: {url}",
+                    code="remote_http_error",
+                    status_code=status_code,
+                ) from exc
+            if attempt == REMOTE_MAX_ATTEMPTS:
+                raise RemoteDataSourceError(
+                    f"远程服务暂时不可用: {url}: {last_error}",
+                    code=error_code,
+                    retryable=retryable,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                ) from exc
+            delay = retry_after if retry_after is not None else REMOTE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            LOGGER.warning(f"远程请求失败，将在 {delay:.1f}s 后重试 ({attempt}/{REMOTE_MAX_ATTEMPTS - 1}): {url}: {exc}")
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         except requests.RequestException as exc:
             last_error = exc
             if attempt == REMOTE_MAX_ATTEMPTS:
@@ -108,6 +268,28 @@ def _request_with_retries(
         code="network_error",
         retryable=True,
     )
+
+
+def _validate_remote_bbox(bbox: list[float]) -> Tuple[float, float, float, float]:
+    """Validate a WGS84 bbox before it reaches a remote query endpoint."""
+    try:
+        values = tuple(float(value) for value in bbox)
+    except (TypeError, ValueError) as exc:
+        raise RemoteDataSourceError(
+            "远程查询范围必须是四个经纬度数值",
+            code="validation_error",
+        ) from exc
+    if (
+        len(values) != 4
+        or not all(math.isfinite(value) for value in values)
+        or not (-180 <= values[0] < values[2] <= 180)
+        or not (-90 <= values[1] < values[3] <= 90)
+    ):
+        raise RemoteDataSourceError(
+            "远程查询范围必须是合法的 WGS84 minx,miny,maxx,maxy",
+            code="validation_error",
+        )
+    return values
 
 
 def extract_location_query(user_request: str) -> Optional[str]:
@@ -224,6 +406,11 @@ def resolve_location(query: str, *, timeout: int = 30) -> LocationResolution:
             provider="OpenStreetMap/Nominatim",
             confidence=0.0,
             error_code=exc.error_code,
+            retryable=exc.retryable,
+            next_action=(
+                "retry_location_resolution" if exc.retryable else "inspect_location_query"
+            ),
+            status_code=exc.status_code,
         )
     except (ValueError, TypeError, requests.RequestException):
         return LocationResolution(
@@ -254,16 +441,16 @@ def resolve_location(query: str, *, timeout: int = 30) -> LocationResolution:
         if geometry:
             from shapely.geometry import shape
 
-            bounds = shape(geometry).bounds
+            resolved_geometry = shape(geometry)
+            if resolved_geometry.is_empty or not resolved_geometry.is_valid:
+                geometry = None
+                raise ValueError("invalid location geometry")
+            bounds = resolved_geometry.bounds
             bbox = tuple(float(value) for value in bounds)
-        else:
-            raw_bbox = [float(value) for value in item.get("boundingbox", [])]
-            if len(raw_bbox) == 4:
-                bbox = (raw_bbox[2], raw_bbox[0], raw_bbox[3], raw_bbox[1])
     except (TypeError, ValueError, KeyError):
         bbox = None
 
-    if not bbox or not _is_usable_location_bbox(bbox):
+    if not geometry or not bbox or not _is_usable_location_bbox(bbox):
         return LocationResolution(
             text=place,
             precision="unknown",
@@ -379,15 +566,9 @@ def fetch_remote_waterways(
 ) -> Optional[Path]:
     """Fetch named river lines for a place and cache them as GeoJSON."""
     place = str(query or "").strip()
-    try:
-        values = [float(value) for value in bbox]
-    except (TypeError, ValueError):
+    if not place:
         return None
-    if not place or len(values) != 4:
-        return None
-    west, south, east, north = values
-    if west >= east or south >= north:
-        return None
+    west, south, east, north = _validate_remote_bbox(bbox)
 
     root = Path(cache_dir or (Config.DATA_CACHE_DIR / "remote_waterways"))
     root.mkdir(parents=True, exist_ok=True)
@@ -406,6 +587,7 @@ def fetch_remote_waterways(
     )
     features = []
     errors = []
+    typed_errors = []
     deadline = time.monotonic() + min(timeout, REMOTE_TOTAL_TIMEOUT_SECONDS)
     for endpoint in OVERPASS_ENDPOINTS:
         try:
@@ -418,8 +600,15 @@ def fetch_remote_waterways(
                 timeout=timeout,
             )
             response.raise_for_status()
-            elements = response.json().get("elements", [])
-        except (RemoteDataSourceError, requests.RequestException, ValueError, TypeError) as exc:
+            elements = _parse_overpass_elements(response)
+        except RemoteDataSourceError as exc:
+            typed_errors.append(exc)
+            if exc.error_code == "validation_error":
+                raise
+            errors.append(f"{endpoint}: {exc}")
+            LOGGER.warning(f"远程河流数据端点失败: {place}: {endpoint}: {exc}")
+            continue
+        except (requests.RequestException, ValueError, TypeError) as exc:
             errors.append(f"{endpoint}: {exc}")
             LOGGER.warning(f"远程河流数据端点失败: {place}: {endpoint}: {exc}")
             continue
@@ -449,6 +638,8 @@ def fetch_remote_waterways(
     if not features:
         detail = f"；失败端点：{' | '.join(errors)}" if errors else ""
         LOGGER.warning(f"远程河流数据为空: {place}{detail}")
+        if typed_errors:
+            raise typed_errors[0]
         if errors:
             raise RemoteDataSourceError(
                 f"远程河流数据源不可用: {place}{detail}",
@@ -473,15 +664,9 @@ def fetch_remote_roads(
 ) -> Optional[Path]:
     """Fetch named OSM road lines for a place and cache them as GeoJSON."""
     place = str(query or "").strip()
-    try:
-        values = [float(value) for value in bbox]
-    except (TypeError, ValueError):
+    if not place:
         return None
-    if not place or len(values) != 4:
-        return None
-    west, south, east, north = values
-    if west >= east or south >= north:
-        return None
+    west, south, east, north = _validate_remote_bbox(bbox)
 
     root = Path(cache_dir or (Config.DATA_CACHE_DIR / "remote_roads"))
     root.mkdir(parents=True, exist_ok=True)
@@ -503,6 +688,7 @@ def fetch_remote_roads(
     )
     features = []
     errors = []
+    typed_errors = []
     deadline = time.monotonic() + min(timeout, REMOTE_TOTAL_TIMEOUT_SECONDS)
     for endpoint in OVERPASS_ENDPOINTS:
         try:
@@ -514,8 +700,15 @@ def fetch_remote_roads(
                 headers={"User-Agent": USER_AGENT},
                 timeout=timeout,
             )
-            elements = response.json().get("elements", [])
-        except (RemoteDataSourceError, requests.RequestException, ValueError, TypeError) as exc:
+            elements = _parse_overpass_elements(response)
+        except RemoteDataSourceError as exc:
+            typed_errors.append(exc)
+            if exc.error_code == "validation_error":
+                raise
+            errors.append(f"{endpoint}: {exc}")
+            LOGGER.warning(f"远程道路数据端点失败: {place}: {endpoint}: {exc}")
+            continue
+        except (requests.RequestException, ValueError, TypeError) as exc:
             errors.append(f"{endpoint}: {exc}")
             LOGGER.warning(f"远程道路数据端点失败: {place}: {endpoint}: {exc}")
             continue
@@ -548,6 +741,8 @@ def fetch_remote_roads(
     if not features:
         detail = f"；失败端点：{' | '.join(errors)}" if errors else ""
         LOGGER.warning(f"远程道路数据为空: {place}{detail}")
+        if typed_errors:
+            raise typed_errors[0]
         if errors:
             raise RemoteDataSourceError(
                 f"远程道路数据源不可用: {place}{detail}",
@@ -578,16 +773,10 @@ def fetch_remote_pois(
     can consume it without a separate runtime data format.
     """
     place = str(query or "").strip()
-    try:
-        values = [float(value) for value in bbox]
-    except (TypeError, ValueError):
-        return None
     category_spec = REMOTE_POI_CATEGORIES.get(category)
-    if not place or len(values) != 4 or not category_spec:
+    if not place or not category_spec:
         return None
-    west, south, east, north = values
-    if west >= east or south >= north:
-        return None
+    west, south, east, north = _validate_remote_bbox(bbox)
 
     root = Path(cache_dir or (Config.DATA_CACHE_DIR / "remote_pois"))
     root.mkdir(parents=True, exist_ok=True)
@@ -609,6 +798,7 @@ def fetch_remote_pois(
     )
     features = []
     errors = []
+    typed_errors = []
     deadline = time.monotonic() + min(timeout, REMOTE_TOTAL_TIMEOUT_SECONDS)
     for endpoint in OVERPASS_ENDPOINTS:
         try:
@@ -621,8 +811,15 @@ def fetch_remote_pois(
                 timeout=timeout,
             )
             response.raise_for_status()
-            elements = response.json().get("elements", [])
-        except (RemoteDataSourceError, requests.RequestException, ValueError, TypeError) as exc:
+            elements = _parse_overpass_elements(response)
+        except RemoteDataSourceError as exc:
+            typed_errors.append(exc)
+            if exc.error_code == "validation_error":
+                raise
+            errors.append(f"{endpoint}: {exc}")
+            LOGGER.warning(f"远程{category_spec['label']}数据端点失败: {place}: {endpoint}: {exc}")
+            continue
+        except (requests.RequestException, ValueError, TypeError) as exc:
             errors.append(f"{endpoint}: {exc}")
             LOGGER.warning(f"远程{category_spec['label']}数据端点失败: {place}: {endpoint}: {exc}")
             continue
@@ -668,6 +865,8 @@ def fetch_remote_pois(
     if not features:
         detail = f"；失败端点：{' | '.join(errors)}" if errors else ""
         LOGGER.warning(f"远程{category_spec['label']}数据为空: {place}{detail}")
+        if typed_errors:
+            raise typed_errors[0]
         if errors:
             raise RemoteDataSourceError(
                 f"远程{category_spec['label']}数据源不可用: {place}{detail}",

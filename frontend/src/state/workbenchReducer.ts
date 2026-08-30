@@ -1,4 +1,4 @@
-import type { ClarificationData, LayerPayload, MapStreamEvent, TraceEvent, ViewStatePayload } from "../types/api";
+import type { ClarificationData, LayerPayload, MapStreamEvent, PreviewMeta, TraceEvent, ViewStatePayload } from "../types/api";
 
 export interface WorkbenchMessage {
   role: "user" | "assistant" | "system";
@@ -14,15 +14,19 @@ export interface WorkbenchState {
   layers: LayerPayload[];
   viewState: ViewStatePayload | null;
   previewUrl: string | null;
+  previewMeta: PreviewMeta | null;
   lastEventId: string;
   error: string | null;
-  transportStatus: "idle" | "connecting" | "connected" | "reconnecting";
+  transportStatus: "idle" | "connecting" | "connected" | "reconnecting" | "polling";
   transportError: string | null;
   clarification: ClarificationData | null;
   traceId: string | null;
   runId: number | null;
   traceEvents: TraceEvent[];
   traceTotalCount: number | null;
+  traceNextCursor: number | null;
+  assistantMessageIds: Record<string, number>;
+  assistantDeltaSeq: Record<string, number>;
 }
 
 export const initialWorkbenchState: WorkbenchState = {
@@ -34,6 +38,7 @@ export const initialWorkbenchState: WorkbenchState = {
   layers: [],
   viewState: null,
   previewUrl: null,
+  previewMeta: null,
   lastEventId: "",
   error: null,
   transportStatus: "idle",
@@ -43,6 +48,9 @@ export const initialWorkbenchState: WorkbenchState = {
   runId: null,
   traceEvents: [],
   traceTotalCount: null,
+  traceNextCursor: null,
+  assistantMessageIds: {},
+  assistantDeltaSeq: {},
 };
 
 export type WorkbenchAction =
@@ -54,9 +62,9 @@ export type WorkbenchAction =
   | { type: "user_message"; content: string }
   | { type: "message_loaded"; role: "user" | "assistant" | "system"; content: string }
   | { type: "logs_loaded"; logs: Array<Record<string, unknown>> }
-  | { type: "trace_events_loaded"; events: TraceEvent[]; totalCount?: number }
+  | { type: "trace_events_loaded"; events: TraceEvent[]; totalCount?: number; nextCursor?: number | null }
   | { type: "stream_event"; event: MapStreamEvent }
-  | { type: "stream_error"; message: string }
+  | { type: "stream_error"; message: string; retryable?: boolean }
   | { type: "stream_status"; status: Exclude<WorkbenchState["transportStatus"], "idle"> }
   | { type: "task_status"; status: Exclude<WorkbenchState["status"], "idle">; error: string | null; message?: string; clarification?: ClarificationData | null; traceId?: string | null }
   | { type: "task_status_error"; message: string }
@@ -72,8 +80,16 @@ function mergeLayer(layers: LayerPayload[], incoming: LayerPayload): LayerPayloa
 }
 
 function appendTraceEvent(events: TraceEvent[], incoming: TraceEvent): TraceEvent[] {
-  if (!incoming.event_id || events.some((event) => event.event_id === incoming.event_id)) return events;
+  if (!incoming.event_id) return events;
+  const existingIndex = events.findIndex((event) => event.event_id === incoming.event_id);
+  if (existingIndex >= 0) {
+    return events.map((event, index) => index === existingIndex ? { ...event, ...incoming } : event);
+  }
   return [...events, incoming].sort((left, right) => left.event_seq - right.event_seq);
+}
+
+function mergeTraceEvents(existing: TraceEvent[], incoming: TraceEvent[]): TraceEvent[] {
+  return incoming.reduce(appendTraceEvent, existing);
 }
 
 function traceEventFromData(data: Record<string, unknown>): TraceEvent | null {
@@ -114,8 +130,13 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
         logs: [],
         traceEvents: [],
         traceTotalCount: null,
+        traceNextCursor: null,
         traceId: null,
         runId: null,
+        assistantMessageIds: {},
+        assistantDeltaSeq: {},
+        previewUrl: null,
+        previewMeta: null,
         lastEventId: "",
       };
     case "user_message":
@@ -125,9 +146,15 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
     case "logs_loaded":
       return { ...state, logs: action.logs };
     case "trace_events_loaded":
-      return { ...state, traceEvents: action.events, traceTotalCount: action.totalCount ?? action.events.length };
+      return { ...state, traceEvents: mergeTraceEvents(state.traceEvents, action.events), traceTotalCount: action.totalCount ?? Math.max(state.traceTotalCount ?? 0, state.traceEvents.length + action.events.length), traceNextCursor: action.nextCursor ?? null };
     case "stream_error":
-      return { ...state, transportStatus: "reconnecting", transportError: action.message };
+      return {
+        ...state,
+        transportStatus: action.message.includes("sse_connection_limit")
+          ? "polling"
+          : action.retryable === false ? state.transportStatus : "reconnecting",
+        transportError: action.message,
+      };
     case "stream_status":
       return { ...state, transportStatus: action.status, transportError: null };
     case "task_status":
@@ -135,7 +162,9 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
         ...state,
         status: action.status,
         error: action.status === "failed" ? action.error || "地图任务失败" : null,
-        transportStatus: action.status === "pending" || action.status === "processing" ? "connected" : "idle",
+        transportStatus: action.status === "pending" || action.status === "processing"
+          ? state.transportStatus === "polling" ? "polling" : state.transportStatus
+          : "idle",
         transportError: null,
         clarification: action.status === "needs_clarification" ? action.clarification ?? state.clarification : null,
         traceId: action.traceId ?? state.traceId,
@@ -160,11 +189,50 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
           ? data.transport_error
           : "实时通道已降级，正在用任务状态同步恢复";
       }
+      if (event.event === "stream_error") {
+        const errorCode = typeof data.error_code === "string" ? data.error_code : "stream_error";
+        next.transportStatus = errorCode === "stream_cursor_gap" || errorCode === "sse_connection_limit" || errorCode === "sse_budget_unavailable"
+          ? "polling"
+          : data.retryable === false ? state.transportStatus : "reconnecting";
+        next.transportError = `${errorCode}: ${typeof data.message === "string" ? data.message : "实时通道发生错误"}`;
+      }
       if (typeof data.trace_id === "string") next.traceId = data.trace_id;
       if (typeof data.run_id === "number") next.runId = data.run_id;
       if (event.event === "request_started") next.status = "processing";
+      if (event.event === "assistant_delta" && typeof data.content === "string") {
+        const messageId = typeof data.message_id === "string" ? data.message_id : "streaming";
+        const deltaSeq = typeof data.delta_seq === "number" ? data.delta_seq : null;
+        const previousSeq = state.assistantDeltaSeq[messageId] ?? 0;
+        if (deltaSeq === null || deltaSeq > previousSeq) {
+          const messageIndex = state.assistantMessageIds[messageId];
+          const messages = [...state.messages];
+          if (messageIndex === undefined || !messages[messageIndex]) {
+            next.assistantMessageIds = { ...state.assistantMessageIds, [messageId]: messages.length };
+            messages.push({ role: "assistant", content: data.content });
+          } else {
+            messages[messageIndex] = {
+              ...messages[messageIndex],
+              content: messages[messageIndex].content + data.content,
+            };
+          }
+          next.messages = messages;
+          if (deltaSeq !== null) next.assistantDeltaSeq = { ...state.assistantDeltaSeq, [messageId]: deltaSeq };
+        }
+      }
       if (event.event === "assistant_message" && typeof data.content === "string") {
-        next.messages = [...state.messages, { role: "assistant", content: data.content }];
+        const messageId = typeof data.message_id === "string" ? data.message_id : null;
+        const messageIndex = messageId
+          ? state.assistantMessageIds[messageId]
+          : Object.values(state.assistantMessageIds).findIndex((index) => index === state.messages.length - 1) >= 0
+            ? state.messages.length - 1
+            : undefined;
+        if (messageIndex !== undefined && state.messages[messageIndex]) {
+          next.messages = [...state.messages];
+          next.messages[messageIndex] = { role: "assistant", content: data.content };
+        } else {
+          next.messages = [...state.messages, { role: "assistant", content: data.content }];
+          if (messageId) next.assistantMessageIds = { ...state.assistantMessageIds, [messageId]: next.messages.length - 1 };
+        }
       }
       if (event.event === "request_needs_clarification") {
         next.status = "needs_clarification";
@@ -191,11 +259,12 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
         if (viewState.layers) next.layers = viewState.layers;
       }
       if (data.preview && typeof data.preview === "object") {
-        const preview = data.preview as { image_url?: unknown; created_at_ms?: unknown };
+        const preview = data.preview as PreviewMeta;
         if (typeof preview.image_url === "string") {
-          const separator = preview.image_url.includes("?") ? "&" : "?";
-          const timestamp = typeof preview.created_at_ms === "number" ? preview.created_at_ms : Date.now();
+            const separator = preview.image_url.includes("?") ? "&" : "?";
+            const timestamp = typeof preview.created_at_ms === "number" ? preview.created_at_ms : Date.now();
           next.previewUrl = `${preview.image_url}${separator}preview_ts=${timestamp}`;
+          next.previewMeta = { ...preview, image_url: next.previewUrl };
         }
       }
       if (event.event === "request_completed") next.status = "completed";
@@ -208,6 +277,7 @@ export function workbenchReducer(state: WorkbenchState, action: WorkbenchAction)
         next.error = typeof data.message === "string" ? data.message : "地图任务失败";
       }
       if (event.event === "done") {
+        next.transportStatus = "idle";
         const terminalStatus = data.status;
         if (terminalStatus === "completed") next.status = "completed";
         if (terminalStatus === "partial") {

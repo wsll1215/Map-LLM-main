@@ -14,6 +14,23 @@ import numpy as np
 from ...models.schemas import MapState
 from ...utils.logger import get_logger
 
+
+def _read_runtime_layer(layer):
+    """Read an existing layer from normalized DatasetFeature rows only."""
+    metadata = getattr(layer, "data_source_meta", None) or {}
+    dataset_id = metadata.get("dataset_id")
+    if not dataset_id:
+        data_source = str(getattr(layer, "data_source", "") or "")
+        if data_source.startswith("dataset://"):
+            dataset_id = data_source.removeprefix("dataset://")
+    if not dataset_id:
+        raise ValueError("运行时图层缺少已注册的 dataset_id")
+
+    from mapping.dataset_reader import read_dataset_features
+
+    return read_dataset_features(str(dataset_id))
+
+
 class UnifiedMappingToolsBase:
     def __init__(self):
         """初始化统一制图工具"""
@@ -403,7 +420,7 @@ class UnifiedMappingToolsBase:
             # 分析每个图层的边界
             for layer in self.current_map_state.layers:
                 try:
-                    gdf = gpd.read_file(layer.data_source)
+                    gdf = _read_runtime_layer(layer)
 
                     # 确保坐标系一致
                     target_crs = self.current_map_state.config.crs

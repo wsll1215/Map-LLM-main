@@ -273,6 +273,22 @@ body.auth-page {
     box-shadow: 0 0 0 4px rgba(47, 143, 91, 0.14);
 }
 
+.auth-remember {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 18px;
+    color: #475569;
+    font-size: 0.92rem;
+    cursor: pointer;
+}
+
+.auth-remember input {
+    width: 16px;
+    height: 16px;
+    accent-color: #2f8f5b;
+}
+
 .auth-submit {
     width: 100%;
     height: 52px;

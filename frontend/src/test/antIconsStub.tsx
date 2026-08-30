@@ -17,6 +17,7 @@ export const DatabaseOutlined = icon("DatabaseOutlined");
 export const DownOutlined = icon("DownOutlined");
 export const EyeOutlined = icon("EyeOutlined");
 export const FilterOutlined = icon("FilterOutlined");
+export const LoadingOutlined = icon("LoadingOutlined");
 export const PictureOutlined = icon("PictureOutlined");
 export const ReloadOutlined = icon("ReloadOutlined");
 export const RightOutlined = icon("RightOutlined");

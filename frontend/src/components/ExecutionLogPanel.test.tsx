@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ExecutionLogPanel } from "./ExecutionLogPanel";
+import { EventDetails, ExecutionLogPanel } from "./ExecutionLogPanel";
 
 describe("ExecutionLogPanel", () => {
   it("renders all logs and their trace metadata instead of only the tail", () => {
@@ -91,6 +91,69 @@ describe("ExecutionLogPanel", () => {
 
     expect(markup).toContain("日志 50 条");
     expect(markup).toContain("Trace 65 个事件");
+  });
+
+  it("can render as a one-line collapsed log strip", () => {
+    const markup = renderToStaticMarkup(
+      <ExecutionLogPanel
+        logs={[{ id: 1, message: "不要在折叠状态显示正文" }]}
+        traceId="trace-collapsed"
+        isWorking={false}
+        collapsed
+      />,
+    );
+
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).toContain("日志 1 条");
+    expect(markup).not.toContain("不要在折叠状态显示正文");
+  });
+
+  it("shows tool-specific inputs and result fields in trace details", () => {
+    const markup = renderToStaticMarkup(
+      <EventDetails event={{
+          event_id: "tool-1",
+          event_seq: 1,
+          event_type: "tool_call",
+          status: "success",
+          summary: "执行道路查询",
+          input: { location: "北京" },
+          output: { tool_result: { success: true, data: { feature_count: 8 } } },
+          attributes: {
+            tool_name: "fetch_roads",
+            tool_description: "查询道路数据",
+            validated_input: { location: "北京" },
+            actual_input: { location: "北京", bbox: [116, 39, 117, 40] },
+            map_state_changed: true,
+          },
+        }} />,
+    );
+
+    expect(markup).toContain("工具名称");
+    expect(markup).toContain("工具描述");
+    expect(markup).toContain("校验后参数");
+    expect(markup).toContain("实际执行参数");
+    expect(markup).toContain("ToolResult");
+    expect(markup).toContain("修改地图状态");
+  });
+
+  it("renders structured metadata values without passing objects to React", () => {
+    const markup = renderToStaticMarkup(
+      <EventDetails event={{
+        event_id: "source-1",
+        event_seq: 1,
+        event_type: "source_plan",
+        status: "success",
+        summary: "规划数据源",
+        attributes: {
+          source_type: "remote",
+          provider: { name: "Overpass", endpoint: "primary" },
+          bbox: [116, 39, 117, 40],
+        },
+      }} />,
+    );
+
+    expect(markup).toContain("Overpass");
+    expect(markup).not.toContain("[object Object]");
   });
 
 });
