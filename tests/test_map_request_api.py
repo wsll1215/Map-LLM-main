@@ -78,6 +78,45 @@ def test_process_failure_preserves_source_plan_for_run_diagnostics(monkeypatch):
     assert result["source_plan"] == source_plan
 
 
+def test_finalizer_uses_authoritative_intent_from_agent_response(monkeypatch):
+    user = make_user("authoritative-intent-finalizer-owner")
+    request = MapRequest.objects.create(
+        user=user,
+        request_text="绘制甲市道路",
+        status="processing",
+    )
+
+    def unexpected_legacy_parse(*_args, **_kwargs):
+        raise AssertionError("finalization must not reparse the user text")
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.data_sources.planner.parse_intent",
+        unexpected_legacy_parse,
+    )
+
+    from mapping.views import _finalize_map_request
+
+    result = _finalize_map_request(
+        request,
+        {
+            "intent": {
+                "task": "create_map",
+                "location": {"text": "甲市", "precision": "city"},
+                "layers": [{"role": "boundary", "required": True}],
+                "operations": [],
+                "style": {},
+                "explicit_sources": [],
+                "unknown_fields": [],
+            },
+        },
+        clarification_required=True,
+        use_latest_artifact=False,
+    )
+
+    assert result.status == "needs_clarification"
+    assert result.completion_report["required_layers"] == ["boundary"]
+
+
 def test_process_failure_uses_finalizer_for_terminal_status(monkeypatch):
     user = make_user("finalizer-failure-owner")
     request = MapRequest.objects.create(

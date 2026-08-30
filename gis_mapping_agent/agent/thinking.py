@@ -162,6 +162,7 @@ class ThinkingGISMappingAgent:
         # 当前地图状态
         self.current_map_state: Optional[MapState] = None
         self.last_assistant_message_id: Optional[str] = None
+        self._current_intent: Optional[Any] = None
 
         # self.logger.info("思考型GIS制图智能体初始化完成")
 
@@ -175,6 +176,7 @@ class ThinkingGISMappingAgent:
             explicit_data_files = data_path_resolver.find_data_files_in_request(user_request)
             data_dir_from_request, data_files_from_request = extract_data_info_from_request(user_request)
             if intent is None:
+                intent_trace = {"parent_event_id": None}
                 recognition = self._run_trace_phase(
                     event_type="intent_parse",
                     phase="intent",
@@ -182,10 +184,16 @@ class ThinkingGISMappingAgent:
                     input_data={"request_text": user_request},
                     operation=lambda: recognize_intent(
                         user_request,
-                        current_state=self.current_map_state,
+                        current_state=getattr(self, "current_map_state", None),
                         llm=getattr(self, "intent_llm", None),
+                        trace_callback=lambda **event: self._publish_intent_trace_child(
+                            intent_trace["parent_event_id"], event
+                        ),
                     ),
                     output_serializer=lambda value: value.model_dump(mode="json"),
+                    on_started=lambda span: intent_trace.update(
+                        parent_event_id=getattr(span, "event_id", None)
+                    ),
                 )
                 if recognition.status != "accepted" or recognition.intent is None:
                     return self._intent_failure_response(recognition)
@@ -296,6 +304,7 @@ class ThinkingGISMappingAgent:
                 "success": result["success"],
                 "message": result["message"],
                 "agent_output": result["output"],
+                "intent": self._serialize_intent(intent),
                 "map_state": final_map_state.model_dump() if final_map_state else None,
                 "thinking_steps": result.get("thinking_steps", []),
                 "source_errors": list(self._source_errors),
@@ -320,6 +329,28 @@ class ThinkingGISMappingAgent:
             }
 
     @staticmethod
+    def _serialize_intent(intent):
+        if intent is None:
+            return None
+        if hasattr(intent, "model_dump"):
+            return intent.model_dump(mode="json")
+        return {
+            "location": {
+                "text": getattr(getattr(intent, "location", None), "text", None),
+                "precision": getattr(getattr(intent, "location", None), "precision", None),
+            },
+            "layers": [
+                {
+                    "role": getattr(layer, "role", None),
+                    "required": getattr(layer, "required", True),
+                }
+                for layer in getattr(intent, "layers", ())
+            ],
+            "explicit_sources": list(getattr(intent, "explicit_sources", ()) or ()),
+            "unknown_fields": list(getattr(intent, "unknown_fields", ()) or ()),
+        }
+
+    @staticmethod
     def _serialize_source_plan(plan):
         if plan is None:
             return None
@@ -331,7 +362,7 @@ class ThinkingGISMappingAgent:
                 location_geometry = shapely_mapping(location_geometry)
             except (ImportError, TypeError, ValueError):
                 location_geometry = None
-            return {
+        return {
             "location": {
                 "text": plan.location.text if plan.location else None,
                 "bbox": list(plan.location.bbox) if plan.location and plan.location.bbox else None,
@@ -376,6 +407,7 @@ class ThinkingGISMappingAgent:
         input_data: Any,
         operation: Callable[[], Any],
         output_serializer: Optional[Callable[[Any], Any]] = None,
+        on_started: Optional[Callable[[Any], None]] = None,
     ) -> Any:
         """Execute one agent phase and close its trace span exactly once."""
         try:
@@ -408,6 +440,8 @@ class ThinkingGISMappingAgent:
                     publish_trace_lifecycle(span, lifecycle[0])
                 else:
                     publish_trace_event(span)
+                if on_started:
+                    on_started(span)
             except Exception:
                 span = None
 
@@ -468,6 +502,41 @@ class ThinkingGISMappingAgent:
                     # Trace persistence must never change the GIS result.
                     pass
         return result
+
+    def _publish_intent_trace_child(self, parent_event_id: Optional[str], event: Dict[str, Any]) -> None:
+        """Persist one recognition phase beneath the intent parent span."""
+        if not parent_event_id:
+            return
+        try:
+            from mapping.trace import (
+                publish_trace_event,
+                record_trace_event,
+                run_for_session,
+            )
+
+            run = run_for_session(getattr(self, "session_id", None))
+            if not run:
+                return
+            trace_event = record_trace_event(
+                run=run,
+                event_type=str(event.get("event_type") or "intent_validate"),
+                phase="intent",
+                actor="agent",
+                status=str(event.get("status") or "success"),
+                summary={
+                    "intent_rule_parse": "规则解析",
+                    "intent_llm_parse": "LLM 语义补全",
+                    "intent_merge": "合并意图",
+                    "intent_validate": "校验意图",
+                }.get(str(event.get("event_type")), "识别阶段"),
+                parent_event_id=parent_event_id,
+                input_data=event.get("input_data") or {},
+                output_data=event.get("output_data") or {},
+                error=event.get("error"),
+            )
+            publish_trace_event(trace_event)
+        except Exception:
+            return
 
     def _execute_thinking_loop(self, user_request: str) -> Dict[str, Any]:
         """执行思考-行动-观察循环（使用OpenAI工具调用标准）"""
@@ -837,12 +906,21 @@ class ThinkingGISMappingAgent:
         except Exception as e:
             return format_tool_result(tool_failure(f"工具 '{tool_name}' 执行失败: {e}", e))
 
+    def _intent_location_text(self, user_request: str) -> Optional[str]:
+        """Return the already-recognized place, with a legacy helper fallback."""
+        intent = getattr(self, "_current_intent", None)
+        location = getattr(intent, "location", None)
+        text = getattr(location, "text", None)
+        if text:
+            return str(text)
+        return extract_location_query(user_request)
+
     def _add_remote_river_source(self, user_request: str, plan):
         """Fill a missing river role from a place-scoped remote source."""
         if "river" not in plan.requested_roles or plan.river_path:
             return plan
         boundary_path = plan.boundary_path
-        location_query = parse_intent(user_request).location.text
+        location_query = self._intent_location_text(user_request)
         if not boundary_path or not location_query:
             return plan
         try:
@@ -870,7 +948,7 @@ class ThinkingGISMappingAgent:
         if "road" not in plan.requested_roles or plan.road_path:
             return plan
         boundary_path = plan.boundary_path
-        location_query = parse_intent(user_request).location.text
+        location_query = self._intent_location_text(user_request)
         if not boundary_path or not location_query:
             return plan
         try:
@@ -898,7 +976,7 @@ class ThinkingGISMappingAgent:
         if not request or not request.get("place") or plan.poi_path:
             return plan
         batch_place = extract_remote_poi_query(user_request)
-        place = parse_intent(user_request).location.text or request["place"]
+        place = self._intent_location_text(user_request) or request["place"]
         boundary_path = plan.boundary_path
         if not boundary_path:
             return replace(

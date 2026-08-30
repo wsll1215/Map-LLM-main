@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..models.schemas import MapState
 from ..specs.intent import (
@@ -15,6 +15,30 @@ from ..specs.intent import (
 )
 from .intent_llm import LlmIntentParser
 from .intent_rules import RuleParseResult, RuleParser
+
+
+def _notify(
+    callback: Optional[Callable[..., None]],
+    *,
+    event_type: str,
+    status: str,
+    input_data: Any = None,
+    output_data: Any = None,
+    error: Any = None,
+) -> None:
+    """Notify observability code without coupling recognition to persistence."""
+    if callback is None:
+        return
+    try:
+        callback(
+            event_type=event_type,
+            status=status,
+            input_data=input_data or {},
+            output_data=output_data or {},
+            error=error,
+        )
+    except Exception:
+        return
 
 
 def _issue(
@@ -95,13 +119,20 @@ def _merge_intents(
         location = llm_intent.location
 
     layers: List[LayerSlot] = list(rule_intent.layers)
-    known_roles = {layer.role for layer in layers}
-    for layer in llm_intent.layers:
-        if layer.role not in known_roles:
-            layers.append(layer)
-            known_roles.add(layer.role)
+    layers_locked = bool(
+        rule_result.field_evidence.get("layers")
+        and rule_result.field_evidence["layers"].locked
+    )
+    if not layers_locked:
+        known_roles = {layer.role for layer in layers}
+        for layer in llm_intent.layers:
+            if layer.role not in known_roles:
+                layers.append(layer)
+                known_roles.add(layer.role)
 
-    explicit_sources = list(dict.fromkeys(rule_intent.explicit_sources + llm_intent.explicit_sources))
+    # Source paths are user evidence only. The LLM can never introduce a
+    # dataset reference into the downstream source planner.
+    explicit_sources = list(dict.fromkeys(rule_intent.explicit_sources))
     operations = llm_intent.operations or rule_intent.operations
     style = dict(rule_intent.style)
     style.update(llm_intent.style)
@@ -136,9 +167,27 @@ def recognize_intent(
     text: str,
     current_state: Optional[MapState] = None,
     llm: Optional[Any] = None,
+    trace_callback: Optional[Callable[..., None]] = None,
 ) -> IntentRecognitionResult:
     """Recognize one request without selecting data or executing tools."""
     rule_result = RuleParser().parse(text, current_state)
+    _notify(
+        trace_callback,
+        event_type="intent_rule_parse",
+        status="warning" if rule_result.conflicts else "success",
+        input_data={"request_text": text},
+        output_data={
+            "decision": rule_result.decision,
+            "intent": rule_result.intent.model_dump(mode="json"),
+            "missing_fields": rule_result.missing_fields,
+            "conflicts": rule_result.conflicts,
+        },
+        error=(
+            {"error_code": "multiple_locations", "next_action": "ask_user"}
+            if rule_result.conflicts
+            else None
+        ),
+    )
 
     if rule_result.conflicts:
         issues = [
@@ -149,11 +198,23 @@ def recognize_intent(
             )
             for conflict in rule_result.conflicts
         ]
-        return _clarification_result(rule_result, issues=issues)
+        result = _clarification_result(rule_result, issues=issues)
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="warning",
+            output_data={
+                "status": result.status,
+                "missing_fields": result.missing_fields,
+                "conflicts": result.conflicts,
+            },
+            error={"error_code": "clarification_required", "next_action": "ask_user"},
+        )
+        return result
 
     # Missing map state is a domain fact, not an LLM-completable semantic slot.
     if "current_map_state" in rule_result.missing_fields:
-        return _clarification_result(
+        result = _clarification_result(
             rule_result,
             issues=[
                 _issue(
@@ -163,11 +224,19 @@ def recognize_intent(
                 )
             ],
         )
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="warning",
+            output_data={"status": result.status, "missing_fields": result.missing_fields},
+            error={"error_code": "current_map_state_missing", "next_action": "ask_user"},
+        )
+        return result
 
     if not rule_result.llm_required and rule_result.decision == "complete":
         missing = _missing_fields(rule_result.intent, current_state)
         if missing:
-            return _clarification_result(
+            result = _clarification_result(
                 rule_result,
                 issues=[
                     _issue(
@@ -178,41 +247,123 @@ def recognize_intent(
                     for field in missing
                 ],
             )
-        return IntentRecognitionResult(
+            _notify(
+                trace_callback,
+                event_type="intent_validate",
+                status="warning",
+                output_data={"status": result.status, "missing_fields": result.missing_fields},
+                error={"error_code": "clarification_required", "next_action": "ask_user"},
+            )
+            return result
+        result = IntentRecognitionResult(
             status="accepted",
             intent=rule_result.intent,
             field_evidence=rule_result.field_evidence,
             attempt=1,
             llm_used=False,
         )
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="success",
+            output_data={"status": result.status, "intent": result.intent.model_dump(mode="json")},
+        )
+        return result
 
     if llm is None:
-        return _clarification_result(
+        missing_fields = list(rule_result.missing_fields)
+        issue_code = "clarification_required" if missing_fields else "llm_unavailable"
+        issue_message = (
+            "缺少继续制图所需的信息：" + "、".join(missing_fields)
+            if missing_fields
+            else "规则无法完整理解请求，语义补全服务不可用"
+        )
+        result = _clarification_result(
             rule_result,
             issues=[
                 _issue(
-                    "llm_unavailable",
-                    "规则无法完整理解请求，语义补全服务不可用",
+                    issue_code,
+                    issue_message,
                     next_action="ask_user",
-                    retryable=True,
+                    retryable=not missing_fields,
                 )
             ],
         )
+        _notify(
+            trace_callback,
+            event_type="intent_llm_parse",
+            status="warning" if missing_fields else "error",
+            input_data={"request_text": text},
+            output_data={},
+            error={"error_code": issue_code, "next_action": "ask_user"},
+        )
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="warning",
+            output_data={"status": result.status, "missing_fields": result.missing_fields},
+            error={"error_code": issue_code, "next_action": "ask_user"},
+        )
+        return result
 
     llm_result = LlmIntentParser(llm).parse(text, rule_result, current_state)
+    _notify(
+        trace_callback,
+        event_type="intent_llm_parse",
+        status="success" if llm_result.status == "accepted" else "error",
+        input_data={"request_text": text},
+        output_data={
+            "status": llm_result.status,
+            "attempts": llm_result.attempts,
+            "intent": (
+                llm_result.intent.model_dump(mode="json")
+                if llm_result.intent is not None
+                else None
+            ),
+        },
+        error=(
+            llm_result.issues[0].model_dump(mode="json")
+            if llm_result.issues
+            else None
+        ),
+    )
     if llm_result.status != "accepted" or llm_result.intent is None:
-        return _clarification_result(
+        result = _clarification_result(
             rule_result,
             issues=llm_result.issues,
             llm_used=True,
-            attempt=llm_result.attempts,
+            attempt=max(1, llm_result.attempts),
             status=llm_result.status,
         )
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="warning",
+            output_data={"status": result.status, "missing_fields": result.missing_fields},
+            error=(
+                result.issues[0].model_dump(mode="json")
+                if result.issues
+                else None
+            ),
+        )
+        return result
 
     intent, evidence, conflicts = _merge_intents(rule_result, llm_result.intent)
+    _notify(
+        trace_callback,
+        event_type="intent_merge",
+        status="warning" if conflicts else "success",
+        input_data={"rule_intent": rule_result.intent.model_dump(mode="json")},
+        output_data={"intent": intent.model_dump(mode="json"), "conflicts": conflicts},
+        error=(
+            {"error_code": "intent_conflict", "next_action": "ask_user"}
+            if conflicts
+            else None
+        ),
+    )
     missing = _missing_fields(intent, current_state)
     if conflicts:
-        return IntentRecognitionResult(
+        result = IntentRecognitionResult(
             status="needs_clarification",
             intent=intent,
             field_evidence=evidence,
@@ -226,12 +377,20 @@ def recognize_intent(
                 )
                 for conflict in conflicts
             ],
-            attempt=llm_result.attempts,
+            attempt=max(1, llm_result.attempts),
             llm_used=True,
         )
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="warning",
+            output_data={"status": result.status, "conflicts": result.conflicts},
+            error={"error_code": "intent_conflict", "next_action": "ask_user"},
+        )
+        return result
 
     if missing:
-        return IntentRecognitionResult(
+        result = IntentRecognitionResult(
             status="needs_clarification",
             intent=intent,
             field_evidence=evidence,
@@ -244,14 +403,29 @@ def recognize_intent(
                 )
                 for field in missing
             ],
-            attempt=llm_result.attempts,
+            attempt=max(1, llm_result.attempts),
             llm_used=True,
         )
+        _notify(
+            trace_callback,
+            event_type="intent_validate",
+            status="warning",
+            output_data={"status": result.status, "missing_fields": result.missing_fields},
+            error={"error_code": "clarification_required", "next_action": "ask_user"},
+        )
+        return result
 
-    return IntentRecognitionResult(
+    result = IntentRecognitionResult(
         status="accepted",
         intent=intent,
         field_evidence=evidence,
-        attempt=llm_result.attempts,
+        attempt=max(1, llm_result.attempts),
         llm_used=True,
     )
+    _notify(
+        trace_callback,
+        event_type="intent_validate",
+        status="success",
+        output_data={"status": result.status, "intent": result.intent.model_dump(mode="json")},
+    )
+    return result

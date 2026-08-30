@@ -178,6 +178,13 @@ class ConversationalMappingAgent:
                 "response": last_message.content if hasattr(last_message, 'content') else str(last_message),
                 "session_id": self.session_id,
                 "intent": result.get("user_intent", "unknown"),
+                "intent_spec": (
+                    result["parsed_intent"].model_dump(mode="json")
+                    if result.get("parsed_intent") is not None
+                    and hasattr(result["parsed_intent"], "model_dump")
+                    else None
+                ),
+                "intent_result": result.get("intent_result"),
                 "task_type": result.get("task_type"),
                 "patch": result.get("patch"),
                 "tool_trace_id": result.get("tool_trace_id"),
@@ -229,6 +236,7 @@ class ConversationalMappingAgent:
         workflow.add_node("modify_map", self._modify_map)
         workflow.add_node("handle_query", self._handle_query)
         workflow.add_node("handle_confirmation", self._handle_confirmation)
+        workflow.add_node("handle_retry", self._handle_retry)
         workflow.add_node("handle_error", self._handle_error)
         workflow.add_node("generate_response", self._generate_response)
         
@@ -247,6 +255,7 @@ class ConversationalMappingAgent:
                 "modify": "modify_map",
                 "query": "handle_query",
                 "confirmation": "handle_confirmation",
+                "retry": "handle_retry",
                 "response": "generate_response"
             }
         )
@@ -259,6 +268,7 @@ class ConversationalMappingAgent:
             "modify_map",
             "handle_query",
             "handle_confirmation",
+            "handle_retry",
         ]:
             workflow.add_conditional_edges(
                 node,
@@ -346,10 +356,18 @@ class ConversationalMappingAgent:
             state["parsed_intent"] = None
             state["intent_result"] = None
 
-            recognition = recognize_intent(
+            pending_control = self._pending_confirmation_control(
+                state, user_input
+            )
+            if pending_control:
+                state["user_intent"] = pending_control
+                state["task_type"] = pending_control
+                state["requires_confirmation"] = False
+                return state
+
+            recognition = self._recognize_intent_with_trace(
                 user_input,
                 current_state=state.get("current_map_state"),
-                llm=getattr(self, "intent_llm", None) or getattr(self, "llm", None),
             )
             state["intent_result"] = recognition.model_dump(mode="json")
             state["parsed_intent"] = recognition.intent
@@ -387,6 +405,7 @@ class ConversationalMappingAgent:
                 AIMessage(content=state["clarification_questions"][0])
             )
             return state
+
         except Exception as exc:
             self.logger.error(f"意图识别失败: {exc}")
             state["user_intent"] = "clarification"
@@ -399,6 +418,82 @@ class ConversationalMappingAgent:
             }
             state["messages"].append(AIMessage(content=state["clarification_questions"][0]))
             return state
+
+    def _recognize_intent_with_trace(
+        self, user_input: str, *, current_state: Optional[MapState]
+    ):
+        """Run the gateway under one parent span for web-backed conversations."""
+        intent_trace = {"parent_event_id": None}
+        return ThinkingGISMappingAgent._run_trace_phase(
+            self,
+            event_type="intent_parse",
+            phase="intent",
+            summary="识别用户意图",
+            input_data={"request_text": user_input},
+            operation=lambda: recognize_intent(
+                user_input,
+                current_state=current_state,
+                llm=getattr(self, "intent_llm", None) or getattr(self, "llm", None),
+                trace_callback=lambda **event: self._publish_intent_trace_child(
+                    intent_trace["parent_event_id"], event
+                ),
+            ),
+            output_serializer=lambda value: value.model_dump(mode="json"),
+            on_started=lambda span: intent_trace.update(
+                parent_event_id=getattr(span, "event_id", None)
+            ),
+        )
+
+    def _publish_intent_trace_child(
+        self, parent_event_id: Optional[str], event: Dict[str, Any]
+    ) -> None:
+        """Persist gateway phases without coupling the gateway to Django."""
+        if not parent_event_id:
+            return
+        try:
+            from mapping.trace import publish_trace_event, record_trace_event, run_for_session
+
+            run = run_for_session(getattr(self, "session_id", None))
+            if not run:
+                return
+            trace_event = record_trace_event(
+                run=run,
+                event_type=str(event.get("event_type") or "intent_validate"),
+                phase="intent",
+                actor="agent",
+                status=str(event.get("status") or "success"),
+                summary={
+                    "intent_rule_parse": "规则解析",
+                    "intent_llm_parse": "LLM 语义补全",
+                    "intent_merge": "合并意图",
+                    "intent_validate": "校验意图",
+                }.get(str(event.get("event_type")), "识别阶段"),
+                parent_event_id=parent_event_id,
+                input_data=event.get("input_data") or {},
+                output_data=event.get("output_data") or {},
+                error=event.get("error"),
+            )
+            publish_trace_event(trace_event)
+        except Exception:
+            return
+
+    @staticmethod
+    def _pending_confirmation_control(
+        state: ConversationState, user_input: str
+    ) -> Optional[str]:
+        """Resolve confirmation replies before semantic intent parsing."""
+        if not state.get("requires_confirmation"):
+            return None
+        compact = re.sub(r"[\s，,。！？!?、]+", "", str(user_input or "")).lower()
+        if not compact:
+            return None
+        negative = ("否", "取消", "不要", "不用", "算了", "no", "n")
+        affirmative = ("是", "确定", "确认", "好的", "可以", "同意", "yes", "y", "ok")
+        if any(compact.startswith(marker) for marker in negative):
+            return "cancel"
+        if any(compact.startswith(marker) for marker in affirmative):
+            return "confirmation"
+        return None
 
     def _legacy_classify_intent(self, state: ConversationState) -> ConversationState:
         """Legacy LLM-first classifier retained only during migration."""
@@ -604,6 +699,8 @@ class ConversationalMappingAgent:
             return "query"
         elif intent in ["confirmation", "cancel"]:
             return "confirmation"
+        elif intent == "retry":
+            return "retry"
         elif intent == "clarification":
             return "response"
         else:
@@ -643,6 +740,40 @@ class ConversationalMappingAgent:
             return state
 
         state["messages"].append(AIMessage(content=f"任务执行失败：{error}"))
+        return state
+
+    def _handle_retry(self, state: ConversationState) -> ConversationState:
+        """Retry only a known render failure without recreating the map task."""
+        self._mark_graph_step(state, "retry", "retry_render")
+        current_map_state = state.get("current_map_state")
+        render_result = state.get("render_result") or {}
+        if not current_map_state or render_result.get("success", True):
+            state["error"] = "当前没有可重试的失败渲染步骤。"
+            state["render_result"] = {
+                "success": False,
+                "error_code": "no_retryable_operation",
+                "error": state["error"],
+            }
+            state["messages"].append(AIMessage(content=state["error"]))
+            return state
+
+        retry_result = self.map_renderer.render_map(current_map_state)
+        state["render_result"] = retry_result
+        if retry_result.get("success"):
+            state["error"] = None
+            state["messages"].append(
+                AIMessage(content="已重试地图渲染，新的预览已经生成。")
+            )
+            return state
+
+        state["error"] = (
+            retry_result.get("error")
+            or retry_result.get("message")
+            or "地图渲染重试失败。"
+        )
+        state["messages"].append(
+            AIMessage(content=f"地图渲染重试失败：{state['error']}")
+        )
         return state
 
     @staticmethod

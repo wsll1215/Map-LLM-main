@@ -87,3 +87,58 @@ def test_modify_request_without_current_map_is_blocked_before_execution():
 
     assert result.status == "needs_clarification"
     assert "current_map_state" in result.missing_fields
+
+
+def test_gateway_reports_recognition_phases_for_trace_in_order():
+    events = []
+    llm = FakeLLM(
+        {
+            "task": "create_map",
+            "location": {"text": "天津市", "precision": "city"},
+            "layers": [{"role": "road"}],
+        }
+    )
+
+    result = recognize_intent(
+        "请显示主要道路",
+        llm=llm,
+        trace_callback=lambda **event: events.append(event),
+    )
+
+    assert result.status == "accepted"
+    assert [event["event_type"] for event in events] == [
+        "intent_rule_parse",
+        "intent_llm_parse",
+        "intent_merge",
+        "intent_validate",
+    ]
+    assert all(event["status"] in {"success", "warning", "error"} for event in events)
+
+
+def test_llm_cannot_add_to_locked_layers_or_invent_explicit_sources():
+    llm = FakeLLM(
+        {
+            "task": "create_map",
+            "location": {"text": "天津市", "precision": "city"},
+            "layers": [{"role": "road"}, {"role": "river"}],
+            "explicit_sources": ["secret.geojson"],
+        }
+    )
+
+    result = recognize_intent("请显示主要道路", llm=llm)
+
+    assert result.status == "accepted"
+    assert [layer.role for layer in result.intent.layers] == ["road"]
+    assert result.intent.explicit_sources == []
+
+
+def test_llm_bind_failure_returns_structured_failure_instead_of_raising():
+    class BindFailureLLM:
+        def bind_tools(self, *_args, **_kwargs):
+            raise RuntimeError("provider unavailable")
+
+    result = recognize_intent("请显示主要道路", llm=BindFailureLLM())
+
+    assert result.status == "failed"
+    assert result.attempt == 1
+    assert result.issues[0].code == "llm_bind_failed"

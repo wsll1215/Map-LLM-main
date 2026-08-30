@@ -1,6 +1,7 @@
 from gis_mapping_agent.agent.conversational import ConversationalMappingAgent
 from gis_mapping_agent.agent.thinking import ThinkingGISMappingAgent
 from gis_mapping_agent.models.schemas import GeometryType, LayerConfig, MapConfig, MapState, SessionInfo
+from gis_mapping_agent.specs.intent import Intent, LayerSlot, LocationSlot
 
 from langchain_core.messages import HumanMessage
 
@@ -107,6 +108,74 @@ def test_query_intent_is_selected_before_generic_map_word():
     assert result["user_intent"] == "query"
     assert not hasattr(agent.llm, "stream_calls")
     assert agent.llm.calls == 0
+
+
+def test_pending_confirmation_is_resolved_before_semantic_gateway():
+    agent = make_agent_with_fake_llm("create")
+    state = make_state("确定", has_map_state=True)
+    state["requires_confirmation"] = True
+
+    result = agent._classify_intent(state)
+
+    assert result["user_intent"] == "confirmation"
+    assert result["task_type"] == "confirmation"
+    assert result["needs_clarification"] is False
+    assert agent.llm.calls == 0
+
+
+def test_retry_intent_routes_to_retry_handler():
+    agent = make_agent_with_fake_llm("create")
+    state = agent._classify_intent(make_state("重试", has_map_state=True))
+
+    assert state["user_intent"] == "retry"
+    assert agent._route_by_intent(state) == "retry"
+
+
+def test_thinking_agent_reuses_supplied_intent_and_returns_normalized_intent(monkeypatch):
+    intent = Intent(
+        task="create_map",
+        location=LocationSlot(text="天津市", precision="city"),
+        layers=[LayerSlot(role="road")],
+        explicit_sources=["data/road.geojson"],
+    )
+    agent = object.__new__(ThinkingGISMappingAgent)
+    agent.logger = FakeLogger()
+    agent.current_map_state = None
+    agent.last_assistant_message_id = None
+    agent.save_tool = None
+    agent._source_errors = []
+    agent._source_plan = None
+    agent._semantic_data_plan = None
+
+    def unexpected_recognition(*_args, **_kwargs):
+        raise AssertionError("supplied Intent must skip a second recognition")
+
+    monkeypatch.setattr(
+        "gis_mapping_agent.agent.thinking.recognize_intent",
+        unexpected_recognition,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_calculate_auto_extent",
+        lambda **_kwargs: ([116.0, 38.0, 117.0, 39.0], "[116.0, 38.0, 117.0, 39.0]"),
+    )
+    monkeypatch.setattr(agent, "_enhance_request_with_auto_extent", lambda value: value)
+    monkeypatch.setattr(
+        agent,
+        "_execute_thinking_loop",
+        lambda _request: {
+            "success": True,
+            "message": "地图创建完成",
+            "output": "完成",
+            "thinking_steps": [],
+        },
+    )
+    monkeypatch.setattr(agent, "_get_final_map_state", lambda: None)
+
+    result = agent.create_map("请创建天津市道路地图", intent=intent)
+
+    assert result["success"] is True, result
+    assert result["intent"] == intent.model_dump(mode="json")
 
 
 def test_thinking_agent_emits_authoritative_assistant_message_after_stream(monkeypatch):

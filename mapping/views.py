@@ -175,6 +175,33 @@ def _map_layer_role(name):
     return 'boundary'
 
 
+def _required_roles_from_intent(intent_payload):
+    """Read required semantic roles from the gateway-owned Intent payload."""
+    if isinstance(intent_payload, dict):
+        layers = intent_payload.get('layers')
+        if not isinstance(layers, list):
+            return None
+        roles = set()
+        for layer in layers:
+            if not isinstance(layer, dict) or not layer.get('role'):
+                return None
+            if layer.get('required', True):
+                roles.add(str(layer['role']))
+        return roles
+
+    layers = getattr(intent_payload, 'layers', None)
+    if layers is None:
+        return None
+    roles = set()
+    for layer in layers:
+        role = getattr(layer, 'role', None)
+        if not role:
+            return None
+        if getattr(layer, 'required', True):
+            roles.add(str(role))
+    return roles
+
+
 def _finalize_map_request(
     map_request,
     response,
@@ -184,17 +211,30 @@ def _finalize_map_request(
     use_latest_artifact=True,
 ):
     """Validate the persisted state and artifact before publishing completion."""
-    from gis_mapping_agent.data_sources.planner import parse_intent
     from gis_mapping_agent.state import get_state_manager
 
     response = response if isinstance(response, dict) else {}
-    intent = parse_intent(intent_text or map_request.request_text)
+    intent_payload = response.get('intent_spec')
+    if intent_payload is None and isinstance(response.get('intent'), (dict, list)):
+        intent_payload = response.get('intent')
+
+    if intent_payload is not None:
+        required_roles = _required_roles_from_intent(intent_payload)
+        if required_roles is None:
+            clarification_required = True
+            required_roles = set()
+    else:
+        # Compatibility path for historical runs that predate Intent. New
+        # production callers always pass the gateway result above.
+        from gis_mapping_agent.data_sources.planner import parse_intent
+
+        legacy_intent = parse_intent(intent_text or map_request.request_text)
+        required_roles = {
+            layer.role for layer in legacy_intent.layers if layer.required
+        }
     source_plan = response.get('source_plan') or {}
     planned_layers = {
         item.get('role'): item for item in source_plan.get('layers', []) if item.get('role')
-    }
-    required_roles = {
-        layer.role for layer in intent.layers if layer.required
     }
     state = get_state_manager().load_state(f'web_session_{map_request.id}')
     layers = []
@@ -1317,6 +1357,9 @@ def _process_with_map_llm(map_request, run=None):
                 clarification = response.get('clarification') or {}
                 agent_trace_id = response.get('tool_trace_id')
                 agent_source_plan = response.get('source_plan')
+                agent_intent = response.get('intent_spec')
+                if agent_intent is None and isinstance(response.get('intent'), dict):
+                    agent_intent = response.get('intent')
             else:
                 agent_output = str(response)
                 agent_success = True
@@ -1325,6 +1368,7 @@ def _process_with_map_llm(map_request, run=None):
                 clarification = {}
                 agent_trace_id = None
                 agent_source_plan = None
+                agent_intent = None
 
             # 构造 result 格式以兼容后续处理
             result = {
@@ -1333,6 +1377,7 @@ def _process_with_map_llm(map_request, run=None):
                 'message': agent_error or '地图制作完成',
                 'tool_trace_id': agent_trace_id,
                 'source_plan': agent_source_plan,
+                'intent_spec': agent_intent,
             }
 
             if agent_status == 'needs_clarification':

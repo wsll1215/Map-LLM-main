@@ -63,6 +63,51 @@ def test_record_trace_event_assigns_sequence_and_parent_relationship():
     assert child.input_data == {"api_key": "[REDACTED]", "location": "北京"}
 
 
+def test_conversation_intent_gateway_persists_nested_recognition_phases():
+    from gis_mapping_agent.agent.conversational import ConversationalMappingAgent
+
+    class BoundLLM:
+        def invoke(self, _messages):
+            return type(
+                "Response",
+                (),
+                {
+                    "tool_calls": [{
+                        "name": "parse_map_intent",
+                        "args": {
+                            "task": "create_map",
+                            "location": {"text": "天津市", "precision": "city"},
+                            "layers": [{"role": "road"}],
+                        },
+                    }]
+                },
+            )()
+
+    class LLM:
+        def bind_tools(self, _tools, **_kwargs):
+            return BoundLLM()
+
+    request, run = _run("intent-trace-owner")
+    agent = object.__new__(ConversationalMappingAgent)
+    agent.session_id = f"web_session_{request.id}"
+    agent.llm = LLM()
+
+    result = agent._recognize_intent_with_trace(
+        "请显示主要道路", current_state=None
+    )
+
+    assert result.status == "accepted"
+    events = list(ProcessLog.objects.filter(run=run).order_by("event_seq", "id"))
+    assert [event.event_type for event in events] == [
+        "intent_parse",
+        "intent_rule_parse",
+        "intent_llm_parse",
+        "intent_merge",
+        "intent_validate",
+    ]
+    assert all(event.parent_event_id == events[0].event_id for event in events[1:])
+
+
 def test_trace_lifecycle_uses_only_protocol_event_names():
     assert trace_lifecycle_names("tool_call") == ("tool_started", "tool_finished")
     assert trace_lifecycle_names("llm_generation") == ("llm_started", "llm_finished")
