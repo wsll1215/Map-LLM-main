@@ -29,12 +29,12 @@ from ..data_sources.remote import (
 )
 from ..data_sources.catalog import DjangoDatasetCatalog
 from ..data_sources.planner import (
-    parse_intent,
     plan_local_sources,
     resolve_local_location,
     semantic_plan_from_source_plan,
 )
 from ..data_sources.coordinator import build_source_plan
+from .intent_gateway import recognize_intent
 from ..gis import calculate_extent_from_files, format_extent_for_request
 from ..state import get_generalization_context
 from ..tools.registry import ALL_UNIFIED_TOOLS
@@ -150,6 +150,9 @@ class ThinkingGISMappingAgent:
         self.use_unified_tools = use_unified_tools
         self.tools, self.save_tool = self._initialize_tools()
         self.tool_dict = {tool.name: tool for tool in self.tools}
+        # Keep an unbound model for semantic intent completion. The execution
+        # model remains tool-bound and is used only after Intent validation.
+        self.intent_llm = self.llm
         self.llm = self.llm.bind_tools(self.tools)
 
         # 设置参数
@@ -162,7 +165,7 @@ class ThinkingGISMappingAgent:
 
         # self.logger.info("思考型GIS制图智能体初始化完成")
 
-    def create_map(self, user_request: str) -> Dict[str, Any]:
+    def create_map(self, user_request: str, intent: Optional[Any] = None) -> Dict[str, Any]:
         """使用思考-行动-观察循环创建地图"""
 
         try:
@@ -171,25 +174,23 @@ class ThinkingGISMappingAgent:
             # 从用户请求中提取数据目录和文件信息
             explicit_data_files = data_path_resolver.find_data_files_in_request(user_request)
             data_dir_from_request, data_files_from_request = extract_data_info_from_request(user_request)
-            intent = self._run_trace_phase(
-                event_type="intent_parse",
-                phase="intent",
-                summary="识别用户意图",
-                input_data={"request_text": user_request},
-                operation=lambda: parse_intent(user_request),
-                output_serializer=lambda value: {
-                    "location": {
-                        "text": value.location.text,
-                        "precision": value.location.precision,
-                    },
-                    "layers": [
-                        {"role": layer.role, "required": layer.required}
-                        for layer in value.layers
-                    ],
-                    "unknown_fields": list(value.unknown_fields),
-                    "confidence": value.confidence,
-                },
-            )
+            if intent is None:
+                recognition = self._run_trace_phase(
+                    event_type="intent_parse",
+                    phase="intent",
+                    summary="识别用户意图",
+                    input_data={"request_text": user_request},
+                    operation=lambda: recognize_intent(
+                        user_request,
+                        current_state=self.current_map_state,
+                        llm=getattr(self, "intent_llm", None),
+                    ),
+                    output_serializer=lambda value: value.model_dump(mode="json"),
+                )
+                if recognition.status != "accepted" or recognition.intent is None:
+                    return self._intent_failure_response(recognition)
+                intent = recognition.intent
+            self._current_intent = intent
             self._explicit_data_files = bool(explicit_data_files or intent.explicit_sources)
             if not self._explicit_data_files:
                 data_dir_from_request, data_files_from_request = None, []
@@ -330,7 +331,7 @@ class ThinkingGISMappingAgent:
                 location_geometry = shapely_mapping(location_geometry)
             except (ImportError, TypeError, ValueError):
                 location_geometry = None
-        return {
+            return {
             "location": {
                 "text": plan.location.text if plan.location else None,
                 "bbox": list(plan.location.bbox) if plan.location and plan.location.bbox else None,
@@ -963,6 +964,34 @@ class ThinkingGISMappingAgent:
                 "message": str(error),
             }
         )
+
+    @staticmethod
+    def _intent_failure_response(recognition: Any) -> Dict[str, Any]:
+        """Convert recognition issues into an execution-safe response."""
+        issues = list(getattr(recognition, "issues", []) or [])
+        first_issue = issues[0] if issues else None
+        needs_clarification = recognition.status == "needs_clarification"
+        message = (
+            getattr(first_issue, "message", None)
+            or "无法可靠识别该制图请求"
+        )
+        return {
+            "success": False,
+            "status": "needs_clarification" if needs_clarification else "failed",
+            "message": message,
+            "error": message,
+            "error_code": getattr(first_issue, "code", None) or "intent_parse_failed",
+            "clarification": {
+                "missing_fields": list(getattr(recognition, "missing_fields", []) or []),
+                "conflicts": list(getattr(recognition, "conflicts", []) or []),
+                "next_action": getattr(first_issue, "next_action", None) or "ask_user",
+            },
+            "intent": (
+                recognition.intent.model_dump(mode="json")
+                if getattr(recognition, "intent", None) is not None
+                else None
+            ),
+        }
 
     def _publish_realtime_tool_event(
         self,

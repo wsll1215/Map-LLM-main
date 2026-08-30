@@ -28,6 +28,7 @@ from ..rendering.renderer import get_map_renderer
 from ..tools.conversation_tools import CONVERSATION_TOOLS
 from ..tools.registry import ALL_UNIFIED_TOOLS
 from .ambiguity import detect_ambiguity
+from .intent_gateway import recognize_intent
 from .thinking import ThinkingGISMappingAgent
 
 
@@ -49,6 +50,8 @@ class ConversationState(TypedDict):
     last_operation: Optional[str]
     source_plan: Optional[Dict[str, Any]]
     conversation_history: List[Dict[str, Any]]
+    parsed_intent: Optional[Any]
+    intent_result: Optional[Dict[str, Any]]
 
 
 class ConversationalMappingAgent:
@@ -295,7 +298,9 @@ class ConversationalMappingAgent:
             needs_clarification=False,
             clarification_data={},
             last_operation=None,
-            conversation_history=[]
+            conversation_history=[],
+            parsed_intent=None,
+            intent_result=None,
         )
 
     def _looks_like_new_map_request(self, user_input: str) -> bool:
@@ -329,7 +334,74 @@ class ConversationalMappingAgent:
         return (has_create_word or has_map_output) and (data_file_count > 0 or has_data_dir or has_layer_style_spec)
     
     def _classify_intent(self, state: ConversationState) -> ConversationState:
-        """分类用户意图：优先使用 LLM，失败或返回异常时使用规则兜底。"""
+        """Recognize intent through the single rule-first gateway."""
+        try:
+            last_message = state["messages"][-1]
+            user_input = str(last_message.content)
+            state["patch"] = None
+            state["render_result"] = None
+            state["error"] = None
+            state["needs_clarification"] = False
+            state["clarification_data"] = {}
+            state["parsed_intent"] = None
+            state["intent_result"] = None
+
+            recognition = recognize_intent(
+                user_input,
+                current_state=state.get("current_map_state"),
+                llm=getattr(self, "intent_llm", None) or getattr(self, "llm", None),
+            )
+            state["intent_result"] = recognition.model_dump(mode="json")
+            state["parsed_intent"] = recognition.intent
+
+            task_map = {
+                "create_map": "create",
+                "modify_map": "modify",
+                "query_map": "query",
+                "retry": "retry",
+                "cancel": "cancel",
+            }
+            if recognition.status == "accepted" and recognition.intent is not None:
+                task = task_map.get(recognition.intent.task, "clarification")
+                state["user_intent"] = task
+                state["task_type"] = task
+                return state
+
+            state["user_intent"] = "clarification"
+            state["task_type"] = "clarification"
+            state["needs_clarification"] = True
+            state["clarification_questions"] = [
+                issue.message for issue in recognition.issues
+            ] or ["无法可靠识别请求，请补充地点、图层或操作。"]
+            state["clarification_data"] = {
+                "missing_fields": list(recognition.missing_fields),
+                "conflicts": list(recognition.conflicts),
+                "next_action": (
+                    recognition.issues[0].next_action
+                    if recognition.issues
+                    else "ask_user"
+                ),
+                "reason": "intent_recognition",
+            }
+            state["messages"].append(
+                AIMessage(content=state["clarification_questions"][0])
+            )
+            return state
+        except Exception as exc:
+            self.logger.error(f"意图识别失败: {exc}")
+            state["user_intent"] = "clarification"
+            state["task_type"] = "clarification"
+            state["needs_clarification"] = True
+            state["clarification_questions"] = ["意图识别暂时失败，请补充明确的地点和图层。"]
+            state["clarification_data"] = {
+                "reason": "intent_gateway_error",
+                "next_action": "ask_user",
+            }
+            state["messages"].append(AIMessage(content=state["clarification_questions"][0]))
+            return state
+
+    def _legacy_classify_intent(self, state: ConversationState) -> ConversationState:
+        """Legacy LLM-first classifier retained only during migration."""
         try:
             last_message = state["messages"][-1]
             user_input = last_message.content
@@ -710,7 +782,12 @@ class ConversationalMappingAgent:
                     f"MapSpec: {spec_payload}",
                     user_request,
                 ])
-            result = self.creation_agent.create_map(create_request)
+            parsed_intent = state.get("parsed_intent")
+            result = (
+                self.creation_agent.create_map(create_request, intent=parsed_intent)
+                if parsed_intent is not None
+                else self.creation_agent.create_map(create_request)
+            )
             state["source_plan"] = result.get("source_plan")
 
             if result["success"]:

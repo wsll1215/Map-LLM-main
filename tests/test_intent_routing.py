@@ -85,7 +85,7 @@ def make_state(user_input, has_map_state=True):
     }
 
 
-def test_llm_intent_takes_priority_over_modify_keywords_when_available():
+def test_complete_rule_intent_skips_llm_classification():
     agent = make_agent_with_fake_llm("create")
     state = make_state(
         "使用data5目录中的数据生成地图: Wuhan.shp, Skating Rink.shp。Wuhan.shp: 根据 地名 属性调整多边形要素的颜色",
@@ -94,18 +94,18 @@ def test_llm_intent_takes_priority_over_modify_keywords_when_available():
 
     result = agent._classify_intent(state)
 
-    assert agent.llm.stream_calls == 1
+    assert not hasattr(agent.llm, "stream_calls")
     assert agent.llm.calls == 0
     assert result["user_intent"] == "create"
     assert result["task_type"] == "create"
 
 
-def test_intent_classification_uses_streaming_model_response_when_available():
+def test_query_intent_is_selected_before_generic_map_word():
     agent = make_agent_with_fake_llm("query")
     result = agent._classify_intent(make_state("查看当前地图状态", has_map_state=True))
 
     assert result["user_intent"] == "query"
-    assert agent.llm.stream_calls == 1
+    assert not hasattr(agent.llm, "stream_calls")
     assert agent.llm.calls == 0
 
 
